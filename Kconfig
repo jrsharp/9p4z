@@ -1,0 +1,69 @@
+# Copyright (c) 2025 9p4z Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig NINEP
+	bool "9P Protocol Support"
+	help
+	  Enable support for the 9P (Plan 9 Filesystem Protocol).
+	  This allows Zephyr applications to act as 9P clients or servers
+	  over various transports (UART, TCP, Bluetooth L2CAP, etc).
+
+if NINEP
+
+config NINEP_MAX_MESSAGE_SIZE
+	int "Maximum 9P message size"
+	default 8192
+	help
+	  Maximum size of a 9P protocol message in bytes.
+	  Typical values are 8192 or 65536. Smaller values reduce
+	  memory usage but may limit functionality.
+
+config NINEP_MAX_FIDS
+	int "Maximum number of file IDs (fids)"
+	default 32
+	help
+	  Maximum number of concurrent file IDs that can be tracked.
+	  Each fid represents an open file or directory handle.
+
+config NINEP_MAX_TAGS
+	int "Maximum number of pending requests"
+	default 16
+	help
+	  Maximum number of concurrent outstanding requests.
+	  Each request in flight requires a unique tag.
+
+config NINEP_SERVER
+	bool "9P Server Support"
+	default y
+	help
+	  Enable 9P server functionality.
+
+config NINEP_CLIENT
+	bool "9P Client Support"
+	default y
+	help
+	  Enable 9P client functionality.
+
+config NINEP_TRANSPORT_UART
+	bool "UART Transport"
+	depends on SERIAL
+	help
+	  Enable 9P over UART serial transport.
+
+config NINEP_TRANSPORT_TCP
+	bool "TCP Transport"
+	depends on NETWORKING
+	help
+	  Enable 9P over TCP/IP transport.
+
+config NINEP_TRANSPORT_L2CAP
+	bool "Bluetooth L2CAP Transport"
+	depends on BT_L2CAP
+	help
+	  Enable 9P over Bluetooth L2CAP transport.
+
+module = NINEP
+module-str = 9p
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # NINEP
