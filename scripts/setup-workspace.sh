@@ -81,6 +81,26 @@ pip list | grep -E "^(west|pip) "
 
 # Initialize west workspace
 echo -e "\n${GREEN}[5/6]${NC} Initializing west workspace..."
+
+# Check for conflicting west workspaces in parent directories
+CONFLICT_CHECK="$WORKSPACE_DIR"
+while [ "$CONFLICT_CHECK" != "/" ]; do
+    CONFLICT_CHECK="$(dirname "$CONFLICT_CHECK")"
+    if [ -d "$CONFLICT_CHECK/.west" ]; then
+        echo -e "${RED}Error: Found existing west workspace at: $CONFLICT_CHECK/.west${NC}"
+        echo ""
+        echo "You have a west workspace in a parent directory that conflicts."
+        echo "This will prevent creating an isolated workspace here."
+        echo ""
+        echo "Options:"
+        echo "  1. Use a different workspace location (set WORKSPACE_DIR env var)"
+        echo "  2. Remove the conflicting workspace:"
+        echo "     rm -rf $CONFLICT_CHECK/.west"
+        echo ""
+        exit 1
+    fi
+done
+
 if [ ! -d ".west" ]; then
     # Use local path if module is already cloned, otherwise use git URL
     if [ -d "$MODULE_DIR/.git" ]; then

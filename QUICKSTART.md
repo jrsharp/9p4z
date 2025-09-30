@@ -283,6 +283,41 @@ Ensure west.yml is correct and run:
 west update
 ```
 
+### "FATAL ERROR: already initialized" during setup
+
+If you see:
+```
+FATAL ERROR: already initialized in /path/to/parent, aborting.
+```
+
+You have an existing west workspace in a parent directory (e.g., `/Users/you/src/.west`).
+
+**Solutions:**
+
+**Option 1: Use a different workspace location** (Recommended)
+```bash
+# Specify workspace location outside the conflicting hierarchy
+WORKSPACE_DIR=~/zephyr-workspaces/9p4z-workspace ./scripts/setup-workspace.sh
+```
+
+**Option 2: Remove the conflicting workspace** (If you don't need it)
+```bash
+# Find and remove the .west directory
+rm -rf /Users/you/src/.west
+
+# Then re-run setup
+./scripts/setup-workspace.sh
+```
+
+**Option 3: Work within the existing workspace**
+```bash
+# If you want to use the existing workspace
+cd /Users/you/src  # Directory with .west/
+
+# Add 9p4z to the existing manifest
+# Edit .west/config or the manifest file to include 9p4z
+```
+
 ## Next Steps
 
 - Read [tests/README.md](tests/README.md) for testing details
