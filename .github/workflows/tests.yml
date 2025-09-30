@@ -1,0 +1,84 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: zephyrprojectrtos/ci:latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          path: 9p4z
+
+      - name: Initialize Zephyr workspace
+        run: |
+          west init -l 9p4z
+          cd 9p4z
+          west update
+
+      - name: Run unit tests (native_posix)
+        run: |
+          cd 9p4z
+          west twister -p native_posix -T tests/ --inline-logs
+
+      - name: Run unit tests (qemu_x86)
+        run: |
+          cd 9p4z
+          west twister -p qemu_x86 -T tests/ --inline-logs
+
+      - name: Generate test report
+        if: always()
+        run: |
+          cd 9p4z
+          west twister -p native_posix -T tests/ --coverage --coverage-tool=gcovr
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            9p4z/twister-out/
+            9p4z/coverage.html
+
+  build-samples:
+    runs-on: ubuntu-latest
+    container:
+      image: zephyrprojectrtos/ci:latest
+
+    strategy:
+      matrix:
+        sample: [uart_echo]
+        board: [native_posix, qemu_x86, qemu_cortex_m3]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          path: 9p4z
+
+      - name: Initialize Zephyr workspace
+        run: |
+          west init -l 9p4z
+          cd 9p4z
+          west update
+
+      - name: Build sample
+        run: |
+          cd 9p4z
+          west build -b ${{ matrix.board }} samples/${{ matrix.sample }}/
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.sample }}-${{ matrix.board }}
+          path: 9p4z/build/zephyr/zephyr.*

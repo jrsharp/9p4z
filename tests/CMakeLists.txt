@@ -10,4 +10,5 @@ target_sources(app PRIVATE
   protocol_test.c
   fid_test.c
   tag_test.c
+  transport_test.c
 )

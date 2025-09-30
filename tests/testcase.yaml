@@ -1,9 +1,38 @@
 # Copyright (c) 2025 9p4z Contributors
 # SPDX-License-Identifier: Apache-2.0
 
+common:
+  tags: ninep
+  platform_allow: native_posix native_posix_64 qemu_x86 qemu_cortex_m3
+  integration_platforms:
+    - native_posix
+  harness: ztest
+
 tests:
-  libraries.ninep:
-    tags: ninep protocol
-    platform_allow: native_posix native_posix_64
-    integration_platforms:
-      - native_posix
+  libraries.ninep.protocol:
+    tags: ninep protocol unit
+    extra_configs:
+      - CONFIG_ZTEST=y
+      - CONFIG_NINEP=y
+    min_ram: 32
+
+  libraries.ninep.fid:
+    tags: ninep fid unit
+    extra_configs:
+      - CONFIG_ZTEST=y
+      - CONFIG_NINEP=y
+    min_ram: 32
+
+  libraries.ninep.tag:
+    tags: ninep tag unit
+    extra_configs:
+      - CONFIG_ZTEST=y
+      - CONFIG_NINEP=y
+    min_ram: 32
+
+  libraries.ninep.transport:
+    tags: ninep transport integration
+    extra_configs:
+      - CONFIG_ZTEST=y
+      - CONFIG_NINEP=y
+    min_ram: 32

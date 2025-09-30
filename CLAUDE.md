@@ -55,17 +55,34 @@ This is a Zephyr RTOS project. Zephyr development typically requires:
 
 ## Building and Testing
 
-### Build tests
+### Run Tests
+
 ```bash
-west build -b native_posix tests/
-west build -t run
+# Quick test runner script
+./scripts/run_tests.sh [platform] [-v]
+
+# Using west directly
+west twister -T tests/                           # All tests, all platforms
+west twister -p native_posix -T tests/           # Specific platform
+west twister -p native_posix -T tests/ --inline-logs  # See output
+west twister -T tests/ --tag unit                # Filter by tag
+west twister -T tests/ --coverage                # With coverage
 ```
 
-### Build UART echo sample
+### Build Samples
+
 ```bash
 west build -b <board> samples/uart_echo/
 west flash
 ```
+
+### Test Coverage
+
+See `tests/README.md` for comprehensive testing documentation including:
+- Test suite organization
+- Writing new tests
+- CI/CD pipeline
+- Troubleshooting
 
 ## Architecture
 
