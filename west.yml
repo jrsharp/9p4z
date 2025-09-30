@@ -1,0 +1,33 @@
+# Copyright (c) 2025 9p4z Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# West manifest for 9p4z module development
+# This creates a T2 topology (star) with 9p4z as the manifest repository
+
+manifest:
+  version: "0.13"
+
+  defaults:
+    remote: zephyrproject-rtos
+
+  remotes:
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+
+  projects:
+    - name: zephyr
+      remote: zephyrproject-rtos
+      revision: v3.7.0
+      import:
+        # Import Zephyr's manifest to get all dependencies
+        name-allowlist:
+          - cmsis      # ARM CMSIS
+          - hal_stm32  # STM32 HAL (if needed)
+          - mcuboot    # Bootloader (optional)
+          - mbedtls    # Crypto (optional)
+          - segger     # Segger RTT (optional)
+          - tinycrypt  # Crypto (optional)
+
+  self:
+    path: 9p4z
+    west-commands: scripts/west-commands.yml

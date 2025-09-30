@@ -1,6 +1,7 @@
 # Build outputs
 build/
 twister-out/
+*-workspace/
 
 # Coverage reports
 *.gcda
