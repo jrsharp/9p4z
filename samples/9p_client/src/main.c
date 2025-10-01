@@ -245,8 +245,10 @@ static void cmd_help(void)
 	printk("  connect       - Connect to 9P server\n");
 	printk("  pwd           - Print working directory\n");
 	printk("  ls [path]     - List directory (basic walk test)\n");
-	printk("  quit          - Exit client\n");
-	printk("\nComing soon: cd, cat, stat, full ls\n\n");
+	printk("  cd <path>     - Change directory\n");
+	printk("  cat <file>    - Display file contents\n");
+	printk("  stat <path>   - Show file information\n");
+	printk("  quit          - Exit client\n\n");
 }
 
 /* Command: pwd */
@@ -383,6 +385,401 @@ static void cmd_ls(const char *path)
 	ninep_tag_free(&tag_table, tag);
 }
 
+/* Command: cd - change directory */
+static void cmd_cd(const char *path)
+{
+	int ret;
+	uint16_t tag;
+	uint32_t walk_fid;
+	struct ninep_msg_header hdr;
+
+	if (!connected) {
+		printk("Not connected. Use 'connect' first.\n");
+		return;
+	}
+
+	if (path == NULL || path[0] == '\0') {
+		printk("Usage: cd <path>\n");
+		return;
+	}
+
+	/* Allocate tag and FID for the walk */
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		printk("Failed to allocate tag\n");
+		return;
+	}
+
+	walk_fid = 2; /* Use FID 2 for cd operations */
+	if (ninep_fid_alloc(&fid_table, walk_fid) == NULL) {
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to allocate walk FID\n");
+		return;
+	}
+
+	/* Build Twalk message to target path */
+	const char *wnames[1] = {path};
+	uint16_t wname_lens[1] = {strlen(path)};
+
+	ret = ninep_build_twalk(tx_buffer, sizeof(tx_buffer), tag,
+	                         cwd_fid, walk_fid, 1, wnames, wname_lens);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to build Twalk: %d\n", ret);
+		return;
+	}
+
+	/* Send and wait */
+	ret = send_and_wait(tx_buffer, ret, 5000);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Walk request failed: %d\n", ret);
+		return;
+	}
+
+	/* Parse response */
+	ret = ninep_parse_header(response_buffer, response_len, &hdr);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to parse walk response\n");
+		return;
+	}
+
+	if (hdr.type == NINEP_RERROR) {
+		/* Parse error message */
+		size_t offset = 7;
+		const char *errstr;
+		uint16_t errlen;
+		ninep_parse_string(response_buffer, response_len, &offset, &errstr, &errlen);
+		printk("cd error: %.*s\n", errlen, errstr);
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		return;
+	}
+
+	if (hdr.type != NINEP_RWALK || hdr.tag != tag) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Unexpected walk response: type=%d, tag=%d\n", hdr.type, hdr.tag);
+		return;
+	}
+
+	/* Update current directory */
+	if (cwd_fid != root_fid) {
+		ninep_fid_free(&fid_table, cwd_fid);
+	}
+	cwd_fid = walk_fid;
+
+	/* Update path string */
+	if (strcmp(path, "..") == 0) {
+		/* Go up one level */
+		char *last_slash = strrchr(cwd_path, '/');
+		if (last_slash != NULL && last_slash != cwd_path) {
+			*last_slash = '\0';
+		} else {
+			strcpy(cwd_path, "/");
+		}
+	} else if (strcmp(cwd_path, "/") == 0) {
+		snprintf(cwd_path, MAX_PATH_LEN, "/%s", path);
+	} else {
+		snprintf(cwd_path, MAX_PATH_LEN, "%s/%s", cwd_path, path);
+	}
+
+	ninep_tag_free(&tag_table, tag);
+}
+
+/* Command: cat - display file contents */
+static void cmd_cat(const char *path)
+{
+	int ret;
+	uint16_t tag;
+	uint32_t walk_fid;
+	struct ninep_msg_header hdr;
+
+	if (!connected) {
+		printk("Not connected. Use 'connect' first.\n");
+		return;
+	}
+
+	if (path == NULL || path[0] == '\0') {
+		printk("Usage: cat <file>\n");
+		return;
+	}
+
+	/* Allocate tag and FID for the walk */
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		printk("Failed to allocate tag\n");
+		return;
+	}
+
+	walk_fid = 3; /* Use FID 3 for cat operations */
+	if (ninep_fid_alloc(&fid_table, walk_fid) == NULL) {
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to allocate walk FID\n");
+		return;
+	}
+
+	/* Build Twalk message to file */
+	const char *wnames[1] = {path};
+	uint16_t wname_lens[1] = {strlen(path)};
+
+	ret = ninep_build_twalk(tx_buffer, sizeof(tx_buffer), tag,
+	                         cwd_fid, walk_fid, 1, wnames, wname_lens);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to build Twalk: %d\n", ret);
+		return;
+	}
+
+	/* Send walk and wait */
+	ret = send_and_wait(tx_buffer, ret, 5000);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Walk request failed: %d\n", ret);
+		return;
+	}
+
+	/* Parse walk response */
+	ret = ninep_parse_header(response_buffer, response_len, &hdr);
+	if (ret < 0 || hdr.type == NINEP_RERROR) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Walk to file failed\n");
+		return;
+	}
+
+	ninep_tag_free(&tag_table, tag);
+
+	/* Open the file for reading */
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		ninep_fid_free(&fid_table, walk_fid);
+		printk("Failed to allocate tag\n");
+		return;
+	}
+
+	ret = ninep_build_topen(tx_buffer, sizeof(tx_buffer), tag,
+	                         walk_fid, NINEP_OREAD);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to build Topen: %d\n", ret);
+		return;
+	}
+
+	ret = send_and_wait(tx_buffer, ret, 5000);
+	if (ret < 0 || hdr.type == NINEP_RERROR) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Open file failed\n");
+		return;
+	}
+
+	ninep_tag_free(&tag_table, tag);
+
+	/* Read file contents */
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		ninep_fid_free(&fid_table, walk_fid);
+		printk("Failed to allocate tag\n");
+		return;
+	}
+
+	ret = ninep_build_tread(tx_buffer, sizeof(tx_buffer), tag,
+	                         walk_fid, 0, 8192);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to build Tread: %d\n", ret);
+		return;
+	}
+
+	ret = send_and_wait(tx_buffer, ret, 5000);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Read request failed\n");
+		return;
+	}
+
+	/* Parse read response */
+	ret = ninep_parse_header(response_buffer, response_len, &hdr);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to parse read response\n");
+		return;
+	}
+
+	if (hdr.type == NINEP_RERROR) {
+		size_t offset = 7;
+		const char *errstr;
+		uint16_t errlen;
+		ninep_parse_string(response_buffer, response_len, &offset, &errstr, &errlen);
+		printk("Read error: %.*s\n", errlen, errstr);
+	} else if (hdr.type == NINEP_RREAD) {
+		/* Data starts at offset 7 + 4 (count) */
+		uint32_t count = get_u32(response_buffer, 7);
+		if (count > 0) {
+			printk("%.*s", (int)count, &response_buffer[11]);
+		}
+	}
+
+	/* Clean up */
+	ninep_fid_free(&fid_table, walk_fid);
+	ninep_tag_free(&tag_table, tag);
+}
+
+/* Command: stat - display file information */
+static void cmd_stat(const char *path)
+{
+	int ret;
+	uint16_t tag;
+	uint32_t walk_fid;
+	struct ninep_msg_header hdr;
+
+	if (!connected) {
+		printk("Not connected. Use 'connect' first.\n");
+		return;
+	}
+
+	if (path == NULL || path[0] == '\0') {
+		printk("Usage: stat <path>\n");
+		return;
+	}
+
+	/* Allocate tag and FID for the walk */
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		printk("Failed to allocate tag\n");
+		return;
+	}
+
+	walk_fid = 4; /* Use FID 4 for stat operations */
+	if (ninep_fid_alloc(&fid_table, walk_fid) == NULL) {
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to allocate walk FID\n");
+		return;
+	}
+
+	/* Build Twalk message to file */
+	const char *wnames[1] = {path};
+	uint16_t wname_lens[1] = {strlen(path)};
+
+	ret = ninep_build_twalk(tx_buffer, sizeof(tx_buffer), tag,
+	                         cwd_fid, walk_fid, 1, wnames, wname_lens);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to build Twalk: %d\n", ret);
+		return;
+	}
+
+	/* Send walk and wait */
+	ret = send_and_wait(tx_buffer, ret, 5000);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Walk request failed: %d\n", ret);
+		return;
+	}
+
+	/* Parse walk response */
+	ret = ninep_parse_header(response_buffer, response_len, &hdr);
+	if (ret < 0 || hdr.type == NINEP_RERROR) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Walk to path failed\n");
+		return;
+	}
+
+	ninep_tag_free(&tag_table, tag);
+
+	/* Send Tstat */
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		ninep_fid_free(&fid_table, walk_fid);
+		printk("Failed to allocate tag\n");
+		return;
+	}
+
+	ret = ninep_build_tstat(tx_buffer, sizeof(tx_buffer), tag, walk_fid);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to build Tstat: %d\n", ret);
+		return;
+	}
+
+	ret = send_and_wait(tx_buffer, ret, 5000);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Stat request failed\n");
+		return;
+	}
+
+	/* Parse stat response */
+	ret = ninep_parse_header(response_buffer, response_len, &hdr);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to parse stat response\n");
+		return;
+	}
+
+	if (hdr.type == NINEP_RERROR) {
+		size_t offset = 7;
+		const char *errstr;
+		uint16_t errlen;
+		ninep_parse_string(response_buffer, response_len, &offset, &errstr, &errlen);
+		printk("Stat error: %.*s\n", errlen, errstr);
+	} else if (hdr.type == NINEP_RSTAT) {
+		/* Parse stat structure - simplified output */
+		/* Stat format: size[2] size[2] type[2] dev[4] qid[13] mode[4]
+		   atime[4] mtime[4] length[8] name[s] uid[s] gid[s] muid[s] */
+		size_t offset = 7;
+		uint16_t stat_size = get_u16(response_buffer, offset);
+		offset += 2;
+
+		/* Skip to qid (skip size + type + dev) */
+		offset += 2 + 2 + 4;
+
+		/* Parse qid */
+		uint8_t qid_type = response_buffer[offset++];
+		offset += 4; /* skip version */
+		uint64_t qid_path = get_u32(response_buffer, offset);
+		offset += 8;
+
+		/* Parse mode and length */
+		uint32_t mode = get_u32(response_buffer, offset);
+		offset += 4 + 4 + 4; /* skip atime, mtime */
+		uint64_t length = (uint64_t)get_u32(response_buffer, offset) |
+		                  ((uint64_t)get_u32(response_buffer, offset + 4) << 32);
+		offset += 8;
+
+		/* Parse name */
+		const char *name;
+		uint16_t name_len;
+		ninep_parse_string(response_buffer, response_len, &offset, &name, &name_len);
+
+		printk("File: %.*s\n", name_len, name);
+		printk("Type: %s\n", (qid_type & NINEP_QTDIR) ? "directory" : "file");
+		printk("Mode: 0x%08x\n", mode);
+		printk("Size: %llu bytes\n", length);
+	}
+
+	/* Clean up */
+	ninep_fid_free(&fid_table, walk_fid);
+	ninep_tag_free(&tag_table, tag);
+}
+
 /* Parse and execute command */
 static void execute_command(const char *line)
 {
@@ -404,6 +801,12 @@ static void execute_command(const char *line)
 		cmd_connect();
 	} else if (strcmp(cmd, "ls") == 0) {
 		cmd_ls(n > 1 ? arg : NULL);
+	} else if (strcmp(cmd, "cd") == 0) {
+		cmd_cd(n > 1 ? arg : NULL);
+	} else if (strcmp(cmd, "cat") == 0) {
+		cmd_cat(n > 1 ? arg : NULL);
+	} else if (strcmp(cmd, "stat") == 0) {
+		cmd_stat(n > 1 ? arg : NULL);
 	} else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0) {
 		printk("Goodbye!\n");
 		k_sleep(K_MSEC(100));

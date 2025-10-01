@@ -157,6 +157,31 @@ int ninep_build_tclunk(uint8_t *buf, size_t buf_len, uint16_t tag, uint32_t fid)
 int ninep_build_rclunk(uint8_t *buf, size_t buf_len, uint16_t tag);
 
 /**
+ * @brief Build a Tread message
+ *
+ * @param buf Output buffer
+ * @param buf_len Buffer length
+ * @param tag Message tag
+ * @param fid File identifier
+ * @param offset Byte offset to read from
+ * @param count Number of bytes to read
+ * @return Number of bytes written, or negative error code
+ */
+int ninep_build_tread(uint8_t *buf, size_t buf_len, uint16_t tag,
+                      uint32_t fid, uint64_t offset, uint32_t count);
+
+/**
+ * @brief Build a Tstat message
+ *
+ * @param buf Output buffer
+ * @param buf_len Buffer length
+ * @param tag Message tag
+ * @param fid File identifier
+ * @return Number of bytes written, or negative error code
+ */
+int ninep_build_tstat(uint8_t *buf, size_t buf_len, uint16_t tag, uint32_t fid);
+
+/**
  * @brief Build an Rerror message
  *
  * @param buf Output buffer

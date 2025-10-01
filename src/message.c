@@ -8,6 +8,19 @@
 #include <string.h>
 #include <errno.h>
 
+/* Helper to write uint64 in little-endian */
+static void write_u64_le(uint8_t *buf, size_t *offset, uint64_t val)
+{
+	buf[(*offset)++] = val & 0xff;
+	buf[(*offset)++] = (val >> 8) & 0xff;
+	buf[(*offset)++] = (val >> 16) & 0xff;
+	buf[(*offset)++] = (val >> 24) & 0xff;
+	buf[(*offset)++] = (val >> 32) & 0xff;
+	buf[(*offset)++] = (val >> 40) & 0xff;
+	buf[(*offset)++] = (val >> 48) & 0xff;
+	buf[(*offset)++] = (val >> 56) & 0xff;
+}
+
 /* Helper to write uint32 in little-endian */
 static void write_u32_le(uint8_t *buf, size_t *offset, uint32_t val)
 {
@@ -364,6 +377,67 @@ int ninep_build_rclunk(uint8_t *buf, size_t buf_len, uint16_t tag)
 	offset = 7;
 
 	return offset;
+}
+
+int ninep_build_tread(uint8_t *buf, size_t buf_len, uint16_t tag,
+                      uint32_t fid, uint64_t offset, uint32_t count)
+{
+	if (!buf || buf_len < 7) {
+		return -EINVAL;
+	}
+
+	uint32_t msg_size = 7 + 4 + 8 + 4;  /* header + fid + offset + count */
+	if (buf_len < msg_size) {
+		return -ENOSPC;
+	}
+
+	size_t pos = 0;
+	struct ninep_msg_header hdr = {
+		.size = msg_size,
+		.type = NINEP_TREAD,
+		.tag = tag,
+	};
+
+	int ret = ninep_write_header(buf, buf_len, &hdr);
+	if (ret < 0) {
+		return ret;
+	}
+	pos = 7;
+
+	write_u32_le(buf, &pos, fid);
+	write_u64_le(buf, &pos, offset);
+	write_u32_le(buf, &pos, count);
+
+	return pos;
+}
+
+int ninep_build_tstat(uint8_t *buf, size_t buf_len, uint16_t tag, uint32_t fid)
+{
+	if (!buf || buf_len < 7) {
+		return -EINVAL;
+	}
+
+	uint32_t msg_size = 7 + 4;  /* header + fid */
+	if (buf_len < msg_size) {
+		return -ENOSPC;
+	}
+
+	size_t pos = 0;
+	struct ninep_msg_header hdr = {
+		.size = msg_size,
+		.type = NINEP_TSTAT,
+		.tag = tag,
+	};
+
+	int ret = ninep_write_header(buf, buf_len, &hdr);
+	if (ret < 0) {
+		return ret;
+	}
+	pos = 7;
+
+	write_u32_le(buf, &pos, fid);
+
+	return pos;
 }
 
 int ninep_build_rerror(uint8_t *buf, size_t buf_len, uint16_t tag,
