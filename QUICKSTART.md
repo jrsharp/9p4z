@@ -100,16 +100,35 @@ source zephyr/zephyr-env.sh
 
 ### Build and Run Tests
 
+**On Linux:**
 ```bash
 # Build all tests for native_posix
-west build -b native_posix 9p4z/tests
+west build -b native_posix 9p4z/tests -p
 
 # Run tests
 west build -t run
+```
 
-# Or use the test runner script
-cd 9p4z
-./scripts/run_tests.sh
+**On macOS:**
+```bash
+# native_posix doesn't work on macOS, use QEMU instead
+west build -b qemu_x86 9p4z/tests -p
+
+# Run tests in QEMU
+west build -t run
+
+# Or use Cortex-M3 emulation
+west build -b qemu_cortex_m3 9p4z/tests -p
+west build -t run
+```
+
+**Using Twister (cross-platform):**
+```bash
+# Linux
+west twister -p native_posix -T 9p4z/tests/ --inline-logs
+
+# macOS
+west twister -p qemu_x86 -T 9p4z/tests/ --inline-logs
 ```
 
 ### Build Sample Application

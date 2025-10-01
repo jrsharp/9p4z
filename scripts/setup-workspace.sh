@@ -55,12 +55,13 @@ fi
 # Create workspace directory
 echo -e "\n${GREEN}[1/6]${NC} Creating workspace directory..."
 mkdir -p "$WORKSPACE_DIR"
-cd "$WORKSPACE_DIR"
 
-# Create Python virtual environment
+# Do NOT cd into workspace yet - we need to init from parent
+
+# Create Python virtual environment IN workspace
 echo -e "${GREEN}[2/6]${NC} Creating Python virtual environment..."
-if [ ! -d ".venv" ]; then
-    python3 -m venv .venv
+if [ ! -d "$WORKSPACE_DIR/.venv" ]; then
+    python3 -m venv "$WORKSPACE_DIR/.venv"
     echo "✓ Virtual environment created"
 else
     echo "✓ Virtual environment already exists"
@@ -68,7 +69,7 @@ fi
 
 # Activate virtual environment
 echo -e "${GREEN}[3/6]${NC} Activating virtual environment..."
-source .venv/bin/activate
+source "$WORKSPACE_DIR/.venv/bin/activate"
 
 # Upgrade pip
 echo -e "${GREEN}[4/6]${NC} Installing/upgrading Python tools..."
@@ -94,6 +95,7 @@ while [ "$CONFLICT_CHECK" != "/" ]; do
         echo ""
         echo "Options:"
         echo "  1. Use a different workspace location (set WORKSPACE_DIR env var)"
+        echo "     Example: WORKSPACE_DIR=~/zephyr-workspaces/9p4z-workspace ./scripts/setup-workspace.sh"
         echo "  2. Remove the conflicting workspace:"
         echo "     rm -rf $CONFLICT_CHECK/.west"
         echo ""
@@ -101,11 +103,24 @@ while [ "$CONFLICT_CHECK" != "/" ]; do
     fi
 done
 
-if [ ! -d ".west" ]; then
-    # Use local path if module is already cloned, otherwise use git URL
+if [ ! -d "$WORKSPACE_DIR/.west" ]; then
+    # Use local path if module is already cloned
     if [ -d "$MODULE_DIR/.git" ]; then
         echo "Using local module at: $MODULE_DIR"
-        west init -l "$MODULE_DIR"
+        echo "Workspace directory: $WORKSPACE_DIR"
+
+        # Create symlink to module inside workspace
+        # This follows the pattern: workspace/module-name/ -> actual module location
+        MODULE_LINK="$WORKSPACE_DIR/$(basename "$MODULE_DIR")"
+        if [ ! -e "$MODULE_LINK" ]; then
+            ln -s "$MODULE_DIR" "$MODULE_LINK"
+            echo "✓ Created symlink: $MODULE_LINK -> $MODULE_DIR"
+        fi
+
+        # Now run west init FROM workspace directory WITH -l pointing to the linked module
+        # This creates .west/ in WORKSPACE_DIR, not in MODULE_DIR
+        cd "$WORKSPACE_DIR"
+        west init -l "$(basename "$MODULE_DIR")"
     else
         echo -e "${YELLOW}Note: For remote setup, use:${NC}"
         echo "  west init -m https://github.com/YOUR_USERNAME/9p4z --mr main"
@@ -114,14 +129,17 @@ if [ ! -d ".west" ]; then
     echo "✓ West workspace initialized"
 else
     echo "✓ West workspace already initialized"
+    cd "$WORKSPACE_DIR"
 fi
 
 # Update all projects (pull Zephyr and dependencies)
 echo -e "\n${GREEN}[6/6]${NC} Updating west projects (this may take a while)..."
+cd "$WORKSPACE_DIR"
 west update
 
 # Export Zephyr environment variables
 echo -e "\n${GREEN}Setting up Zephyr environment...${NC}"
+cd "$WORKSPACE_DIR"
 if [ -f "zephyr/zephyr-env.sh" ]; then
     source zephyr/zephyr-env.sh
     echo "✓ Zephyr environment sourced"

@@ -34,12 +34,12 @@ cd 9p4z
 cd ../9p4z-workspace
 source activate.sh
 
-# Run tests
-west build -b native_posix 9p4z/tests
+# Run tests (macOS: use qemu_x86, Linux: use native_posix)
+west build -b qemu_x86 9p4z/tests
 west build -t run
 
 # Build sample
-west build -b native_posix 9p4z/samples/uart_echo
+west build -b qemu_x86 9p4z/samples/uart_echo
 ```
 
 See [QUICKSTART.md](QUICKSTART.md) for detailed setup instructions.
