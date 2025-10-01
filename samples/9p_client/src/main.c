@@ -115,10 +115,10 @@ static int do_version(void)
 	LOG_INF("Negotiating protocol version...");
 
 	/* Allocate tag */
-	ret = ninep_tag_alloc(&tag_table, &tag);
-	if (ret < 0) {
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
 		LOG_ERR("Failed to allocate tag");
-		return ret;
+		return -ENOMEM;
 	}
 
 	/* Build Tversion */
@@ -173,17 +173,18 @@ static int do_attach(const char *aname, const char *uname)
 	LOG_INF("Attaching to filesystem: aname=%s, uname=%s", aname, uname);
 
 	/* Allocate tag and FID */
-	ret = ninep_tag_alloc(&tag_table, &tag);
-	if (ret < 0) {
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
 		LOG_ERR("Failed to allocate tag");
-		return ret;
+		return -ENOMEM;
 	}
 
-	ret = ninep_fid_alloc(&fid_table, &root_fid);
-	if (ret < 0) {
+	/* Use FID 0 for root */
+	root_fid = 0;
+	if (ninep_fid_alloc(&fid_table, root_fid) == NULL) {
 		ninep_tag_free(&tag_table, tag);
 		LOG_ERR("Failed to allocate root FID");
-		return ret;
+		return -ENOMEM;
 	}
 
 	/* Build Tattach */
@@ -357,8 +358,8 @@ int main(void)
 	LOG_INF("=== 9P Interactive Client ===");
 
 	/* Initialize FID and tag tables */
-	ninep_fid_init(&fid_table);
-	ninep_tag_init(&tag_table);
+	ninep_fid_table_init(&fid_table);
+	ninep_tag_table_init(&tag_table);
 
 	/* Get UART device */
 	uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
