@@ -11,4 +11,6 @@ target_sources(app PRIVATE
   fid_test.c
   tag_test.c
   transport_test.c
+  message_test.c
+  message_builder_test.c
 )

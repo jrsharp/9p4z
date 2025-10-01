@@ -11,6 +11,7 @@ zephyr_library_sources(
   src/proto.c
   src/fid.c
   src/tag.c
+  src/message.c
 )
 
 if(CONFIG_NINEP_SERVER)
