@@ -242,10 +242,11 @@ static void cmd_help(void)
 {
 	printk("\n9P Client Commands:\n");
 	printk("  help          - Show this help\n");
-	printk("  pwd           - Print working directory\n");
 	printk("  connect       - Connect to 9P server\n");
+	printk("  pwd           - Print working directory\n");
+	printk("  ls [path]     - List directory (basic walk test)\n");
 	printk("  quit          - Exit client\n");
-	printk("\nComing soon: ls, cd, cat, stat\n\n");
+	printk("\nComing soon: cd, cat, stat, full ls\n\n");
 }
 
 /* Command: pwd */
@@ -279,6 +280,109 @@ static void cmd_connect(void)
 	printk("Connected successfully\n");
 }
 
+/* Command: ls - list directory contents */
+static void cmd_ls(const char *path)
+{
+	int ret;
+	uint16_t tag;
+	uint32_t walk_fid;
+	struct ninep_msg_header hdr;
+	const char *use_path;
+	char path_buf[MAX_PATH_LEN];
+
+	if (!connected) {
+		printk("Not connected. Use 'connect' first.\n");
+		return;
+	}
+
+	/* Use current directory if no path given */
+	if (path == NULL || path[0] == '\0') {
+		use_path = ".";
+	} else {
+		use_path = path;
+	}
+
+	printk("Listing: %s\n", use_path);
+
+	/* Allocate tag and FID for the walk */
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		printk("Failed to allocate tag\n");
+		return;
+	}
+
+	walk_fid = 1; /* Use FID 1 for walk operations */
+	if (ninep_fid_alloc(&fid_table, walk_fid) == NULL) {
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to allocate walk FID\n");
+		return;
+	}
+
+	/* Build Twalk message - walk from root to target path */
+	/* For now, just walk to "." (current directory) */
+	const char *wnames[1] = {"."};
+	uint16_t wname_lens[1] = {1};
+
+	ret = ninep_build_twalk(tx_buffer, sizeof(tx_buffer), tag,
+	                         root_fid, walk_fid,
+	                         use_path[0] == '.' && use_path[1] == '\0' ? 0 : 1,
+	                         wnames, wname_lens);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to build Twalk: %d\n", ret);
+		return;
+	}
+
+	/* Send and wait */
+	ret = send_and_wait(tx_buffer, ret, 5000);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Walk request failed: %d\n", ret);
+		return;
+	}
+
+	/* Parse response */
+	ret = ninep_parse_header(response_buffer, response_len, &hdr);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to parse walk response\n");
+		return;
+	}
+
+	if (hdr.type == NINEP_RERROR) {
+		/* Parse error message */
+		size_t offset = 7;
+		const char *errstr;
+		uint16_t errlen;
+		ninep_parse_string(response_buffer, response_len, &offset, &errstr, &errlen);
+		printk("Walk error: %.*s\n", errlen, errstr);
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		return;
+	}
+
+	if (hdr.type != NINEP_RWALK || hdr.tag != tag) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Unexpected walk response: type=%d, tag=%d\n", hdr.type, hdr.tag);
+		return;
+	}
+
+	/* Parse Rwalk response */
+	uint16_t nwqid = get_u16(response_buffer, 7);
+	printk("Walk successful: %d qids returned\n", nwqid);
+
+	/* TODO: Now we need to Topen the directory and Tread to get entries */
+	printk("(Full directory listing not yet implemented)\n");
+
+	/* Clean up */
+	ninep_fid_free(&fid_table, walk_fid);
+	ninep_tag_free(&tag_table, tag);
+}
+
 /* Parse and execute command */
 static void execute_command(const char *line)
 {
@@ -298,6 +402,8 @@ static void execute_command(const char *line)
 		cmd_pwd();
 	} else if (strcmp(cmd, "connect") == 0) {
 		cmd_connect();
+	} else if (strcmp(cmd, "ls") == 0) {
+		cmd_ls(n > 1 ? arg : NULL);
 	} else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0) {
 		printk("Goodbye!\n");
 		k_sleep(K_MSEC(100));
