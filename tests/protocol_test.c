@@ -131,7 +131,7 @@ ZTEST(ninep_protocol, test_qid_write)
 /* Error handling tests */
 ZTEST(ninep_protocol, test_header_parse_invalid_size)
 {
-	uint8_t buf[5];  /* Too small for header */
+	uint8_t buf[5] = {0};  /* Too small for header */
 	struct ninep_msg_header hdr;
 
 	zassert_not_equal(ninep_parse_header(buf, sizeof(buf), &hdr), 0,
