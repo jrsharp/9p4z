@@ -276,9 +276,12 @@ ZTEST(ninep_uart_transport, test_uart_buffer_overflow_protection)
 	ninep_transport_uart_init(&transport, &config, test_recv_callback, NULL);
 	ninep_transport_start(&transport);
 
-	/* Try to send a message larger than buffer */
-	int msg_len = ninep_build_tversion(test_buffer, sizeof(test_buffer),
-	                                    NINEP_NOTAG, 8192, "9P2000", 6);
+	/* Build a large message (Twalk with multiple path elements) */
+	const char *wnames[] = {"test1", "test2", "test3", "test4"};
+	uint16_t wname_lens[] = {5, 5, 5, 5};
+
+	int msg_len = ninep_build_twalk(test_buffer, sizeof(test_buffer),
+	                                 1, 1, 2, 4, wnames, wname_lens);
 	zassert_true(msg_len > sizeof(small_rx_buf), "Test message too small");
 
 	/* Send oversized message */
