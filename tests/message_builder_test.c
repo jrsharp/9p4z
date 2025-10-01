@@ -170,8 +170,6 @@ ZTEST(ninep_message_builder, test_build_rerror)
 
 ZTEST(ninep_message_builder, test_builder_null_checks)
 {
-	struct ninep_qid qid = {.type = NINEP_QTDIR, .version = 0, .path = 1};
-
 	zassert_true(ninep_build_tversion(NULL, 100, 0, 8192, "9P2000", 6) < 0,
 	             "Should fail with NULL buffer");
 	zassert_true(ninep_build_rattach(test_buffer, 100, 1, NULL) < 0,
