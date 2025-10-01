@@ -208,6 +208,105 @@ ZTEST(ninep_message_builder, test_build_twalk_max_elements)
 	zassert_true(ret < 0, "Should fail with too many elements");
 }
 
+ZTEST(ninep_message_builder, test_build_tread)
+{
+	/* Build a Tread message */
+	int ret = ninep_build_tread(test_buffer, sizeof(test_buffer),
+	                             5, 10, 1024, 4096);
+	zassert_true(ret > 0, "Tread build failed");
+	zassert_equal(ret, 7 + 4 + 8 + 4, "Wrong message size");
+
+	/* Parse and verify header */
+	struct ninep_msg_header hdr;
+	ret = ninep_parse_header(test_buffer, ret, &hdr);
+	zassert_equal(ret, 0, "Header parse failed");
+	zassert_equal(hdr.type, NINEP_TREAD, "Wrong message type");
+	zassert_equal(hdr.tag, 5, "Wrong tag");
+	zassert_equal(hdr.size, 7 + 4 + 8 + 4, "Wrong header size");
+
+	/* Verify payload: fid[4] offset[8] count[4] */
+	size_t offset = 7;
+	uint32_t fid = test_buffer[offset] | (test_buffer[offset + 1] << 8) |
+	               (test_buffer[offset + 2] << 16) | (test_buffer[offset + 3] << 24);
+	zassert_equal(fid, 10, "Wrong fid");
+	offset += 4;
+
+	uint64_t file_offset = 0;
+	for (int i = 0; i < 8; i++) {
+		file_offset |= ((uint64_t)test_buffer[offset + i] << (i * 8));
+	}
+	zassert_equal(file_offset, 1024, "Wrong offset");
+	offset += 8;
+
+	uint32_t count = test_buffer[offset] | (test_buffer[offset + 1] << 8) |
+	                 (test_buffer[offset + 2] << 16) | (test_buffer[offset + 3] << 24);
+	zassert_equal(count, 4096, "Wrong count");
+}
+
+ZTEST(ninep_message_builder, test_build_tread_large_offset)
+{
+	/* Test with a large 64-bit offset */
+	uint64_t large_offset = 0x123456789ABCDEFULL;
+
+	int ret = ninep_build_tread(test_buffer, sizeof(test_buffer),
+	                             1, 5, large_offset, 8192);
+	zassert_true(ret > 0, "Tread build failed");
+
+	/* Verify the 64-bit offset was written correctly */
+	size_t offset = 7 + 4;  /* Skip header and fid */
+	uint64_t parsed_offset = 0;
+	for (int i = 0; i < 8; i++) {
+		parsed_offset |= ((uint64_t)test_buffer[offset + i] << (i * 8));
+	}
+	zassert_equal(parsed_offset, large_offset, "Wrong 64-bit offset");
+}
+
+ZTEST(ninep_message_builder, test_build_tstat)
+{
+	/* Build a Tstat message */
+	int ret = ninep_build_tstat(test_buffer, sizeof(test_buffer), 7, 15);
+	zassert_true(ret > 0, "Tstat build failed");
+	zassert_equal(ret, 7 + 4, "Wrong message size");
+
+	/* Parse and verify header */
+	struct ninep_msg_header hdr;
+	ret = ninep_parse_header(test_buffer, ret, &hdr);
+	zassert_equal(ret, 0, "Header parse failed");
+	zassert_equal(hdr.type, NINEP_TSTAT, "Wrong message type");
+	zassert_equal(hdr.tag, 7, "Wrong tag");
+	zassert_equal(hdr.size, 7 + 4, "Wrong header size");
+
+	/* Verify payload: fid[4] */
+	size_t offset = 7;
+	uint32_t fid = test_buffer[offset] | (test_buffer[offset + 1] << 8) |
+	               (test_buffer[offset + 2] << 16) | (test_buffer[offset + 3] << 24);
+	zassert_equal(fid, 15, "Wrong fid");
+}
+
+ZTEST(ninep_message_builder, test_tread_buffer_size_validation)
+{
+	/* Test buffer too small */
+	uint8_t small_buf[10];
+	int ret = ninep_build_tread(small_buf, sizeof(small_buf), 1, 1, 0, 100);
+	zassert_true(ret < 0, "Should fail with small buffer");
+
+	/* Test null buffer */
+	ret = ninep_build_tread(NULL, 100, 1, 1, 0, 100);
+	zassert_true(ret < 0, "Should fail with null buffer");
+}
+
+ZTEST(ninep_message_builder, test_tstat_buffer_size_validation)
+{
+	/* Test buffer too small */
+	uint8_t small_buf[6];
+	int ret = ninep_build_tstat(small_buf, sizeof(small_buf), 1, 1);
+	zassert_true(ret < 0, "Should fail with small buffer");
+
+	/* Test null buffer */
+	ret = ninep_build_tstat(NULL, 100, 1, 1);
+	zassert_true(ret < 0, "Should fail with null buffer");
+}
+
 ZTEST(ninep_message_builder, test_version_negotiation_roundtrip)
 {
 	/* Client builds Tversion */
