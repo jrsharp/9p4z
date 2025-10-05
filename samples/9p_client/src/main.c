@@ -450,6 +450,11 @@ static void cmd_ls(const char *path)
 		uint32_t count = get_u32(response_buffer, 7);
 		size_t offset = 11;  /* Data starts after size[4] + type[1] + tag[2] + count[4] */
 
+		LOG_DBG("Directory read returned %u bytes", count);
+
+		/* Hex dump first 32 bytes of data */
+		LOG_HEXDUMP_DBG(&response_buffer[11], count < 32 ? count : 32, "Dir data:");
+
 		if (count == 0) {
 			printk("(empty directory)\n");
 		} else {
@@ -459,20 +464,24 @@ static void cmd_ls(const char *path)
 				uint16_t stat_size = get_u16(response_buffer, offset);
 				size_t stat_start = offset + 2;
 
-				/* Skip: size[2] type[2] dev[4] qid[13] mode[4] atime[4] mtime[4] */
-				size_t name_offset = stat_start + 2 + 2 + 4 + 13 + 4 + 4 + 4;
+				LOG_DBG("Parsing stat at offset %zu, size=%u", offset, stat_size);
 
-				/* Skip length[8] */
-				name_offset += 8;
+				/* Skip: type[2] dev[4] qid[13] mode[4] atime[4] mtime[4] length[8] */
+				/* Note: stat_start already points past size[2] */
+				size_t name_offset = stat_start + 2 + 4 + 13 + 4 + 4 + 4 + 8;
 
 				/* Parse name string */
 				const char *name;
 				uint16_t name_len;
 				if (ninep_parse_string(response_buffer, response_len, &name_offset, &name, &name_len) == 0) {
 					/* Check if it's a directory (from qid type) */
-					uint8_t qid_type = response_buffer[stat_start + 2 + 2 + 4];
+					/* stat_start points to type[2], skip type[2]+dev[4] to get to qid */
+					uint8_t qid_type = response_buffer[stat_start + 2 + 4];
 					const char *type_indicator = (qid_type & NINEP_QTDIR) ? "/" : "";
+					LOG_DBG("  Entry: %.*s%s (qid_type=0x%02x)", name_len, name, type_indicator, qid_type);
 					printk("  %.*s%s\n", name_len, name, type_indicator);
+				} else {
+					LOG_ERR("Failed to parse name at offset %zu", name_offset);
 				}
 
 				/* Move to next stat */
@@ -675,6 +684,15 @@ static void cmd_cat(const char *path)
 	}
 
 	ret = send_and_wait(tx_buffer, ret, 5000);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Open request failed\n");
+		return;
+	}
+
+	/* Parse open response */
+	ret = ninep_parse_header(response_buffer, response_len, &hdr);
 	if (ret < 0 || hdr.type == NINEP_RERROR) {
 		ninep_fid_free(&fid_table, walk_fid);
 		ninep_tag_free(&tag_table, tag);
@@ -843,14 +861,14 @@ static void cmd_stat(const char *path)
 		printk("Stat error: %.*s\n", errlen, errstr);
 	} else if (hdr.type == NINEP_RSTAT) {
 		/* Parse stat structure - simplified output */
-		/* Stat format: size[2] size[2] type[2] dev[4] qid[13] mode[4]
+		/* Stat format: size[2] type[2] dev[4] qid[13] mode[4]
 		   atime[4] mtime[4] length[8] name[s] uid[s] gid[s] muid[s] */
 		size_t offset = 7;
 		uint16_t stat_size = get_u16(response_buffer, offset);
-		offset += 2;
+		offset += 2;  /* Now pointing at type[2] */
 
-		/* Skip to qid (skip size + type + dev) */
-		offset += 2 + 2 + 4;
+		/* Skip to qid (skip type + dev) */
+		offset += 2 + 4;
 
 		/* Parse qid */
 		uint8_t qid_type = response_buffer[offset++];
