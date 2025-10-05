@@ -361,10 +361,125 @@ static void cmd_ls(const char *path)
 
 	/* Parse Rwalk response */
 	uint16_t nwqid = get_u16(response_buffer, 7);
-	printk("Walk successful: %d qids returned\n", nwqid);
 
-	/* TODO: Now we need to Topen the directory and Tread to get entries */
-	printk("(Full directory listing not yet implemented)\n");
+	ninep_tag_free(&tag_table, tag);
+
+	/* Open the directory for reading */
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		ninep_fid_free(&fid_table, walk_fid);
+		printk("Failed to allocate tag for open\n");
+		return;
+	}
+
+	ret = ninep_build_topen(tx_buffer, sizeof(tx_buffer), tag,
+	                         walk_fid, NINEP_OREAD);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to build Topen: %d\n", ret);
+		return;
+	}
+
+	ret = send_and_wait(tx_buffer, ret, 5000);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Open request failed: %d\n", ret);
+		return;
+	}
+
+	/* Parse open response */
+	ret = ninep_parse_header(response_buffer, response_len, &hdr);
+	if (ret < 0 || hdr.type == NINEP_RERROR) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Open failed\n");
+		return;
+	}
+
+	ninep_tag_free(&tag_table, tag);
+
+	/* Read directory entries */
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		ninep_fid_free(&fid_table, walk_fid);
+		printk("Failed to allocate tag for read\n");
+		return;
+	}
+
+	ret = ninep_build_tread(tx_buffer, sizeof(tx_buffer), tag,
+	                         walk_fid, 0, 8192);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to build Tread: %d\n", ret);
+		return;
+	}
+
+	ret = send_and_wait(tx_buffer, ret, 5000);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Read request failed: %d\n", ret);
+		return;
+	}
+
+	/* Parse read response */
+	ret = ninep_parse_header(response_buffer, response_len, &hdr);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to parse read response\n");
+		return;
+	}
+
+	if (hdr.type == NINEP_RERROR) {
+		size_t offset = 7;
+		const char *errstr;
+		uint16_t errlen;
+		ninep_parse_string(response_buffer, response_len, &offset, &errstr, &errlen);
+		printk("Read error: %.*s\n", errlen, errstr);
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		return;
+	}
+
+	if (hdr.type == NINEP_RREAD) {
+		/* Parse directory entries */
+		uint32_t count = get_u32(response_buffer, 7);
+		size_t offset = 11;  /* Data starts after size[4] + type[1] + tag[2] + count[4] */
+
+		if (count == 0) {
+			printk("(empty directory)\n");
+		} else {
+			/* Parse stat structures */
+			while (offset < 11 + count) {
+				/* Each stat has: size[2] + stat_data */
+				uint16_t stat_size = get_u16(response_buffer, offset);
+				size_t stat_start = offset + 2;
+
+				/* Skip: size[2] type[2] dev[4] qid[13] mode[4] atime[4] mtime[4] */
+				size_t name_offset = stat_start + 2 + 2 + 4 + 13 + 4 + 4 + 4;
+
+				/* Skip length[8] */
+				name_offset += 8;
+
+				/* Parse name string */
+				const char *name;
+				uint16_t name_len;
+				if (ninep_parse_string(response_buffer, response_len, &name_offset, &name, &name_len) == 0) {
+					/* Check if it's a directory (from qid type) */
+					uint8_t qid_type = response_buffer[stat_start + 2 + 2 + 4];
+					const char *type_indicator = (qid_type & NINEP_QTDIR) ? "/" : "";
+					printk("  %.*s%s\n", name_len, name, type_indicator);
+				}
+
+				/* Move to next stat */
+				offset = offset + 2 + stat_size;
+			}
+		}
+	}
 
 	/* Clean up */
 	ninep_fid_free(&fid_table, walk_fid);
