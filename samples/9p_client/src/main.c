@@ -20,7 +20,7 @@
 
 LOG_MODULE_REGISTER(ninep_client, LOG_LEVEL_DBG);
 
-#define UART_DEVICE_NODE DT_CHOSEN(zephyr_console)
+#define UART_DEVICE_NODE DT_CHOSEN(zephyr_ninep_uart)
 #define MAX_CMD_LEN 128
 #define MAX_PATH_LEN 256
 
@@ -109,23 +109,14 @@ static int send_and_wait(const uint8_t *req, size_t req_len, uint32_t timeout_ms
 static int do_version(void)
 {
 	int ret;
-	uint16_t tag;
 	struct ninep_msg_header hdr;
 
 	LOG_INF("Negotiating protocol version...");
 
-	/* Allocate tag */
-	tag = ninep_tag_alloc(&tag_table);
-	if (tag == NINEP_NOTAG) {
-		LOG_ERR("Failed to allocate tag");
-		return -ENOMEM;
-	}
-
-	/* Build Tversion */
-	ret = ninep_build_tversion(tx_buffer, sizeof(tx_buffer), tag,
+	/* Build Tversion - uses NOTAG per 9P spec */
+	ret = ninep_build_tversion(tx_buffer, sizeof(tx_buffer), NINEP_NOTAG,
 	                            CONFIG_NINEP_MAX_MESSAGE_SIZE, "9P2000", 6);
 	if (ret < 0) {
-		ninep_tag_free(&tag_table, tag);
 		LOG_ERR("Failed to build Tversion");
 		return ret;
 	}
@@ -133,25 +124,20 @@ static int do_version(void)
 	/* Send and wait */
 	ret = send_and_wait(tx_buffer, ret, 5000);
 	if (ret < 0) {
-		ninep_tag_free(&tag_table, tag);
 		return ret;
 	}
 
 	/* Parse response */
 	ret = ninep_parse_header(response_buffer, response_len, &hdr);
 	if (ret < 0) {
-		ninep_tag_free(&tag_table, tag);
 		LOG_ERR("Failed to parse response header");
 		return ret;
 	}
 
-	if (hdr.type != NINEP_RVERSION || hdr.tag != tag) {
-		ninep_tag_free(&tag_table, tag);
+	if (hdr.type != NINEP_RVERSION || hdr.tag != NINEP_NOTAG) {
 		LOG_ERR("Unexpected response: type=%d, tag=%d", hdr.type, hdr.tag);
 		return -EPROTO;
 	}
-
-	ninep_tag_free(&tag_table, tag);
 
 	/* Parse version response */
 	uint32_t msize = get_u32(response_buffer, 7);
