@@ -1,0 +1,17 @@
+/*
+ * Copyright (c) 2025 9p4z Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Device tree overlay for qemu_x86 to configure uart1 for 9P transport
+ */
+
+/ {
+	chosen {
+		zephyr,ninep_uart = &uart1;
+	};
+};
+
+&uart1 {
+	status = "okay";
+	current-speed = <115200>;
+};

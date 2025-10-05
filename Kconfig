@@ -50,6 +50,18 @@ config NINEP_TRANSPORT_UART
 	help
 	  Enable 9P over UART serial transport.
 
+if NINEP_TRANSPORT_UART
+
+config NINEP_UART_POLLING_MODE
+	bool "Use UART polling mode instead of interrupts"
+	default n
+	help
+	  Use UART polling for receive instead of interrupt-driven mode.
+	  Polling mode is less efficient but works on platforms where
+	  UART interrupts are not properly configured.
+
+endif # NINEP_TRANSPORT_UART
+
 config NINEP_TRANSPORT_TCP
 	bool "TCP Transport"
 	depends on NETWORKING

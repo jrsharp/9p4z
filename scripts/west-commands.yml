@@ -1,0 +1,12 @@
+# Copyright (c) 2025 9p4z Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+west-commands:
+  - file: west_9p.py
+    commands:
+      - name: 9p-serve
+        class: NinePServe
+        help: Start 9P file server with 9pserve
+      - name: 9p-run
+        class: NinePRun
+        help: Run QEMU with 9P client connected to server

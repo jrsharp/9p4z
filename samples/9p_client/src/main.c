@@ -42,6 +42,9 @@ static char cwd_path[MAX_PATH_LEN] = "/";
 /* Synchronization */
 static K_SEM_DEFINE(response_sem, 0, 1);
 
+/* Forward declarations */
+static int send_and_wait(const uint8_t *req, size_t req_len, uint32_t timeout_ms);
+
 /* Helper to extract uint32 from message */
 static uint32_t get_u32(const uint8_t *buf, size_t offset)
 {
@@ -55,6 +58,55 @@ static uint32_t get_u32(const uint8_t *buf, size_t offset)
 static uint16_t get_u16(const uint8_t *buf, size_t offset)
 {
 	return buf[offset] | (buf[offset + 1] << 8);
+}
+
+/* Helper to print 9P error messages */
+static void print_9p_error(const char *operation)
+{
+	size_t offset = 7;
+	const char *errstr;
+	uint16_t errlen;
+
+	if (ninep_parse_string(response_buffer, response_len, &offset, &errstr, &errlen) == 0) {
+		printk("%s error: %.*s\n", operation, errlen, errstr);
+	} else {
+		printk("%s error: (unable to parse error message)\n", operation);
+	}
+}
+
+/* Helper to clunk a FID */
+static int do_clunk(uint32_t fid)
+{
+	int ret;
+	uint16_t tag;
+	struct ninep_msg_header hdr;
+
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		return -ENOMEM;
+	}
+
+	ret = ninep_build_tclunk(tx_buffer, sizeof(tx_buffer), tag, fid);
+	if (ret < 0) {
+		ninep_tag_free(&tag_table, tag);
+		return ret;
+	}
+
+	ret = send_and_wait(tx_buffer, ret, 5000);
+	if (ret < 0) {
+		ninep_tag_free(&tag_table, tag);
+		return ret;
+	}
+
+	ret = ninep_parse_header(response_buffer, response_len, &hdr);
+	ninep_tag_free(&tag_table, tag);
+
+	if (ret < 0 || hdr.type == NINEP_RERROR) {
+		return -EIO;
+	}
+
+	ninep_fid_free(&fid_table, fid);
+	return 0;
 }
 
 /* Transport receive callback */
@@ -227,14 +279,18 @@ static int do_attach(const char *aname, const char *uname)
 static void cmd_help(void)
 {
 	printk("\n9P Client Commands:\n");
-	printk("  help          - Show this help\n");
-	printk("  connect       - Connect to 9P server\n");
-	printk("  pwd           - Print working directory\n");
-	printk("  ls [path]     - List directory (basic walk test)\n");
-	printk("  cd <path>     - Change directory\n");
-	printk("  cat <file>    - Display file contents\n");
-	printk("  stat <path>   - Show file information\n");
-	printk("  quit          - Exit client\n\n");
+	printk("  help            - Show this help\n");
+	printk("  connect         - Connect to 9P server\n");
+	printk("  pwd             - Print working directory\n");
+	printk("  ls [path]       - List directory\n");
+	printk("  cd <path>       - Change directory\n");
+	printk("  cat <file>      - Display file contents\n");
+	printk("  stat <path>     - Show file information\n");
+	printk("  echo <text> <file> - Write text to file\n");
+	printk("  touch <file>    - Create empty file\n");
+	printk("  mkdir <dir>     - Create directory\n");
+	printk("  rm <path>       - Delete file/directory\n");
+	printk("  quit            - Exit client\n\n");
 }
 
 /* Command: pwd */
@@ -481,8 +537,8 @@ static void cmd_ls(const char *path)
 	}
 
 	/* Clean up */
-	ninep_fid_free(&fid_table, walk_fid);
 	ninep_tag_free(&tag_table, tag);
+	do_clunk(walk_fid);
 }
 
 /* Command: cd - change directory */
@@ -569,7 +625,7 @@ static void cmd_cd(const char *path)
 
 	/* Update current directory */
 	if (cwd_fid != root_fid) {
-		ninep_fid_free(&fid_table, cwd_fid);
+		do_clunk(cwd_fid);
 	}
 	cwd_fid = walk_fid;
 
@@ -741,8 +797,8 @@ static void cmd_cat(const char *path)
 	}
 
 	/* Clean up */
-	ninep_fid_free(&fid_table, walk_fid);
 	ninep_tag_free(&tag_table, tag);
+	do_clunk(walk_fid);
 }
 
 /* Command: stat - display file information */
@@ -885,19 +941,417 @@ static void cmd_stat(const char *path)
 	}
 
 	/* Clean up */
-	ninep_fid_free(&fid_table, walk_fid);
 	ninep_tag_free(&tag_table, tag);
+	do_clunk(walk_fid);
+}
+
+/* Command: echo - write text to file */
+static void cmd_echo(const char *text, const char *file)
+{
+	int ret;
+	uint16_t tag;
+	uint32_t walk_fid, open_fid;
+	struct ninep_msg_header hdr;
+
+	if (!connected) {
+		printk("Not connected. Use 'connect' first.\n");
+		return;
+	}
+
+	if (!text || !file || file[0] == '\0') {
+		printk("Usage: echo <text> <file>\n");
+		return;
+	}
+
+	/* Walk to file (or parent if creating) */
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		printk("Failed to allocate tag\n");
+		return;
+	}
+
+	walk_fid = 5;
+	if (ninep_fid_alloc(&fid_table, walk_fid) == NULL) {
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to allocate FID\n");
+		return;
+	}
+
+	const char *wnames[1] = {file};
+	uint16_t wname_lens[1] = {strlen(file)};
+
+	ret = ninep_build_twalk(tx_buffer, sizeof(tx_buffer), tag,
+	                         cwd_fid, walk_fid, 1, wnames, wname_lens);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to build Twalk: %d\n", ret);
+		return;
+	}
+
+	ret = send_and_wait(tx_buffer, ret, 5000);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Walk failed - file may not exist\n");
+		return;
+	}
+
+	ret = ninep_parse_header(response_buffer, response_len, &hdr);
+	if (ret < 0 || hdr.type == NINEP_RERROR) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("File not found\n");
+		return;
+	}
+
+	ninep_tag_free(&tag_table, tag);
+
+	/* Open for writing */
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		do_clunk(walk_fid);
+		printk("Failed to allocate tag\n");
+		return;
+	}
+
+	ret = ninep_build_topen(tx_buffer, sizeof(tx_buffer), tag,
+	                         walk_fid, NINEP_OWRITE | NINEP_OTRUNC);
+	if (ret < 0) {
+		do_clunk(walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to build Topen: %d\n", ret);
+		return;
+	}
+
+	ret = send_and_wait(tx_buffer, ret, 5000);
+	if (ret < 0 || (ninep_parse_header(response_buffer, response_len, &hdr) < 0) ||
+	    hdr.type == NINEP_RERROR) {
+		do_clunk(walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to open file for writing\n");
+		return;
+	}
+
+	ninep_tag_free(&tag_table, tag);
+
+	/* Write data */
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		do_clunk(walk_fid);
+		printk("Failed to allocate tag\n");
+		return;
+	}
+
+	size_t text_len = strlen(text);
+	ret = ninep_build_twrite(tx_buffer, sizeof(tx_buffer), tag,
+	                          walk_fid, 0, text_len, (const uint8_t *)text);
+	if (ret < 0) {
+		do_clunk(walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to build Twrite: %d\n", ret);
+		return;
+	}
+
+	ret = send_and_wait(tx_buffer, ret, 5000);
+	if (ret < 0) {
+		do_clunk(walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Write failed\n");
+		return;
+	}
+
+	ret = ninep_parse_header(response_buffer, response_len, &hdr);
+	if (ret < 0 || hdr.type == NINEP_RERROR) {
+		print_9p_error("Write");
+		ninep_tag_free(&tag_table, tag);
+		do_clunk(walk_fid);
+		return;
+	}
+
+	/* Get bytes written */
+	uint32_t count = get_u32(response_buffer, 7);
+	printk("Wrote %u bytes\n", count);
+
+	ninep_tag_free(&tag_table, tag);
+	do_clunk(walk_fid);
+}
+
+/* Command: touch - create empty file */
+static void cmd_touch(const char *file)
+{
+	int ret;
+	uint16_t tag;
+	uint32_t dir_fid;
+	struct ninep_msg_header hdr;
+
+	if (!connected) {
+		printk("Not connected. Use 'connect' first.\n");
+		return;
+	}
+
+	if (!file || file[0] == '\0') {
+		printk("Usage: touch <file>\n");
+		return;
+	}
+
+	/* Clone current directory FID for create */
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		printk("Failed to allocate tag\n");
+		return;
+	}
+
+	dir_fid = 6;
+	if (ninep_fid_alloc(&fid_table, dir_fid) == NULL) {
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to allocate FID\n");
+		return;
+	}
+
+	/* Walk to current dir (clone cwd_fid) */
+	ret = ninep_build_twalk(tx_buffer, sizeof(tx_buffer), tag,
+	                         cwd_fid, dir_fid, 0, NULL, NULL);
+	if (ret < 0 || send_and_wait(tx_buffer, ret, 5000) < 0) {
+		ninep_fid_free(&fid_table, dir_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to clone directory FID\n");
+		return;
+	}
+
+	ninep_tag_free(&tag_table, tag);
+
+	/* Create file */
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		do_clunk(dir_fid);
+		printk("Failed to allocate tag\n");
+		return;
+	}
+
+	ret = ninep_build_tcreate(tx_buffer, sizeof(tx_buffer), tag,
+	                           dir_fid, file, strlen(file),
+	                           0644, NINEP_OWRITE);
+	if (ret < 0) {
+		do_clunk(dir_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to build Tcreate: %d\n", ret);
+		return;
+	}
+
+	ret = send_and_wait(tx_buffer, ret, 5000);
+	if (ret < 0) {
+		do_clunk(dir_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Create failed\n");
+		return;
+	}
+
+	ret = ninep_parse_header(response_buffer, response_len, &hdr);
+	if (ret < 0 || hdr.type == NINEP_RERROR) {
+		print_9p_error("Create");
+		ninep_tag_free(&tag_table, tag);
+		do_clunk(dir_fid);
+		return;
+	}
+
+	printk("Created: %s\n", file);
+	ninep_tag_free(&tag_table, tag);
+	do_clunk(dir_fid);
+}
+
+/* Command: mkdir - create directory */
+static void cmd_mkdir(const char *dir)
+{
+	int ret;
+	uint16_t tag;
+	uint32_t dir_fid;
+	struct ninep_msg_header hdr;
+
+	if (!connected) {
+		printk("Not connected. Use 'connect' first.\n");
+		return;
+	}
+
+	if (!dir || dir[0] == '\0') {
+		printk("Usage: mkdir <dir>\n");
+		return;
+	}
+
+	/* Clone current directory FID */
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		printk("Failed to allocate tag\n");
+		return;
+	}
+
+	dir_fid = 7;
+	if (ninep_fid_alloc(&fid_table, dir_fid) == NULL) {
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to allocate FID\n");
+		return;
+	}
+
+	ret = ninep_build_twalk(tx_buffer, sizeof(tx_buffer), tag,
+	                         cwd_fid, dir_fid, 0, NULL, NULL);
+	if (ret < 0 || send_and_wait(tx_buffer, ret, 5000) < 0) {
+		ninep_fid_free(&fid_table, dir_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to clone directory FID\n");
+		return;
+	}
+
+	ninep_tag_free(&tag_table, tag);
+
+	/* Create directory with DMDIR flag */
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		do_clunk(dir_fid);
+		printk("Failed to allocate tag\n");
+		return;
+	}
+
+	ret = ninep_build_tcreate(tx_buffer, sizeof(tx_buffer), tag,
+	                           dir_fid, dir, strlen(dir),
+	                           NINEP_DMDIR | 0755, NINEP_OREAD);
+	if (ret < 0) {
+		do_clunk(dir_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to build Tcreate: %d\n", ret);
+		return;
+	}
+
+	ret = send_and_wait(tx_buffer, ret, 5000);
+	if (ret < 0) {
+		do_clunk(dir_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Create directory failed\n");
+		return;
+	}
+
+	ret = ninep_parse_header(response_buffer, response_len, &hdr);
+	if (ret < 0 || hdr.type == NINEP_RERROR) {
+		print_9p_error("Create directory");
+		ninep_tag_free(&tag_table, tag);
+		do_clunk(dir_fid);
+		return;
+	}
+
+	printk("Created directory: %s\n", dir);
+	ninep_tag_free(&tag_table, tag);
+	do_clunk(dir_fid);
+}
+
+/* Command: rm - remove file or directory */
+static void cmd_rm(const char *path)
+{
+	int ret;
+	uint16_t tag;
+	uint32_t walk_fid;
+	struct ninep_msg_header hdr;
+
+	if (!connected) {
+		printk("Not connected. Use 'connect' first.\n");
+		return;
+	}
+
+	if (!path || path[0] == '\0') {
+		printk("Usage: rm <path>\n");
+		return;
+	}
+
+	/* Walk to target */
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		printk("Failed to allocate tag\n");
+		return;
+	}
+
+	walk_fid = 8;
+	if (ninep_fid_alloc(&fid_table, walk_fid) == NULL) {
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to allocate FID\n");
+		return;
+	}
+
+	const char *wnames[1] = {path};
+	uint16_t wname_lens[1] = {strlen(path)};
+
+	ret = ninep_build_twalk(tx_buffer, sizeof(tx_buffer), tag,
+	                         cwd_fid, walk_fid, 1, wnames, wname_lens);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to build Twalk: %d\n", ret);
+		return;
+	}
+
+	ret = send_and_wait(tx_buffer, ret, 5000);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Walk failed\n");
+		return;
+	}
+
+	ret = ninep_parse_header(response_buffer, response_len, &hdr);
+	if (ret < 0 || hdr.type == NINEP_RERROR) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("File not found\n");
+		return;
+	}
+
+	ninep_tag_free(&tag_table, tag);
+
+	/* Remove */
+	tag = ninep_tag_alloc(&tag_table);
+	if (tag == NINEP_NOTAG) {
+		ninep_fid_free(&fid_table, walk_fid);
+		printk("Failed to allocate tag\n");
+		return;
+	}
+
+	ret = ninep_build_tremove(tx_buffer, sizeof(tx_buffer), tag, walk_fid);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Failed to build Tremove: %d\n", ret);
+		return;
+	}
+
+	ret = send_and_wait(tx_buffer, ret, 5000);
+	if (ret < 0) {
+		ninep_fid_free(&fid_table, walk_fid);
+		ninep_tag_free(&tag_table, tag);
+		printk("Remove failed\n");
+		return;
+	}
+
+	ret = ninep_parse_header(response_buffer, response_len, &hdr);
+	if (ret < 0 || hdr.type == NINEP_RERROR) {
+		print_9p_error("Remove");
+		ninep_tag_free(&tag_table, tag);
+		ninep_fid_free(&fid_table, walk_fid);
+		return;
+	}
+
+	printk("Removed: %s\n", path);
+	ninep_tag_free(&tag_table, tag);
+	/* Note: Tremove automatically clunks the FID, so just free from table */
+	ninep_fid_free(&fid_table, walk_fid);
 }
 
 /* Parse and execute command */
 static void execute_command(const char *line)
 {
 	char cmd[MAX_CMD_LEN];
-	char arg[MAX_CMD_LEN];
+	char arg1[MAX_CMD_LEN];
+	char arg2[MAX_CMD_LEN];
 	int n;
 
-	/* Parse command and argument */
-	n = sscanf(line, "%s %s", cmd, arg);
+	/* Parse command and arguments */
+	n = sscanf(line, "%s %s %s", cmd, arg1, arg2);
 	if (n < 1) {
 		return;
 	}
@@ -909,13 +1363,25 @@ static void execute_command(const char *line)
 	} else if (strcmp(cmd, "connect") == 0) {
 		cmd_connect();
 	} else if (strcmp(cmd, "ls") == 0) {
-		cmd_ls(n > 1 ? arg : NULL);
+		cmd_ls(n > 1 ? arg1 : NULL);
 	} else if (strcmp(cmd, "cd") == 0) {
-		cmd_cd(n > 1 ? arg : NULL);
+		cmd_cd(n > 1 ? arg1 : NULL);
 	} else if (strcmp(cmd, "cat") == 0) {
-		cmd_cat(n > 1 ? arg : NULL);
+		cmd_cat(n > 1 ? arg1 : NULL);
 	} else if (strcmp(cmd, "stat") == 0) {
-		cmd_stat(n > 1 ? arg : NULL);
+		cmd_stat(n > 1 ? arg1 : NULL);
+	} else if (strcmp(cmd, "echo") == 0) {
+		if (n >= 3) {
+			cmd_echo(arg1, arg2);
+		} else {
+			printk("Usage: echo <text> <file>\n");
+		}
+	} else if (strcmp(cmd, "touch") == 0) {
+		cmd_touch(n > 1 ? arg1 : NULL);
+	} else if (strcmp(cmd, "mkdir") == 0) {
+		cmd_mkdir(n > 1 ? arg1 : NULL);
+	} else if (strcmp(cmd, "rm") == 0) {
+		cmd_rm(n > 1 ? arg1 : NULL);
 	} else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0) {
 		printk("Goodbye!\n");
 		k_sleep(K_MSEC(100));

@@ -182,6 +182,50 @@ int ninep_build_tread(uint8_t *buf, size_t buf_len, uint16_t tag,
 int ninep_build_tstat(uint8_t *buf, size_t buf_len, uint16_t tag, uint32_t fid);
 
 /**
+ * @brief Build a Twrite message
+ *
+ * @param buf Output buffer
+ * @param buf_len Buffer length
+ * @param tag Message tag
+ * @param fid File identifier
+ * @param offset Offset in file to write at
+ * @param count Number of bytes to write
+ * @param data Data to write
+ * @return Number of bytes written, or negative error code
+ */
+int ninep_build_twrite(uint8_t *buf, size_t buf_len, uint16_t tag,
+                       uint32_t fid, uint64_t offset, uint32_t count,
+                       const uint8_t *data);
+
+/**
+ * @brief Build a Tcreate message
+ *
+ * @param buf Output buffer
+ * @param buf_len Buffer length
+ * @param tag Message tag
+ * @param fid File identifier of directory
+ * @param name Name of file to create
+ * @param name_len Length of name
+ * @param perm Permissions (use DMDIR for directories)
+ * @param mode Open mode
+ * @return Number of bytes written, or negative error code
+ */
+int ninep_build_tcreate(uint8_t *buf, size_t buf_len, uint16_t tag,
+                        uint32_t fid, const char *name, uint16_t name_len,
+                        uint32_t perm, uint8_t mode);
+
+/**
+ * @brief Build a Tremove message
+ *
+ * @param buf Output buffer
+ * @param buf_len Buffer length
+ * @param tag Message tag
+ * @param fid File identifier to remove
+ * @return Number of bytes written, or negative error code
+ */
+int ninep_build_tremove(uint8_t *buf, size_t buf_len, uint16_t tag, uint32_t fid);
+
+/**
  * @brief Build an Rerror message
  *
  * @param buf Output buffer

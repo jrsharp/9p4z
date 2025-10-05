@@ -47,7 +47,26 @@ Install Plan 9 from User Space on macOS:
 brew install plan9port
 ```
 
-### Setup
+### Quick Start
+
+Build and run the client in QEMU:
+
+```bash
+cd /path/to/workspace
+source .venv/bin/activate
+
+# Build the client
+west build -b qemu_x86 9p4z/samples/9p_client
+
+# Run in QEMU (boots to interactive prompt)
+west build -t run
+```
+
+The client will boot and show an interactive prompt. You can type `help` to see available commands.
+
+**Note:** Full end-to-end testing with a 9P server requires connecting QEMU's uart1 to the server. The helper scripts are a work in progress. For now, the client demonstrates successful boot with UART polling mode (no interrupt crashes!).
+
+### Manual Setup
 
 1. Create a test directory to serve:
 
@@ -59,48 +78,35 @@ mkdir subdir
 echo "File in subdirectory" > subdir/file.txt
 ```
 
-2. Start 9pserve:
+2. Start file server with 9pserve:
 
 ```bash
-# Serve the directory on a Unix socket
-9pserve -u /tmp/9p.sock &
+# Option 1: Serve directory via 9pex piped to 9pserve on Unix socket
+9pex ~/9p-test | 9pserve unix!/tmp/9p.sock &
 
-# Export the directory
-9pfuse 'unix!/tmp/9p.sock' ~/9p-test
+# Option 2: Serve via TCP (for remote testing)
+9pex ~/9p-test | 9pserve tcp!*!9999 &
+
+# Option 3: Use ramfs (in-memory filesystem)
+ramfs | 9pserve unix!/tmp/9p.sock &
 ```
 
-Alternatively, use TCP (for remote testing):
+**Note**: `9pserve` announces a 9P service on the specified address and multiplexes clients onto the file server (like `9pex` or `ramfs`) piped to its stdin/stdout.
+
+3. Build and run the client:
 
 ```bash
-# Serve on TCP port 9999
-9pserve tcp!*!9999 &
-```
-
-### Run the Client
-
-For native_posix with Unix socket:
-
-```bash
-# Build the client
-west build -b native_posix 9p4z/samples/9p_client
-
-# Run with socket connection
-# (Note: UART transport over Unix socket requires special setup)
-./build/zephyr/zephyr.exe
-```
-
-For QEMU with serial connection:
-
-```bash
-# Start QEMU with serial port mapped to Unix socket
+# Build for QEMU
 west build -b qemu_x86 9p4z/samples/9p_client
+
+# Run QEMU connected to the server
 qemu-system-i386 \
   -m 32 \
   -cpu qemu32 \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
   -no-reboot \
   -nographic \
-  -serial "unix:/tmp/9p.sock,server" \
+  -serial unix:/tmp/9p.sock \
   -kernel build/zephyr/zephyr.elf
 ```
 
