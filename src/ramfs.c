@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2025 9p4z Contributors
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: MIT
  */
 
 #include <zephyr/9p/ramfs.h>

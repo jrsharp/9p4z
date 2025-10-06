@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2025 9p4z Contributors
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: MIT
  *
  * Interactive 9P client - connects to 9pserve and provides shell commands
  */

@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2025 9p4z Contributors
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: MIT
  *
  * Simple 9P responder - responds to Tversion and Tattach
  * Can be connected to Plan 9 port tools via QEMU serial

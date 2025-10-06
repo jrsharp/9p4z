@@ -61,4 +61,4 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed setup instructions.
 
 ## License
 
-Apache-2.0
+MIT License - see [LICENSE](LICENSE) file for details
