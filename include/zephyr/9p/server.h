@@ -56,6 +56,43 @@ struct ninep_fs_node {
 
 /**
  * @brief File system operations
+ *
+ * This generic interface allows 9P to expose any subsystem as a filesystem.
+ * The current implementation includes a reference RAM filesystem (ramfs),
+ * but the interface is designed to be backend-agnostic.
+ *
+ * FUTURE ROADMAP - Additional filesystem backends:
+ * ================================================
+ *
+ * The fs_ops interface enables "everything is a file" abstraction over
+ * Zephyr subsystems, following the Plan 9 philosophy:
+ *
+ * - LittleFS backend (CONFIG_NINEP_FS_LITTLEFS)
+ *   Expose LittleFS partitions over 9P for remote file access
+ *
+ * - Settings subsystem (CONFIG_NINEP_FS_SETTINGS)
+ *   Read/write device settings as files:
+ *   /settings/bluetooth/name, /settings/network/hostname, etc.
+ *
+ * - NVS backend (CONFIG_NINEP_FS_NVS)
+ *   Expose Non-Volatile Storage as key-value files
+ *
+ * - Device drivers (CONFIG_NINEP_FS_DRIVERS)
+ *   Interact with hardware as files:
+ *   /dev/sensors/temp0, /dev/gpio/led0, /dev/uart/console
+ *
+ * - Shell execution (CONFIG_NINEP_FS_SHELL)
+ *   Execute shell commands via filesystem:
+ *   echo "help" > /shell/cmd; cat /shell/output
+ *
+ * - DFU/Firmware Update (CONFIG_NINEP_FS_DFU)
+ *   Perform firmware updates over 9P:
+ *   cat new_firmware.bin > /dfu/image
+ *   cat /dfu/status  # Check update status
+ *   echo "1" > /dfu/reboot  # Trigger reboot into new firmware
+ *
+ * Each backend implements this same interface, allowing seamless switching
+ * or even multiplexing multiple backends under different paths.
  */
 struct ninep_fs_ops {
 	/**
