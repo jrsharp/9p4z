@@ -440,6 +440,41 @@ int ninep_build_tstat(uint8_t *buf, size_t buf_len, uint16_t tag, uint32_t fid)
 	return pos;
 }
 
+int ninep_build_rstat(uint8_t *buf, size_t buf_len, uint16_t tag,
+                      const uint8_t *stat, uint16_t stat_len)
+{
+	if (!buf || !stat || buf_len < 7) {
+		return -EINVAL;
+	}
+
+	uint32_t msg_size = 7 + 2 + stat_len;  /* header + nstat + stat */
+	if (buf_len < msg_size) {
+		return -ENOSPC;
+	}
+
+	size_t pos = 0;
+	struct ninep_msg_header hdr = {
+		.size = msg_size,
+		.type = NINEP_RSTAT,
+		.tag = tag,
+	};
+
+	int ret = ninep_write_header(buf, buf_len, &hdr);
+	if (ret < 0) {
+		return ret;
+	}
+	pos = 7;
+
+	/* Write stat size */
+	write_u16_le(buf, &pos, stat_len);
+
+	/* Copy stat data */
+	memcpy(buf + pos, stat, stat_len);
+	pos += stat_len;
+
+	return pos;
+}
+
 int ninep_build_twrite(uint8_t *buf, size_t buf_len, uint16_t tag,
                        uint32_t fid, uint64_t offset, uint32_t count,
                        const uint8_t *data)

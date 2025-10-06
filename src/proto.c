@@ -151,3 +151,85 @@ int ninep_write_qid(uint8_t *buf, size_t len, size_t *offset,
 
 	return 0;
 }
+
+int ninep_write_stat(uint8_t *buf, size_t len, size_t *offset,
+                     const struct ninep_qid *qid, uint32_t mode,
+                     uint64_t length, const char *name, uint16_t name_len)
+{
+	if (!buf || !offset || !qid || !name) {
+		return -EINVAL;
+	}
+
+	/* Calculate stat size (excluding size field itself):
+	 * type[2] + dev[4] + qid[13] + mode[4] + atime[4] + mtime[4] +
+	 * length[8] + name[2+len] + uid[2+6] + gid[2+6] + muid[2+6]
+	 */
+	const char *uid = "zephyr";
+	const char *gid = "zephyr";
+	const char *muid = "zephyr";
+	uint16_t uid_len = strlen(uid);
+	uint16_t gid_len = strlen(gid);
+	uint16_t muid_len = strlen(muid);
+
+	uint16_t stat_size = 2 + 4 + 13 + 4 + 4 + 4 + 8 +
+	                     (2 + name_len) + (2 + uid_len) +
+	                     (2 + gid_len) + (2 + muid_len);
+
+	/* Check buffer space: need stat_size + 2 (for the size field itself) */
+	if (*offset + 2 + stat_size > len) {
+		return -ENOSPC;
+	}
+
+	/* Write stat size */
+	PUT_U16(buf + *offset, stat_size);
+	*offset += 2;
+
+	/* Write type and dev (kernel use, set to 0) */
+	PUT_U16(buf + *offset, 0);
+	*offset += 2;
+	PUT_U32(buf + *offset, 0);
+	*offset += 4;
+
+	/* Write qid */
+	int ret = ninep_write_qid(buf, len, offset, qid);
+	if (ret < 0) {
+		return ret;
+	}
+
+	/* Write mode */
+	PUT_U32(buf + *offset, mode);
+	*offset += 4;
+
+	/* Write atime and mtime (set to 0 for now) */
+	PUT_U32(buf + *offset, 0);
+	*offset += 4;
+	PUT_U32(buf + *offset, 0);
+	*offset += 4;
+
+	/* Write length */
+	PUT_U64(buf + *offset, length);
+	*offset += 8;
+
+	/* Write strings */
+	ret = ninep_write_string(buf, len, offset, name, name_len);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = ninep_write_string(buf, len, offset, uid, uid_len);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = ninep_write_string(buf, len, offset, gid, gid_len);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = ninep_write_string(buf, len, offset, muid, muid_len);
+	if (ret < 0) {
+		return ret;
+	}
+
+	return 0;
+}

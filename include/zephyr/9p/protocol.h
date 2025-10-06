@@ -198,6 +198,23 @@ int ninep_parse_qid(const uint8_t *buf, size_t len, size_t *offset,
 int ninep_write_qid(uint8_t *buf, size_t len, size_t *offset,
                     const struct ninep_qid *qid);
 
+/**
+ * @brief Write a stat structure to 9P message
+ *
+ * @param buf Output buffer
+ * @param len Buffer length
+ * @param offset Current offset in buffer (updated)
+ * @param qid File qid
+ * @param mode File mode/permissions
+ * @param length File length
+ * @param name File name
+ * @param name_len File name length
+ * @return 0 on success, negative error code on failure
+ */
+int ninep_write_stat(uint8_t *buf, size_t len, size_t *offset,
+                     const struct ninep_qid *qid, uint32_t mode,
+                     uint64_t length, const char *name, uint16_t name_len);
+
 /** @} */
 
 #ifdef __cplusplus

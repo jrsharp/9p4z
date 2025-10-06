@@ -182,6 +182,19 @@ int ninep_build_tread(uint8_t *buf, size_t buf_len, uint16_t tag,
 int ninep_build_tstat(uint8_t *buf, size_t buf_len, uint16_t tag, uint32_t fid);
 
 /**
+ * @brief Build an Rstat message
+ *
+ * @param buf Output buffer
+ * @param buf_len Buffer length
+ * @param tag Message tag
+ * @param stat Stat data
+ * @param stat_len Stat data length
+ * @return Number of bytes written, or negative error code
+ */
+int ninep_build_rstat(uint8_t *buf, size_t buf_len, uint16_t tag,
+                      const uint8_t *stat, uint16_t stat_len);
+
+/**
  * @brief Build a Twrite message
  *
  * @param buf Output buffer
