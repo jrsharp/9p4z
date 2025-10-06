@@ -1,0 +1,9 @@
+# Copyright (c) 2025 9p4z Contributors
+# SPDX-License-Identifier: MIT
+
+cmake_minimum_required(VERSION 3.20.0)
+
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+project(9p_server_tcp)
+
+target_sources(app PRIVATE src/main.c)
