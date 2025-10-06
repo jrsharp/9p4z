@@ -91,6 +91,17 @@ struct ninep_fs_node {
  *   cat /dfu/status  # Check update status
  *   echo "1" > /dfu/reboot  # Trigger reboot into new firmware
  *
+ * - Debug/Coredump (CONFIG_NINEP_FS_DEBUG)
+ *   Remote debugging over 9P, inspired by Plan 9's /proc:
+ *   echo "halt" > /debug/ctl  # Halt execution
+ *   cat /debug/threads/0/regs  # Read thread registers
+ *   cat /debug/threads/0/stack  # Stack trace
+ *   echo "0x20000000 256" > /debug/mem; cat /debug/mem  # Memory access
+ *   cat /debug/coredump > crash.core  # Generate coredump
+ *   echo "continue" > /debug/ctl  # Resume execution
+ *   Enables JTAG-less debugging over UART, TCP, or Bluetooth.
+ *   Compatible with acid-style debuggers and scriptable tools.
+ *
  * Each backend implements this same interface, allowing seamless switching
  * or even multiplexing multiple backends under different paths.
  */
