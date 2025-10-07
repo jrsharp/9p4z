@@ -107,6 +107,35 @@ static void handle_tattach(struct ninep_server *server, uint16_t tag,
 
 	LOG_DBG("Tattach: fid=%u", fid);
 
+	/* Validate pointers */
+	if (!server) {
+		LOG_ERR("server is NULL!");
+		return;
+	}
+	LOG_DBG("server=%p", server);
+
+	if (!server->config) {
+		LOG_ERR("server->config is NULL!");
+		send_error(server, tag, "server not configured");
+		return;
+	}
+	LOG_DBG("config=%p", server->config);
+
+	const struct ninep_fs_ops *ops = server->config->fs_ops;
+	if (!ops) {
+		LOG_ERR("fs_ops is NULL!");
+		send_error(server, tag, "filesystem not configured");
+		return;
+	}
+	LOG_DBG("fs_ops=%p", ops);
+
+	if (!ops->get_root) {
+		LOG_ERR("get_root is NULL!");
+		send_error(server, tag, "get_root not implemented");
+		return;
+	}
+	LOG_DBG("get_root=%p", ops->get_root);
+
 	/* Allocate FID */
 	struct ninep_server_fid *sfid = alloc_fid(server, fid);
 

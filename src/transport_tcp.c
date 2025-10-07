@@ -13,7 +13,7 @@
 
 LOG_MODULE_REGISTER(ninep_tcp_transport, CONFIG_NINEP_LOG_LEVEL);
 
-#define TCP_RECV_THREAD_STACK_SIZE 2048
+#define TCP_RECV_THREAD_STACK_SIZE 4096
 #define TCP_RECV_THREAD_PRIORITY 5
 
 struct tcp_transport_data {
@@ -25,7 +25,7 @@ struct tcp_transport_data {
 	k_tid_t recv_tid;
 	bool active;
 	struct k_thread recv_thread;
-	K_THREAD_STACK_MEMBER(recv_stack, TCP_RECV_THREAD_STACK_SIZE);
+	k_thread_stack_t recv_stack[K_KERNEL_STACK_LEN(TCP_RECV_THREAD_STACK_SIZE)];
 };
 
 static void tcp_recv_thread_fn(void *arg1, void *arg2, void *arg3)
@@ -210,7 +210,7 @@ static int tcp_start(struct ninep_transport *transport)
 	data->active = true;
 	data->client_sock = -1;
 	data->recv_tid = k_thread_create(&data->recv_thread, data->recv_stack,
-	                                  K_THREAD_STACK_SIZEOF(data->recv_stack),
+	                                  K_KERNEL_STACK_SIZEOF(data->recv_stack),
 	                                  tcp_recv_thread_fn, transport, NULL, NULL,
 	                                  TCP_RECV_THREAD_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(data->recv_tid, "9p_tcp_recv");

@@ -18,6 +18,7 @@ if(CONFIG_NINEP_SERVER)
   zephyr_library_sources(
     src/server.c
     src/ramfs.c
+    src/sysfs.c
   )
 endif()
 
