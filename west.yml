@@ -23,6 +23,7 @@ manifest:
         name-allowlist:
           - cmsis      # ARM CMSIS
           - hal_stm32  # STM32 HAL (if needed)
+          - hal_espressif  # ESP32 HAL
           - mcuboot    # Bootloader (optional)
           - mbedtls    # Crypto (optional)
           - segger     # Segger RTT (optional)

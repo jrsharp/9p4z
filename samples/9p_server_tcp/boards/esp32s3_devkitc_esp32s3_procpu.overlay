@@ -1,0 +1,5 @@
+/* Enable WiFi for ESP32-S3 DevKitC */
+
+&wifi {
+	status = "okay";
+};
