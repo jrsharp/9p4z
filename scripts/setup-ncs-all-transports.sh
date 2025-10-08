@@ -54,11 +54,12 @@ fi
 
 echo -e "${YELLOW}This will create:${NC}"
 echo -e "  $WORKSPACE_FULL/"
-echo -e "  ├── $MODULE_NAME/       # Git worktree (syncs with source!)"
+echo -e "  ├── $MODULE_NAME/       # Source copy (rsync from main repo)"
 echo -e "  └── build/              # Build output"
 echo -e "      └── 9p_server_all_transports/"
 echo ""
 echo -e "${GREEN}This workspace uses NCS v3.1.1 (no separate west init needed)${NC}"
+echo -e "${YELLOW}Note: Changes are NOT auto-synced. Work in main repo and re-run setup.${NC}"
 echo ""
 read -p "Continue? (y/N) " -n 1 -r
 echo
@@ -72,14 +73,13 @@ echo -e "\n${GREEN}[1/3]${NC} Creating workspace directory..."
 mkdir -p "$WORKSPACE_FULL"
 cd "$WORKSPACE_FULL"
 
-# Create git worktree
-echo -e "${GREEN}[2/3]${NC} Creating git worktree..."
-if [ ! -d "$MODULE_NAME/.git" ]; then
-    git -C "$MODULE_DIR" worktree add "$WORKSPACE_FULL/$MODULE_NAME"
-    echo "✓ Git worktree created (changes sync back to source)"
-else
-    echo "✓ Git worktree already exists"
-fi
+# Sync source files using rsync
+echo -e "${GREEN}[2/3]${NC} Syncing source files..."
+mkdir -p "$MODULE_NAME"
+rsync -a --exclude='.git' --exclude='build' --exclude='.venv' \
+    "$MODULE_DIR/" "$WORKSPACE_FULL/$MODULE_NAME/"
+echo "✓ Source files synced from $MODULE_DIR"
+echo "  Note: Use rsync to sync changes back manually"
 
 # Create build script
 echo -e "${GREEN}[3/3]${NC} Creating build script..."
@@ -203,7 +203,7 @@ The sample uses `prj_nrf.conf` which enables:
 
 ```
 9p4z-all-transports-ncs/
-├── 9p4z/                    # Git worktree (syncs with source)
+├── 9p4z/                    # Source copy (rsync from main repo)
 ├── build/                   # Build output
 │   └── 9p_server_all_transports/
 ├── build.sh                 # Build script
@@ -211,9 +211,25 @@ The sample uses `prj_nrf.conf` which enables:
 └── README.md                # This file
 ```
 
+## Updating Source Files
+
+After making changes in your main repo, sync them to this workspace:
+
+```bash
+cd ~/src/9p4z
+./scripts/setup-ncs-all-transports.sh
+```
+
+Or manually:
+
+```bash
+rsync -a ~/src/9p4z/ ~/zephyr-workspaces/9p4z-all-transports-ncs/9p4z/
+```
+
 ## Notes
 
-- Changes in `9p4z/` sync back to your main repo via git
+- Source files are copied (not a git worktree)
+- Make changes in main repo and re-sync
 - Uses NCS v3.1.1 (no separate west workspace needed)
 - Build directory is outside NCS to avoid conflicts
 - Total binary size: ~700KB (all transports + WiFi + BT stacks)
@@ -227,9 +243,10 @@ echo -e "${BLUE}Workspace location:${NC}"
 echo "  $WORKSPACE_FULL"
 echo ""
 
-echo -e "${BLUE}The $MODULE_NAME/ directory is a git worktree:${NC}"
-echo "  • Changes sync back to $MODULE_DIR via git"
-echo "  • Commit/push/pull work normally"
+echo -e "${BLUE}The $MODULE_NAME/ directory is synced from source:${NC}"
+echo "  • Work in $MODULE_DIR for development"
+echo "  • Re-run this script to sync changes"
+echo "  • Or use: rsync -a $MODULE_DIR/ $WORKSPACE_FULL/$MODULE_NAME/"
 echo ""
 
 echo -e "${BLUE}To build and flash:${NC}"
@@ -238,15 +255,18 @@ echo "  ./build.sh          # Build for nRF7002dk"
 echo "  ./flash.sh          # Flash via J-Link"
 echo ""
 
-echo -e "${BLUE}Next steps:${NC}"
-echo "  1. Create prj_nrf.conf for all-transports sample"
-echo "  2. Run ./build.sh"
-echo "  3. Run ./flash.sh"
-echo "  4. Connect serial console and test all transports"
+echo -e "${BLUE}To update source files after changes:${NC}"
+echo "  Re-run: $MODULE_DIR/scripts/setup-ncs-all-transports.sh"
 echo ""
 
-echo -e "${YELLOW}Note: You need to create prj_nrf.conf first!${NC}"
-echo "  See samples/9p_server_tcp/prj_nrf.conf as reference"
+echo -e "${BLUE}To remove this workspace:${NC}"
+echo "  rm -rf $WORKSPACE_FULL"
+echo ""
+
+echo -e "${BLUE}Next steps:${NC}"
+echo "  1. Run ./build.sh"
+echo "  2. Run ./flash.sh"
+echo "  3. Connect serial console and test all transports"
 echo ""
 
 echo -e "${GREEN}✓ Ready for all-transports development on nRF7002dk!${NC}"
