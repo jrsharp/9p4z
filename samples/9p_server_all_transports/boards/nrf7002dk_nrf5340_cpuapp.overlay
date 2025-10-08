@@ -1,0 +1,17 @@
+/*
+ * Copyright (c) 2025 9p4z Contributors
+ * SPDX-License-Identifier: MIT
+ *
+ * nRF7002dk overlay for all-transports sample
+ * Enables WiFi via nRF70 companion chip
+ */
+
+/ {
+	chosen {
+		zephyr,wifi = &wlan0;
+	};
+};
+
+&wlan0 {
+	status = "okay";
+};
