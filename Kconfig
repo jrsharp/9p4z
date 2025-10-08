@@ -70,9 +70,32 @@ config NINEP_TRANSPORT_TCP
 
 config NINEP_TRANSPORT_L2CAP
 	bool "Bluetooth L2CAP Transport"
-	depends on BT_L2CAP
+	depends on BT_L2CAP_DYNAMIC_CHANNEL
 	help
 	  Enable 9P over Bluetooth L2CAP transport.
+
+if NINEP_TRANSPORT_L2CAP
+
+config NINEP_L2CAP_PSM
+	hex "L2CAP PSM for 9P service"
+	default 0x0009
+	range 0x0080 0x00FF
+	help
+	  Protocol/Service Multiplexer (PSM) for the 9P L2CAP service.
+	  Must be in the dynamic PSM range (0x0080-0x00FF).
+	  Default: 0x0009 (matches iOS implementation).
+
+config NINEP_L2CAP_MTU
+	int "Maximum L2CAP MTU"
+	default 4096
+	range 23 65535
+	help
+	  Maximum L2CAP MTU (Maximum Transmission Unit) in bytes.
+	  The actual MTU will be negotiated with the peer.
+	  Typical values are 512, 1024, 2048, or 4096.
+	  Default: 4096 bytes.
+
+endif # NINEP_TRANSPORT_L2CAP
 
 module = NINEP
 module-str = 9p
