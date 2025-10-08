@@ -17,6 +17,10 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 static struct ninep_server server;
 static struct ninep_transport transport;
 
+/* Sysfs instance */
+static struct ninep_sysfs sysfs;
+static struct ninep_sysfs_entry sysfs_entries[32];
+
 /* RX buffer for L2CAP transport */
 static uint8_t rx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
 
@@ -122,42 +126,42 @@ static int setup_filesystem(void)
 	int ret;
 
 	/* Initialize sysfs */
-	ret = ninep_sysfs_init();
+	ret = ninep_sysfs_init(&sysfs, sysfs_entries, ARRAY_SIZE(sysfs_entries));
 	if (ret < 0) {
 		LOG_ERR("Failed to initialize sysfs: %d", ret);
 		return ret;
 	}
 
 	/* Create /hello.txt */
-	ret = ninep_sysfs_add_file("hello.txt", gen_hello, NULL, 27);
+	ret = ninep_sysfs_register_file(&sysfs, "hello.txt", gen_hello, NULL);
 	if (ret < 0) {
 		LOG_ERR("Failed to add hello.txt: %d", ret);
 		return ret;
 	}
 
 	/* Create /sys directory */
-	ret = ninep_sysfs_add_dir("sys");
+	ret = ninep_sysfs_register_dir(&sysfs, "sys");
 	if (ret < 0) {
 		LOG_ERR("Failed to add sys directory: %d", ret);
 		return ret;
 	}
 
 	/* Create /sys/version */
-	ret = ninep_sysfs_add_file("sys/version", gen_version, NULL, 128);
+	ret = ninep_sysfs_register_file(&sysfs, "sys/version", gen_version, NULL);
 	if (ret < 0) {
 		LOG_ERR("Failed to add sys/version: %d", ret);
 		return ret;
 	}
 
 	/* Create /sys/uptime */
-	ret = ninep_sysfs_add_file("sys/uptime", gen_uptime, NULL, 64);
+	ret = ninep_sysfs_register_file(&sysfs, "sys/uptime", gen_uptime, NULL);
 	if (ret < 0) {
 		LOG_ERR("Failed to add sys/uptime: %d", ret);
 		return ret;
 	}
 
 	/* Create /docs directory */
-	ret = ninep_sysfs_add_dir("docs");
+	ret = ninep_sysfs_register_dir(&sysfs, "docs");
 	if (ret < 0) {
 		LOG_ERR("Failed to add docs directory: %d", ret);
 		return ret;
@@ -199,15 +203,6 @@ int main(void)
 		return 0;
 	}
 
-	/* Initialize 9P server with sysfs */
-	ret = ninep_server_init(&server, ninep_sysfs_get_fs());
-	if (ret < 0) {
-		LOG_ERR("Failed to initialize 9P server: %d", ret);
-		return 0;
-	}
-
-	LOG_INF("9P server initialized");
-
 	/* Initialize L2CAP transport */
 	struct ninep_transport_l2cap_config l2cap_config = {
 		.psm = CONFIG_NINEP_L2CAP_PSM,
@@ -215,8 +210,7 @@ int main(void)
 		.rx_buf_size = sizeof(rx_buf),
 	};
 
-	ret = ninep_transport_l2cap_init(&transport, &l2cap_config,
-	                                  ninep_server_handle_message, &server);
+	ret = ninep_transport_l2cap_init(&transport, &l2cap_config, NULL, NULL);
 	if (ret < 0) {
 		LOG_ERR("Failed to initialize L2CAP transport: %d", ret);
 		return 0;
@@ -224,13 +218,26 @@ int main(void)
 
 	LOG_INF("L2CAP transport initialized");
 
-	/* Attach transport to server */
-	ninep_server_set_transport(&server, &transport);
+	/* Initialize 9P server with sysfs */
+	struct ninep_server_config server_config = {
+		.fs_ops = ninep_sysfs_get_ops(),
+		.fs_ctx = &sysfs,
+		.max_message_size = CONFIG_NINEP_MAX_MESSAGE_SIZE,
+		.version = "9P2000",
+	};
 
-	/* Start transport (registers L2CAP server) */
-	ret = ninep_transport_start(&transport);
+	ret = ninep_server_init(&server, &server_config, &transport);
 	if (ret < 0) {
-		LOG_ERR("Failed to start transport: %d", ret);
+		LOG_ERR("Failed to initialize 9P server: %d", ret);
+		return 0;
+	}
+
+	LOG_INF("9P server initialized");
+
+	/* Start server (starts transport and begins accepting messages) */
+	ret = ninep_server_start(&server);
+	if (ret < 0) {
+		LOG_ERR("Failed to start server: %d", ret);
 		return 0;
 	}
 
