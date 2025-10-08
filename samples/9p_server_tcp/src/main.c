@@ -246,16 +246,23 @@ static int gen_wifi_status(uint8_t *buf, size_t buf_size,
 		return snprintf((char *)buf, buf_size, "No network interface\n");
 	}
 
-	struct wifi_iface_status status = {0};
+	/* Allocate status struct from heap to avoid stack overflow */
+	struct wifi_iface_status *status = k_malloc(sizeof(struct wifi_iface_status));
+	if (!status) {
+		return snprintf((char *)buf, buf_size, "Error: Out of memory\n");
+	}
+
+	memset(status, 0, sizeof(*status));
 	int ret = net_mgmt(NET_REQUEST_WIFI_IFACE_STATUS, iface,
-	                   &status, sizeof(status));
+	                   status, sizeof(*status));
 
 	if (ret < 0) {
+		k_free(status);
 		return snprintf((char *)buf, buf_size, "WiFi status unavailable (error %d)\n", ret);
 	}
 
 	const char *state_str;
-	switch (status.state) {
+	switch (status->state) {
 	case WIFI_STATE_DISCONNECTED:
 		state_str = "DISCONNECTED";
 		break;
@@ -288,24 +295,25 @@ static int gen_wifi_status(uint8_t *buf, size_t buf_size,
 		break;
 	}
 
-	size_t len = snprintf((char *)buf, buf_size,
-	                      "State: %s\n"
-	                      "SSID: %s\n"
-	                      "Channel: %d\n"
-	                      "Link Mode: %s\n"
-	                      "RSSI: %d dBm\n",
-	                      state_str,
-	                      status.ssid,
-	                      status.channel,
-	                      status.link_mode == WIFI_LINK_MODE_UNKNOWN ? "UNKNOWN" :
-	                      status.link_mode == WIFI_1 ? "802.11b" :
-	                      status.link_mode == WIFI_2 ? "802.11a" :
-	                      status.link_mode == WIFI_3 ? "802.11g" :
-	                      status.link_mode == WIFI_4 ? "802.11n" :
-	                      status.link_mode == WIFI_5 ? "802.11ac" :
-	                      status.link_mode == WIFI_6 ? "802.11ax" : "OTHER",
-	                      status.rssi);
+	int len = snprintf((char *)buf, buf_size,
+	                   "State: %s\n"
+	                   "SSID: %s\n"
+	                   "Channel: %d\n"
+	                   "Link Mode: %s\n"
+	                   "RSSI: %d dBm\n",
+	                   state_str,
+	                   status->ssid,
+	                   status->channel,
+	                   status->link_mode == WIFI_LINK_MODE_UNKNOWN ? "UNKNOWN" :
+	                   status->link_mode == WIFI_1 ? "802.11b" :
+	                   status->link_mode == WIFI_2 ? "802.11a" :
+	                   status->link_mode == WIFI_3 ? "802.11g" :
+	                   status->link_mode == WIFI_4 ? "802.11n" :
+	                   status->link_mode == WIFI_5 ? "802.11ac" :
+	                   status->link_mode == WIFI_6 ? "802.11ax" : "OTHER",
+	                   status->rssi);
 
+	k_free(status);
 	return len;
 }
 
@@ -324,15 +332,24 @@ static int gen_wifi_rssi(uint8_t *buf, size_t buf_size,
 		return snprintf((char *)buf, buf_size, "N/A\n");
 	}
 
-	struct wifi_iface_status status = {0};
+	/* Allocate status struct from heap to avoid stack overflow */
+	struct wifi_iface_status *status = k_malloc(sizeof(struct wifi_iface_status));
+	if (!status) {
+		return snprintf((char *)buf, buf_size, "Error: Out of memory\n");
+	}
+
+	memset(status, 0, sizeof(*status));
 	int ret = net_mgmt(NET_REQUEST_WIFI_IFACE_STATUS, iface,
-	                   &status, sizeof(status));
+	                   status, sizeof(*status));
 
 	if (ret < 0) {
+		k_free(status);
 		return snprintf((char *)buf, buf_size, "N/A\n");
 	}
 
-	return snprintf((char *)buf, buf_size, "%d dBm\n", status.rssi);
+	int len = snprintf((char *)buf, buf_size, "%d dBm\n", status->rssi);
+	k_free(status);
+	return len;
 }
 
 static void setup_demo_filesystem(void)

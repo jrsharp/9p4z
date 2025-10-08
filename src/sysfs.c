@@ -34,7 +34,7 @@ static struct ninep_fs_node *alloc_node(struct ninep_sysfs *sysfs,
 			memset(node, 0, sizeof(*node));
 			strncpy(node->name, name, sizeof(node->name) - 1);
 			node->type = is_dir ? NINEP_NODE_DIR : NINEP_NODE_FILE;
-			node->mode = is_dir ? 0755 : 0444;
+			node->mode = is_dir ? (0755 | NINEP_DMDIR) : 0444;
 			node->qid.path = sysfs->next_qid_path++;
 			node->qid.version = 0;
 			node->qid.type = is_dir ? NINEP_QTDIR : NINEP_QTFILE;
@@ -186,12 +186,12 @@ static int sysfs_read(struct ninep_fs_node *node, uint64_t offset,
 
 	if (node->type == NINEP_NODE_DIR) {
 		/* Read directory - list children */
-		LOG_DBG("Reading directory: %s", node->name);
+		LOG_DBG("Reading directory: %s, offset=%llu", node->name, offset);
 
 		char parent_path[256];
 		strncpy(parent_path, node->name, sizeof(parent_path) - 1);
+		parent_path[sizeof(parent_path) - 1] = '\0';
 
-		size_t buf_offset = 0;
 		char child_names[32][64];  /* Track unique child names */
 		int num_children = 0;
 
@@ -217,6 +217,10 @@ static int sysfs_read(struct ninep_fs_node *node, uint64_t offset,
 			}
 		}
 
+		/* Handle offset - skip entries we've already sent */
+		uint64_t current_offset = 0;
+		size_t buf_offset = 0;
+
 		/* Generate directory entries */
 		for (int i = 0; i < num_children; i++) {
 			char child_path[256];
@@ -226,49 +230,51 @@ static int sysfs_read(struct ninep_fs_node *node, uint64_t offset,
 			struct ninep_sysfs_entry *child_entry = find_entry(sysfs, child_path);
 			bool is_dir = child_entry ? child_entry->is_dir : true;
 
-			/* Build stat structure */
-			uint16_t name_len = strlen(child_names[i]);
-			uint16_t stat_size = 2 + 4 + 13 + 4 + 4 + 4 + 8 +
-			                      2 + name_len + 2 + 0 + 2 + 0 + 2 + 0;
-			uint32_t entry_size = 2 + stat_size;
+			/* Build qid for this child */
+			struct ninep_qid child_qid;
+			child_qid.type = is_dir ? NINEP_QTDIR : NINEP_QTFILE;
+			child_qid.version = 0;
+			/* Generate unique qid.path based on path string hash */
+			child_qid.path = 0;
+			for (const char *p = child_path; *p; p++) {
+				child_qid.path = child_qid.path * 31 + *p;
+			}
 
-			if (buf_offset + entry_size > count) {
+			/* Calculate stat entry size:
+			 * size[2] + type[2] + dev[4] + qid[13] + mode[4] + atime[4] +
+			 * mtime[4] + length[8] + name[2+len] + uid[2+6] + gid[2+6] + muid[2+6]
+			 */
+			uint16_t name_len = strlen(child_names[i]);
+			size_t stat_size = 2 + 2 + 4 + 13 + 4 + 4 + 4 + 8 +
+			                   (2 + name_len) + (2 + 6) + (2 + 6) + (2 + 6);
+
+			/* Skip if this entry is before our requested offset */
+			if (current_offset + stat_size <= offset) {
+				current_offset += stat_size;
+				continue;
+			}
+
+			/* Check if we have space in the buffer */
+			if (buf_offset + stat_size > count) {
+				/* No more space */
 				break;
 			}
 
-			/* size[2] */
-			buf[buf_offset++] = stat_size & 0xFF;
-			buf[buf_offset++] = (stat_size >> 8) & 0xFF;
+			/* Write the stat structure */
+			size_t write_offset = 0;
+			int ret = ninep_write_stat(buf + buf_offset, count - buf_offset,
+			                           &write_offset, &child_qid,
+			                           is_dir ? (0755 | NINEP_DMDIR) : 0444,
+			                           0,  /* length */
+			                           child_names[i], name_len);
 
-			/* type[2], dev[4] */
-			memset(&buf[buf_offset], 0, 6);
-			buf_offset += 6;
+			if (ret < 0) {
+				/* Error writing stat */
+				break;
+			}
 
-			/* qid[13] */
-			buf[buf_offset++] = is_dir ? NINEP_QTDIR : NINEP_QTFILE;
-			memset(&buf[buf_offset], 0, 12);  /* version + path */
-			buf_offset += 12;
-
-			/* mode[4] */
-			uint32_t mode = is_dir ? 0755 | NINEP_DMDIR : 0444;
-			buf[buf_offset++] = mode & 0xFF;
-			buf[buf_offset++] = (mode >> 8) & 0xFF;
-			buf[buf_offset++] = (mode >> 16) & 0xFF;
-			buf[buf_offset++] = (mode >> 24) & 0xFF;
-
-			/* atime[4], mtime[4], length[8] */
-			memset(&buf[buf_offset], 0, 16);
-			buf_offset += 16;
-
-			/* name[s] */
-			buf[buf_offset++] = name_len & 0xFF;
-			buf[buf_offset++] = (name_len >> 8) & 0xFF;
-			memcpy(&buf[buf_offset], child_names[i], name_len);
-			buf_offset += name_len;
-
-			/* uid[s], gid[s], muid[s] - all empty */
-			memset(&buf[buf_offset], 0, 6);
-			buf_offset += 6;
+			buf_offset += write_offset;
+			current_offset += write_offset;
 		}
 
 		LOG_DBG("Directory read: %d children, %zu bytes", num_children, buf_offset);
@@ -293,10 +299,21 @@ static int sysfs_stat(struct ninep_fs_node *node, uint8_t *buf,
                       size_t buf_len, void *fs_ctx)
 {
 	size_t offset = 0;
+	uint16_t name_len = strlen(node->name);
 
-	return ninep_write_stat(buf, buf_len, &offset, &node->qid,
-	                        node->mode, node->length,
-	                        node->name, strlen(node->name));
+	LOG_DBG("sysfs_stat: name='%s', len=%u, mode=0x%x",
+	        node->name, name_len, node->mode);
+
+	int ret = ninep_write_stat(buf, buf_len, &offset, &node->qid,
+	                           node->mode, node->length,
+	                           node->name, name_len);
+	if (ret < 0) {
+		LOG_ERR("ninep_write_stat failed: %d", ret);
+		return ret;
+	}
+
+	LOG_DBG("sysfs_stat returning %zu bytes", offset);
+	return offset;  /* Return number of bytes written */
 }
 
 /* Filesystem operations */
