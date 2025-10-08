@@ -21,39 +21,62 @@
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 /* Transport instances */
+#ifdef CONFIG_NINEP_TRANSPORT_UART
 static struct ninep_transport uart_transport;
-static struct ninep_transport tcp_transport;
-static struct ninep_transport l2cap_transport;
-
-/* Server instances (one per transport, all sharing same filesystem) */
 static struct ninep_server uart_server;
+#endif
+
+#ifdef CONFIG_NINEP_TRANSPORT_TCP
+static struct ninep_transport tcp_transport;
 static struct ninep_server tcp_server;
+#endif
+
+#ifdef CONFIG_NINEP_TRANSPORT_L2CAP
+static struct ninep_transport l2cap_transport;
 static struct ninep_server l2cap_server;
+#endif
 
 /* Shared filesystem */
 static struct ninep_sysfs sysfs;
 static struct ninep_sysfs_entry sysfs_entries[32];
 
 /* RX buffers for each transport */
+#ifdef CONFIG_NINEP_TRANSPORT_UART
 static uint8_t uart_rx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
-static uint8_t tcp_rx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
-static uint8_t l2cap_rx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
+#endif
 
+#ifdef CONFIG_NINEP_TRANSPORT_TCP
+static uint8_t tcp_rx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
+#endif
+
+#ifdef CONFIG_NINEP_TRANSPORT_L2CAP
+static uint8_t l2cap_rx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
+#endif
+
+#ifdef CONFIG_NINEP_TRANSPORT_L2CAP
 /* Bluetooth advertising data */
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
 	        sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
+#endif
 
 /* Generator functions for synthetic files */
 static int gen_hello(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx)
 {
 	const char *msg = "Hello from 9P all transports sample!\n"
 	                  "This filesystem is available via:\n"
+#ifdef CONFIG_NINEP_TRANSPORT_UART
 	                  "- UART\n"
+#endif
+#ifdef CONFIG_NINEP_TRANSPORT_TCP
 	                  "- TCP (port 564)\n"
-	                  "- Bluetooth L2CAP (PSM 0x0009)\n";
+#endif
+#ifdef CONFIG_NINEP_TRANSPORT_L2CAP
+	                  "- Bluetooth L2CAP (PSM 0x0009)\n"
+#endif
+	                  ;
 	size_t len = strlen(msg);
 
 	if (offset >= len) {
@@ -74,12 +97,24 @@ static int gen_version(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx
 	                  "Zephyr: %s\n"
 	                  "Build: %s %s\n\n"
 	                  "Active Transports:\n"
+#ifdef CONFIG_NINEP_TRANSPORT_UART
 	                  "- UART: %s\n"
+#endif
+#ifdef CONFIG_NINEP_TRANSPORT_TCP
 	                  "- TCP: port 564\n"
-	                  "- L2CAP: PSM 0x%04x\n",
-	                  KERNEL_VERSION_STRING, __DATE__, __TIME__,
-	                  DEVICE_DT_NAME(DT_CHOSEN(zephyr_console)),
-	                  CONFIG_NINEP_L2CAP_PSM);
+#endif
+#ifdef CONFIG_NINEP_TRANSPORT_L2CAP
+	                  "- L2CAP: PSM 0x%04x\n"
+#endif
+	                  ,
+	                  KERNEL_VERSION_STRING, __DATE__, __TIME__
+#ifdef CONFIG_NINEP_TRANSPORT_UART
+	                  , DEVICE_DT_NAME(DT_CHOSEN(zephyr_console))
+#endif
+#ifdef CONFIG_NINEP_TRANSPORT_L2CAP
+	                  , CONFIG_NINEP_L2CAP_PSM
+#endif
+	                  );
 
 	if (offset >= len) {
 		return 0;
@@ -163,6 +198,7 @@ static int setup_filesystem(void)
 	return 0;
 }
 
+#ifdef CONFIG_NINEP_TRANSPORT_UART
 /* Initialize UART transport and server */
 static int init_uart_server(void)
 {
@@ -208,7 +244,9 @@ static int init_uart_server(void)
 	LOG_INF("UART transport initialized on %s", uart_dev->name);
 	return 0;
 }
+#endif /* CONFIG_NINEP_TRANSPORT_UART */
 
+#ifdef CONFIG_NINEP_TRANSPORT_TCP
 /* Initialize TCP transport and server */
 static int init_tcp_server(void)
 {
@@ -247,7 +285,9 @@ static int init_tcp_server(void)
 	LOG_INF("TCP transport initialized on port 564");
 	return 0;
 }
+#endif /* CONFIG_NINEP_TRANSPORT_TCP */
 
+#ifdef CONFIG_NINEP_TRANSPORT_L2CAP
 /* Initialize L2CAP transport and server */
 static int init_l2cap_server(void)
 {
@@ -305,6 +345,7 @@ static int init_l2cap_server(void)
 	LOG_INF("L2CAP transport initialized on PSM 0x%04x", CONFIG_NINEP_L2CAP_PSM);
 	return 0;
 }
+#endif /* CONFIG_NINEP_TRANSPORT_L2CAP */
 
 int main(void)
 {
@@ -324,27 +365,39 @@ int main(void)
 	/* Initialize all transports */
 	LOG_INF("Initializing transports...");
 
+#ifdef CONFIG_NINEP_TRANSPORT_UART
 	ret = init_uart_server();
 	if (ret < 0) {
 		LOG_WRN("UART transport not available (continuing without it)");
 	}
+#endif
 
+#ifdef CONFIG_NINEP_TRANSPORT_TCP
 	ret = init_tcp_server();
 	if (ret < 0) {
 		LOG_WRN("TCP transport not available (continuing without it)");
 	}
+#endif
 
+#ifdef CONFIG_NINEP_TRANSPORT_L2CAP
 	ret = init_l2cap_server();
 	if (ret < 0) {
 		LOG_WRN("L2CAP transport not available (continuing without it)");
 	}
+#endif
 
 	LOG_INF("===========================================");
 	LOG_INF("Server ready!");
 	LOG_INF("===========================================");
+#ifdef CONFIG_NINEP_TRANSPORT_UART
 	LOG_INF("UART:  Connect via serial console");
+#endif
+#ifdef CONFIG_NINEP_TRANSPORT_TCP
 	LOG_INF("TCP:   9p -a tcp!<IP>!564 ls /");
+#endif
+#ifdef CONFIG_NINEP_TRANSPORT_L2CAP
 	LOG_INF("L2CAP: Use iOS 9p4i app, PSM 0x%04x", CONFIG_NINEP_L2CAP_PSM);
+#endif
 	LOG_INF("===========================================");
 
 	/* All servers run in background via transport callbacks */
