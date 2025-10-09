@@ -128,8 +128,13 @@ static struct ninep_fs_node *sysfs_walk(struct ninep_fs_node *parent,
 	}
 
 	/* Build target path */
-	snprintf(target_path, sizeof(target_path), "%s/%.*s",
-	         parent_path, name_len, name);
+	if (parent_path[0] == '\0') {
+		/* Root - don't add leading slash */
+		snprintf(target_path, sizeof(target_path), "%.*s", name_len, name);
+	} else {
+		snprintf(target_path, sizeof(target_path), "%s/%.*s",
+		         parent_path, name_len, name);
+	}
 
 	LOG_DBG("Walking: parent='%s', name='%.*s', target='%s'",
 	        parent->name, name_len, name, target_path);
@@ -170,12 +175,32 @@ static struct ninep_fs_node *sysfs_walk(struct ninep_fs_node *parent,
 /* Open node */
 static int sysfs_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 {
-	/* Sysfs files are read-only */
-	if (mode != NINEP_OREAD && mode != NINEP_OEXEC) {
-		return -EACCES;
+	struct ninep_sysfs *sysfs = fs_ctx;
+
+	/* Find entry to check if writable */
+	struct ninep_sysfs_entry *entry = find_entry(sysfs, node->name);
+
+	/* Directories are always read-only */
+	if (node->type == NINEP_NODE_DIR) {
+		if (mode != NINEP_OREAD && mode != NINEP_OEXEC) {
+			return -EACCES;
+		}
+		return 0;
 	}
 
-	return 0;
+	/* Files: check if writable */
+	if (mode == NINEP_OREAD || mode == NINEP_OEXEC) {
+		return 0;  /* Read always allowed */
+	}
+
+	if (mode == NINEP_OWRITE || mode == NINEP_ORDWR) {
+		if (!entry || !entry->writable) {
+			return -EACCES;  /* Not writable */
+		}
+		return 0;
+	}
+
+	return -EACCES;
 }
 
 /* Read from file */
@@ -224,11 +249,18 @@ static int sysfs_read(struct ninep_fs_node *node, uint64_t offset,
 		/* Generate directory entries */
 		for (int i = 0; i < num_children; i++) {
 			char child_path[256];
-			snprintf(child_path, sizeof(child_path), "%s/%s",
-			         parent_path, child_names[i]);
+
+			/* Build child path - handle root specially */
+			if (strcmp(parent_path, "/") == 0) {
+				/* Root - don't add leading slash */
+				snprintf(child_path, sizeof(child_path), "%s", child_names[i]);
+			} else {
+				snprintf(child_path, sizeof(child_path), "%s/%s",
+				         parent_path, child_names[i]);
+			}
 
 			struct ninep_sysfs_entry *child_entry = find_entry(sysfs, child_path);
-			bool is_dir = child_entry ? child_entry->is_dir : true;
+			bool is_dir = child_entry ? child_entry->is_dir : false;
 
 			/* Build qid for this child */
 			struct ninep_qid child_qid;
@@ -294,6 +326,29 @@ static int sysfs_read(struct ninep_fs_node *node, uint64_t offset,
 	}
 }
 
+/* Write to file */
+static int sysfs_write(struct ninep_fs_node *node, uint64_t offset,
+                       const uint8_t *buf, uint32_t count, void *fs_ctx)
+{
+	struct ninep_sysfs *sysfs = fs_ctx;
+
+	if (node->type == NINEP_NODE_DIR) {
+		return -EISDIR;
+	}
+
+	/* Find entry */
+	struct ninep_sysfs_entry *entry = find_entry(sysfs, node->name);
+
+	if (!entry || !entry->writer) {
+		return -EIO;
+	}
+
+	int ret = entry->writer(buf, count, offset, entry->ctx);
+	LOG_DBG("File write: %s, offset=%llu, count=%u, ret=%d",
+	        node->name, offset, count, ret);
+	return ret;
+}
+
 /* Get stat */
 static int sysfs_stat(struct ninep_fs_node *node, uint8_t *buf,
                       size_t buf_len, void *fs_ctx)
@@ -322,7 +377,7 @@ static const struct ninep_fs_ops sysfs_ops = {
 	.walk = sysfs_walk,
 	.open = sysfs_open,
 	.read = sysfs_read,
-	.write = NULL,  /* Read-only */
+	.write = sysfs_write,
 	.stat = sysfs_stat,
 	.create = NULL,
 	.remove = NULL,
@@ -373,12 +428,43 @@ int ninep_sysfs_register_file(struct ninep_sysfs *sysfs,
 
 	entry->path = path;
 	entry->generator = generator;
+	entry->writer = NULL;
 	entry->ctx = ctx;
 	entry->is_dir = false;
+	entry->writable = false;
 
 	sysfs->num_entries++;
 
 	LOG_DBG("Registered file: %s", path);
+	return 0;
+}
+
+int ninep_sysfs_register_writable_file(struct ninep_sysfs *sysfs,
+                                        const char *path,
+                                        ninep_sysfs_generator_t generator,
+                                        ninep_sysfs_writer_t writer,
+                                        void *ctx)
+{
+	if (!sysfs || !path) {
+		return -EINVAL;
+	}
+
+	if (sysfs->num_entries >= sysfs->max_entries) {
+		return -ENOMEM;
+	}
+
+	struct ninep_sysfs_entry *entry = &sysfs->entries[sysfs->num_entries];
+
+	entry->path = path;
+	entry->generator = generator;
+	entry->writer = writer;
+	entry->ctx = ctx;
+	entry->is_dir = false;
+	entry->writable = (writer != NULL);
+
+	sysfs->num_entries++;
+
+	LOG_DBG("Registered writable file: %s", path);
 	return 0;
 }
 
@@ -396,8 +482,10 @@ int ninep_sysfs_register_dir(struct ninep_sysfs *sysfs, const char *path)
 
 	entry->path = path;
 	entry->generator = NULL;
+	entry->writer = NULL;
 	entry->ctx = NULL;
 	entry->is_dir = true;
+	entry->writable = false;
 
 	sysfs->num_entries++;
 

@@ -9,14 +9,24 @@
 #include <zephyr/kernel.h>
 #include <zephyr/9p/server.h>
 #include <zephyr/9p/sysfs.h>
+#ifdef CONFIG_NINEP_TRANSPORT_UART
 #include <zephyr/9p/transport_uart.h>
+#endif
+#ifdef CONFIG_NINEP_TRANSPORT_TCP
 #include <zephyr/9p/transport_tcp.h>
+#endif
+#ifdef CONFIG_NINEP_TRANSPORT_L2CAP
 #include <zephyr/9p/transport_l2cap.h>
-#include <zephyr/logging/log.h>
-#include <zephyr/net/net_if.h>
 #include <zephyr/bluetooth/bluetooth.h>
+#endif
+#include <zephyr/logging/log.h>
+#ifdef CONFIG_NINEP_TRANSPORT_TCP
+#include <zephyr/net/net_if.h>
+#endif
 #include <zephyr/device.h>
+#ifdef CONFIG_NINEP_TRANSPORT_UART
 #include <zephyr/drivers/uart.h>
+#endif
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -107,7 +117,7 @@ static int gen_version(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx
 	                  "- L2CAP: PSM 0x%04x\n"
 #endif
 	                  ,
-	                  KERNEL_VERSION_STRING, __DATE__, __TIME__
+	                  "9p4z", __DATE__, __TIME__
 #ifdef CONFIG_NINEP_TRANSPORT_UART
 	                  , DEVICE_DT_NAME(DT_CHOSEN(zephyr_console))
 #endif
@@ -160,35 +170,35 @@ static int setup_filesystem(void)
 	}
 
 	/* Create /hello.txt */
-	ret = ninep_sysfs_add_file(&sysfs, "hello.txt", gen_hello, NULL, 256);
+	ret = ninep_sysfs_register_file(&sysfs, "hello.txt", gen_hello, NULL);
 	if (ret < 0) {
 		LOG_ERR("Failed to add hello.txt: %d", ret);
 		return ret;
 	}
 
 	/* Create /sys directory */
-	ret = ninep_sysfs_add_dir(&sysfs, "sys");
+	ret = ninep_sysfs_register_dir(&sysfs, "sys");
 	if (ret < 0) {
 		LOG_ERR("Failed to add sys directory: %d", ret);
 		return ret;
 	}
 
 	/* Create /sys/version */
-	ret = ninep_sysfs_add_file(&sysfs, "sys/version", gen_version, NULL, 512);
+	ret = ninep_sysfs_register_file(&sysfs, "sys/version", gen_version, NULL);
 	if (ret < 0) {
 		LOG_ERR("Failed to add sys/version: %d", ret);
 		return ret;
 	}
 
 	/* Create /sys/uptime */
-	ret = ninep_sysfs_add_file(&sysfs, "sys/uptime", gen_uptime, NULL, 64);
+	ret = ninep_sysfs_register_file(&sysfs, "sys/uptime", gen_uptime, NULL);
 	if (ret < 0) {
 		LOG_ERR("Failed to add sys/uptime: %d", ret);
 		return ret;
 	}
 
 	/* Create /docs directory */
-	ret = ninep_sysfs_add_dir(&sysfs, "docs");
+	ret = ninep_sysfs_register_dir(&sysfs, "docs");
 	if (ret < 0) {
 		LOG_ERR("Failed to add docs directory: %d", ret);
 		return ret;
@@ -351,6 +361,8 @@ int main(void)
 {
 	int ret;
 
+	printk("\n\n*** 9P All Transports Server Starting ***\n");
+
 	LOG_INF("===========================================");
 	LOG_INF("9P All Transports Server");
 	LOG_INF("===========================================");
@@ -400,6 +412,13 @@ int main(void)
 #endif
 	LOG_INF("===========================================");
 
+	printk("Server running - shell available\n");
+
 	/* All servers run in background via transport callbacks */
+	/* Keep main thread alive for shell and logging */
+	while (1) {
+		k_sleep(K_SECONDS(60));
+	}
+
 	return 0;
 }

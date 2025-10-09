@@ -9,9 +9,18 @@
 #include <zephyr/bluetooth/l2cap.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/net/buf.h>
 #include <string.h>
 #include <errno.h>
+
+/* Platform detection: NCS vs mainline Zephyr */
+#if defined(CONFIG_NRF_MODEM_LIB) || defined(CONFIG_NCS_BOOT_BANNER)
+#define NINEP_NCS_BUILD 1
+#include <zephyr/bluetooth/buf.h>
+#include <zephyr/net_buf.h>
+#else
+#define NINEP_NCS_BUILD 0
+#include <zephyr/net/buf.h>
+#endif
 
 LOG_MODULE_REGISTER(ninep_l2cap_transport, CONFIG_NINEP_LOG_LEVEL);
 
@@ -39,7 +48,18 @@ struct l2cap_transport_data {
 	uint8_t *rx_buf;
 	size_t rx_buf_size;
 	bool connected;
+	struct ninep_transport *transport;  /* Backpointer to parent transport */
+#if NINEP_NCS_BUILD
+	struct net_buf_pool tx_pool;  /* TX buffer pool for NCS */
+#endif
 };
+
+#if NINEP_NCS_BUILD
+/* NCS: Define TX buffer pool for L2CAP SDUs */
+#define TX_BUF_COUNT 4
+#define TX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_MAX_MESSAGE_SIZE)
+NET_BUF_POOL_DEFINE(l2cap_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE, 0, NULL);
+#endif
 
 /* Forward declarations */
 static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
@@ -47,7 +67,14 @@ static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
 
 static void l2cap_connected(struct bt_l2cap_chan *chan)
 {
-	struct l2cap_9p_chan *ch = CONTAINER_OF(chan, struct l2cap_9p_chan, le);
+#if NINEP_NCS_BUILD
+	/* NCS: Two-step CONTAINER_OF via BT_L2CAP_LE_CHAN macro */
+	struct bt_l2cap_le_chan *le_chan = BT_L2CAP_LE_CHAN(chan);
+	struct l2cap_9p_chan *ch = CONTAINER_OF(le_chan, struct l2cap_9p_chan, le);
+#else
+	/* Mainline: Direct CONTAINER_OF */
+	struct l2cap_9p_chan *ch = CONTAINER_OF(chan, struct l2cap_9p_chan, le.chan);
+#endif
 	struct l2cap_transport_data *data = CONTAINER_OF(ch, struct l2cap_transport_data, channel);
 
 	LOG_INF("L2CAP channel connected (MTU: RX=%u, TX=%u)",
@@ -62,7 +89,12 @@ static void l2cap_connected(struct bt_l2cap_chan *chan)
 
 static void l2cap_disconnected(struct bt_l2cap_chan *chan)
 {
-	struct l2cap_9p_chan *ch = CONTAINER_OF(chan, struct l2cap_9p_chan, le);
+#if NINEP_NCS_BUILD
+	struct bt_l2cap_le_chan *le_chan = BT_L2CAP_LE_CHAN(chan);
+	struct l2cap_9p_chan *ch = CONTAINER_OF(le_chan, struct l2cap_9p_chan, le);
+#else
+	struct l2cap_9p_chan *ch = CONTAINER_OF(chan, struct l2cap_9p_chan, le.chan);
+#endif
 	struct l2cap_transport_data *data = CONTAINER_OF(ch, struct l2cap_transport_data, channel);
 
 	LOG_INF("L2CAP channel disconnected");
@@ -76,7 +108,12 @@ static void l2cap_disconnected(struct bt_l2cap_chan *chan)
 
 static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 {
-	struct l2cap_9p_chan *ch = CONTAINER_OF(chan, struct l2cap_9p_chan, le);
+#if NINEP_NCS_BUILD
+	struct bt_l2cap_le_chan *le_chan = BT_L2CAP_LE_CHAN(chan);
+	struct l2cap_9p_chan *ch = CONTAINER_OF(le_chan, struct l2cap_9p_chan, le);
+#else
+	struct l2cap_9p_chan *ch = CONTAINER_OF(chan, struct l2cap_9p_chan, le.chan);
+#endif
 	struct ninep_transport *transport = ch->transport;
 
 	LOG_DBG("L2CAP recv: %u bytes", buf->len);
@@ -144,6 +181,14 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 	return 0;
 }
 
+#if NINEP_NCS_BUILD
+/* NCS: .sent callback has no status parameter */
+static void l2cap_sent(struct bt_l2cap_chan *chan)
+{
+	LOG_DBG("L2CAP sent successfully");
+}
+#else
+/* Mainline: .sent callback has status parameter */
 static void l2cap_sent(struct bt_l2cap_chan *chan, int status)
 {
 	if (status < 0) {
@@ -152,6 +197,7 @@ static void l2cap_sent(struct bt_l2cap_chan *chan, int status)
 		LOG_DBG("L2CAP sent successfully");
 	}
 }
+#endif
 
 static struct bt_l2cap_chan_ops l2cap_chan_ops = {
 	.connected = l2cap_connected,
@@ -178,8 +224,7 @@ static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
 	/* Initialize channel */
 	memset(&data->channel, 0, sizeof(data->channel));
 	data->channel.le.chan.ops = &l2cap_chan_ops;
-	data->channel.transport = (struct ninep_transport *)((uint8_t *)data -
-	                          offsetof(struct ninep_transport, priv_data));
+	data->channel.transport = data->transport;
 	data->channel.rx_buf = data->rx_buf;
 	data->channel.rx_buf_size = data->rx_buf_size;
 	data->channel.rx_len = 0;
@@ -201,12 +246,23 @@ static int l2cap_send(struct ninep_transport *transport, const uint8_t *buf,
 		return -ENOTCONN;
 	}
 
-	/* Allocate net_buf for message */
+#if NINEP_NCS_BUILD
+	/* NCS: Allocate from application buffer pool */
+	msg_buf = net_buf_alloc(&l2cap_tx_pool, K_FOREVER);
+	if (!msg_buf) {
+		LOG_ERR("Failed to allocate net_buf");
+		return -ENOMEM;
+	}
+	/* Reserve L2CAP SDU headroom */
+	net_buf_reserve(msg_buf, BT_L2CAP_SDU_CHAN_SEND_RESERVE);
+#else
+	/* Mainline: Allocate from channel's built-in buffer pool */
 	msg_buf = net_buf_alloc(&data->channel.le.tx.seg.pool, K_FOREVER);
 	if (!msg_buf) {
 		LOG_ERR("Failed to allocate net_buf");
 		return -ENOMEM;
 	}
+#endif
 
 	/* Copy message data to net_buf */
 	net_buf_add_mem(msg_buf, buf, len);
@@ -294,6 +350,7 @@ int ninep_transport_l2cap_init(struct ninep_transport *transport,
 	data->rx_buf = config->rx_buf;
 	data->rx_buf_size = config->rx_buf_size;
 	data->connected = false;
+	data->transport = transport;
 
 	/* Initialize L2CAP server */
 	data->server.psm = config->psm;

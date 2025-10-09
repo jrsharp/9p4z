@@ -34,13 +34,29 @@ typedef int (*ninep_sysfs_generator_t)(uint8_t *buf, size_t buf_size,
                                         uint64_t offset, void *ctx);
 
 /**
+ * @brief Content writer callback
+ *
+ * Called when a sysfs file is written. Should process the written data.
+ *
+ * @param buf Buffer containing data to write
+ * @param count Number of bytes to write
+ * @param offset Offset within the file (for partial writes)
+ * @param ctx Optional context pointer passed during registration
+ * @return Number of bytes written, or negative error code
+ */
+typedef int (*ninep_sysfs_writer_t)(const uint8_t *buf, uint32_t count,
+                                     uint64_t offset, void *ctx);
+
+/**
  * @brief Sysfs file entry
  */
 struct ninep_sysfs_entry {
 	const char *path;                  /* Full path (e.g., "/sys/uptime") */
 	ninep_sysfs_generator_t generator; /* Content generator callback */
-	void *ctx;                         /* Optional context for generator */
+	ninep_sysfs_writer_t writer;       /* Content writer callback (NULL for read-only) */
+	void *ctx;                         /* Optional context for generator/writer */
 	bool is_dir;                       /* True for directories */
+	bool writable;                     /* True if file is writable */
 };
 
 /**
@@ -79,6 +95,22 @@ int ninep_sysfs_register_file(struct ninep_sysfs *sysfs,
                                const char *path,
                                ninep_sysfs_generator_t generator,
                                void *ctx);
+
+/**
+ * @brief Register a writable sysfs file
+ *
+ * @param sysfs Sysfs instance
+ * @param path Full path to the file (e.g., "/dev/led")
+ * @param generator Content generator callback (for reads)
+ * @param writer Content writer callback (for writes)
+ * @param ctx Optional context pointer passed to generator/writer
+ * @return 0 on success, negative error code on failure
+ */
+int ninep_sysfs_register_writable_file(struct ninep_sysfs *sysfs,
+                                        const char *path,
+                                        ninep_sysfs_generator_t generator,
+                                        ninep_sysfs_writer_t writer,
+                                        void *ctx);
 
 /**
  * @brief Register a sysfs directory
