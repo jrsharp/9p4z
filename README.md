@@ -6,7 +6,7 @@ A clean, modern 9P protocol library implementation for Zephyr RTOS.
 ## Features
 
 - ✅ **9P2000 Protocol** - Full message parsing and serialization
-- ✅ **Multiple Transports** - UART, TCP/IP (coming), Bluetooth L2CAP (coming)
+- ✅ **Multiple Transports** - UART, TCP/IPv4, Bluetooth L2CAP
 - ✅ **Zephyr Native** - Proper module integration with Kconfig
 - ✅ **No Dynamic Allocation** - Fixed resource tables for embedded systems
 - ✅ **Comprehensive Tests** - 31 test cases with 100% core coverage
@@ -15,9 +15,9 @@ A clean, modern 9P protocol library implementation for Zephyr RTOS.
 ## Transport Support
 
 - ✅ **UART** - Serial transport with interrupt-driven RX
-- ⏳ **TCP/IPv4** - Network transport (Phase 3)
+- ✅ **TCP/IPv4** - Network transport with server and client support
 - ⏳ **TCP/IPv6** - IPv6 network transport (Phase 3)
-- ⏳ **Bluetooth L2CAP** - Bluetooth transport (Phase 4)
+- ✅ **Bluetooth L2CAP** - Bluetooth transport with connection-oriented channels
 - ⏳ **Thread/802.15.4** - Mesh network transport (Phase 4)
 
 ## Quick Start
