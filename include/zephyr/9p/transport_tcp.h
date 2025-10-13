@@ -20,6 +20,10 @@ extern "C" {
 
 /**
  * @brief TCP transport configuration
+ *
+ * This transport operates in dual-stack mode when CONFIG_NET_IPV6 is enabled,
+ * accepting both native IPv6 and IPv4-mapped IPv6 connections.
+ * When CONFIG_NET_IPV6 is disabled, it operates in IPv4-only mode.
  */
 struct ninep_tcp_config {
 	/** Port to listen on (default: 564) */
@@ -30,6 +34,11 @@ struct ninep_tcp_config {
 
 /**
  * @brief Initialize TCP transport
+ *
+ * Creates a TCP transport that listens on the specified port.
+ * When IPv6 is enabled (CONFIG_NET_IPV6), binds to :: (all interfaces)
+ * in dual-stack mode, accepting both IPv6 and IPv4 connections.
+ * When IPv6 is disabled, binds to 0.0.0.0 for IPv4-only operation.
  *
  * @param transport Transport instance
  * @param config TCP configuration

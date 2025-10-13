@@ -68,6 +68,11 @@ config NINEP_TRANSPORT_TCP
 	help
 	  Enable 9P over TCP/IP transport.
 
+	  When CONFIG_NET_IPV6 is enabled, operates in dual-stack mode,
+	  accepting both native IPv6 and IPv4-mapped IPv6 connections.
+
+	  When CONFIG_NET_IPV6 is disabled, operates in IPv4-only mode.
+
 config NINEP_TRANSPORT_L2CAP
 	bool "Bluetooth L2CAP Transport"
 	depends on BT_L2CAP_DYNAMIC_CHANNEL

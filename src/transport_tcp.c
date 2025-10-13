@@ -44,7 +44,7 @@ static void tcp_recv_thread_fn(void *arg1, void *arg2, void *arg3)
 	while (data->active) {
 		/* Wait for client connection if not connected */
 		if (data->client_sock < 0) {
-			struct sockaddr_in client_addr;
+			struct sockaddr_storage client_addr;
 			socklen_t client_addr_len = sizeof(client_addr);
 
 			LOG_INF("Waiting for client connection on port %d", data->port);
@@ -61,11 +61,21 @@ static void tcp_recv_thread_fn(void *arg1, void *arg2, void *arg3)
 				continue;
 			}
 
-			LOG_INF("Client connected from %d.%d.%d.%d",
-			        ((uint8_t *)&client_addr.sin_addr)[0],
-			        ((uint8_t *)&client_addr.sin_addr)[1],
-			        ((uint8_t *)&client_addr.sin_addr)[2],
-			        ((uint8_t *)&client_addr.sin_addr)[3]);
+			/* Log client connection with address */
+			char addr_str[INET6_ADDRSTRLEN];
+			if (client_addr.ss_family == AF_INET6) {
+				struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&client_addr;
+				zsock_inet_ntop(AF_INET6, &addr6->sin6_addr,
+				               addr_str, sizeof(addr_str));
+				LOG_INF("Client connected from [%s]:%d",
+				        addr_str, ntohs(addr6->sin6_port));
+			} else {
+				struct sockaddr_in *addr4 = (struct sockaddr_in *)&client_addr;
+				zsock_inet_ntop(AF_INET, &addr4->sin_addr,
+				               addr_str, sizeof(addr_str));
+				LOG_INF("Client connected from %s:%d",
+				        addr_str, ntohs(addr4->sin_port));
+			}
 
 			/* Reset receive state for new connection */
 			rx_offset = 0;
@@ -164,10 +174,52 @@ static int tcp_send(struct ninep_transport *transport, const uint8_t *buf,
 static int tcp_start(struct ninep_transport *transport)
 {
 	struct tcp_transport_data *data = transport->priv_data;
-	struct sockaddr_in addr;
 	int ret;
 
-	/* Create listen socket */
+#if defined(CONFIG_NET_IPV6)
+	/* Use IPv6 socket in dual-stack mode when IPv6 is available */
+	struct sockaddr_in6 addr;
+
+	data->listen_sock = zsock_socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+	if (data->listen_sock < 0) {
+		LOG_ERR("Failed to create IPv6 socket: %d", errno);
+		return -errno;
+	}
+
+	/* Allow reuse of address */
+	int opt = 1;
+	ret = zsock_setsockopt(data->listen_sock, SOL_SOCKET, SO_REUSEADDR,
+	                 &opt, sizeof(opt));
+	if (ret < 0) {
+		LOG_WRN("Failed to set SO_REUSEADDR: %d", errno);
+	}
+
+	/* Disable IPv6-only mode to allow IPv4-mapped IPv6 addresses */
+	opt = 0;
+	ret = zsock_setsockopt(data->listen_sock, IPPROTO_IPV6, IPV6_V6ONLY,
+	                 &opt, sizeof(opt));
+	if (ret < 0) {
+		LOG_WRN("Failed to set IPV6_V6ONLY: %d", errno);
+	}
+
+	/* Bind to port on all interfaces (IPv6 and IPv4-mapped) */
+	memset(&addr, 0, sizeof(addr));
+	addr.sin6_family = AF_INET6;
+	addr.sin6_addr = in6addr_any;
+	addr.sin6_port = htons(data->port);
+
+	ret = zsock_bind(data->listen_sock, (struct sockaddr *)&addr, sizeof(addr));
+	if (ret < 0) {
+		LOG_ERR("Failed to bind to port %d: %d", data->port, errno);
+		zsock_close(data->listen_sock);
+		return -errno;
+	}
+
+	LOG_INF("Listening on port %d (IPv6 dual-stack)", data->port);
+#else
+	/* IPv4-only mode when IPv6 is not available */
+	struct sockaddr_in addr;
+
 	data->listen_sock = zsock_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (data->listen_sock < 0) {
 		LOG_ERR("Failed to create socket: %d", errno);
@@ -176,14 +228,13 @@ static int tcp_start(struct ninep_transport *transport)
 
 	/* Allow reuse of address */
 	int opt = 1;
-
 	ret = zsock_setsockopt(data->listen_sock, SOL_SOCKET, SO_REUSEADDR,
 	                 &opt, sizeof(opt));
 	if (ret < 0) {
 		LOG_WRN("Failed to set SO_REUSEADDR: %d", errno);
 	}
 
-	/* Bind to port */
+	/* Bind to port on all IPv4 interfaces */
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = INADDR_ANY;
@@ -196,6 +247,9 @@ static int tcp_start(struct ninep_transport *transport)
 		return -errno;
 	}
 
+	LOG_INF("Listening on port %d (IPv4)", data->port);
+#endif
+
 	/* Listen for connections */
 	ret = zsock_listen(data->listen_sock, 1);
 	if (ret < 0) {
@@ -203,8 +257,6 @@ static int tcp_start(struct ninep_transport *transport)
 		zsock_close(data->listen_sock);
 		return -errno;
 	}
-
-	LOG_INF("Listening on port %d", data->port);
 
 	/* Start receive thread */
 	data->active = true;

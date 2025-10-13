@@ -3,6 +3,9 @@
  * SPDX-License-Identifier: MIT
  *
  * 9P TCP Server - Serves a synthetic filesystem over TCP/IP
+ *
+ * Operates in dual-stack mode (IPv4 + IPv6) when CONFIG_NET_IPV6 is enabled.
+ * Accepts both native IPv6 connections and IPv4-mapped IPv6 connections.
  */
 
 #include <zephyr/kernel.h>
@@ -28,12 +31,13 @@ static struct ninep_server_config server_config;
 /* Static content for demo files */
 static const char *hello_content = "Hello from Zephyr 9P TCP server!\n";
 static const char *readme_content =
-	"9P Server on Zephyr RTOS over TCP/IP\n"
-	"======================================\n\n"
+	"9P Server on Zephyr RTOS over TCP/IP (Dual-Stack)\n"
+	"===================================================\n\n"
 	"This is a demonstration 9P server running on Zephyr.\n"
 	"It serves both static demo files and dynamic system info.\n\n"
 	"Connection:\n"
-	"  Port:    564 (standard 9P port)\n\n"
+	"  Port:    564 (standard 9P port)\n"
+	"  Mode:    Dual-stack (IPv4 + IPv6)\n\n"
 	"Demo Files:\n"
 	"  /hello.txt  - Static greeting\n"
 	"  /readme.txt - This file\n"
@@ -42,9 +46,18 @@ static const char *readme_content =
 	"  /sys/uptime  - System uptime\n"
 	"  /sys/version - Kernel version\n"
 	"  /sys/board   - Board name\n\n"
-	"Try:\n"
-	"  9p -a tcp!<IP>!564 ls /\n"
-	"  9p -a tcp!<IP>!564 read /sys/uptime\n";
+	"Network Info:\n"
+	"  /net/interfaces - Network interface details\n"
+	"  /net/stats      - Network statistics\n\n"
+	"WiFi Info (on supported hardware):\n"
+	"  /wifi/status    - WiFi connection status\n"
+	"  /wifi/rssi      - Signal strength\n\n"
+	"Try (IPv4):\n"
+	"  9p -a tcp!192.0.2.1!564 ls /\n"
+	"  9p -a tcp!192.0.2.1!564 read /sys/uptime\n\n"
+	"Try (IPv6):\n"
+	"  9p -a tcp![2001:db8::1]!564 ls /\n"
+	"  9p -a tcp![2001:db8::1]!564 read /net/interfaces\n";
 static const char *doc1_content = "This is document 1\n";
 static const char *doc2_content = "This is document 2\n";
 
@@ -490,8 +503,9 @@ int main(void)
 		return -1;
 	}
 
-	LOG_INF("9P server listening on tcp!192.0.2.1!564");
-	LOG_INF("Connect with: 9p -a tcp!192.0.2.1!564 ls /");
+	LOG_INF("9P server ready - dual-stack TCP transport");
+	LOG_INF("  IPv4: 9p -a tcp!192.0.2.1!564 ls /");
+	LOG_INF("  IPv6: 9p -a tcp![2001:db8::1]!564 ls /");
 
 	/* Server runs in background via transport callbacks.
 	 * Shell runs automatically on console.
