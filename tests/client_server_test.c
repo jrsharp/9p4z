@@ -24,7 +24,8 @@ static struct mock_transport client_transport;
 static struct mock_transport server_transport;
 static struct ninep_client client;
 static struct ninep_server server;
-static struct ninep_sysfs_ctx sysfs_ctx;
+static struct ninep_sysfs sysfs;
+static struct ninep_sysfs_entry sysfs_entries[32];
 
 /* Mock transport send - delivers directly to peer */
 static int mock_send(struct ninep_transport *transport, const uint8_t *buf, size_t len)
@@ -54,6 +55,57 @@ static int mock_stop(struct ninep_transport *transport)
 	return 0;
 }
 
+static const struct ninep_transport_ops mock_ops = {
+	.send = mock_send,
+	.start = mock_start,
+	.stop = mock_stop,
+};
+
+/* Static content for test files */
+static const char *hello_content = "Hello from 9P!\n";
+static const char *data_content = "\x01\x02\x03\x04";
+static const char *nested_content = "Nested file\n";
+
+/* Generator for static content */
+static int gen_static(uint8_t *buf, size_t buf_size,
+                      uint64_t offset, void *ctx)
+{
+	const char *content = (const char *)ctx;
+	size_t len = strlen(content);
+
+	if (offset >= len) {
+		return 0;
+	}
+
+	size_t to_copy = len - offset;
+	if (to_copy > buf_size) {
+		to_copy = buf_size;
+	}
+
+	memcpy(buf, content + offset, to_copy);
+	return to_copy;
+}
+
+/* Generator for binary data (data.bin) */
+static int gen_data_bin(uint8_t *buf, size_t buf_size,
+                        uint64_t offset, void *ctx)
+{
+	const uint8_t *content = (const uint8_t *)ctx;
+	size_t len = 4; /* data_content is 4 bytes */
+
+	if (offset >= len) {
+		return 0;
+	}
+
+	size_t to_copy = len - offset;
+	if (to_copy > buf_size) {
+		to_copy = buf_size;
+	}
+
+	memcpy(buf, content + offset, to_copy);
+	return to_copy;
+}
+
 /* Test setup */
 static void *client_server_setup(void)
 {
@@ -63,40 +115,30 @@ static void *client_server_setup(void)
 	memset(&client_transport, 0, sizeof(client_transport));
 	memset(&server_transport, 0, sizeof(server_transport));
 
-	client_transport.base.send = mock_send;
-	client_transport.base.start = mock_start;
-	client_transport.base.stop = mock_stop;
+	client_transport.base.ops = &mock_ops;
 	client_transport.peer = &server_transport.base;
 
-	server_transport.base.send = mock_send;
-	server_transport.base.start = mock_start;
-	server_transport.base.stop = mock_stop;
+	server_transport.base.ops = &mock_ops;
 	server_transport.peer = &client_transport.base;
 
 	/* Setup server filesystem */
-	ret = ninep_sysfs_init(&sysfs_ctx);
+	ret = ninep_sysfs_init(&sysfs, sysfs_entries, ARRAY_SIZE(sysfs_entries));
 	zassert_equal(ret, 0, "Failed to init sysfs");
 
 	/* Add test files */
-	ret = ninep_sysfs_add_file(&sysfs_ctx, "/", "hello.txt", 0644,
-	                           "Hello from 9P!\n", 16);
-	zassert_equal(ret, 0, "Failed to add hello.txt");
+	ninep_sysfs_register_file(&sysfs, "/hello.txt", gen_static,
+	                           (void *)hello_content);
+	ninep_sysfs_register_file(&sysfs, "/data.bin", gen_data_bin,
+	                           (void *)data_content);
 
-	ret = ninep_sysfs_add_file(&sysfs_ctx, "/", "data.bin", 0644,
-	                           "\x01\x02\x03\x04", 4);
-	zassert_equal(ret, 0, "Failed to add data.bin");
-
-	ret = ninep_sysfs_add_dir(&sysfs_ctx, "/", "testdir", 0755);
-	zassert_equal(ret, 0, "Failed to add testdir");
-
-	ret = ninep_sysfs_add_file(&sysfs_ctx, "/testdir", "nested.txt", 0644,
-	                           "Nested file\n", 12);
-	zassert_equal(ret, 0, "Failed to add nested.txt");
+	ninep_sysfs_register_dir(&sysfs, "/testdir");
+	ninep_sysfs_register_file(&sysfs, "/testdir/nested.txt", gen_static,
+	                           (void *)nested_content);
 
 	/* Initialize server */
 	struct ninep_server_config server_config = {
-		.fs_ops = &ninep_sysfs_ops,
-		.fs_ctx = &sysfs_ctx,
+		.fs_ops = ninep_sysfs_get_ops(),
+		.fs_ctx = &sysfs,
 		.max_message_size = CONFIG_NINEP_MAX_MESSAGE_SIZE,
 		.version = "9P2000",
 	};

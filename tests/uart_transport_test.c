@@ -1,9 +1,15 @@
 /*
  * Copyright (c) 2025 9p4z Contributors
  * SPDX-License-Identifier: MIT
+ *
+ * UART Transport Tests - Only runs when UART emulator is available
  */
 
 #include <zephyr/ztest.h>
+#include <zephyr/devicetree.h>
+
+#if DT_HAS_COMPAT_STATUS_OKAY(zephyr_uart_emul)
+
 #include <zephyr/9p/transport_uart.h>
 #include <zephyr/9p/message.h>
 #include <zephyr/9p/protocol.h>
@@ -436,3 +442,4 @@ ZTEST(ninep_uart_transport, test_uart_bidirectional_communication)
 	zassert_equal(hdr.type, NINEP_TATTACH, "Wrong loopback message type");
 	zassert_equal(hdr.tag, 1, "Wrong loopback tag");
 }
+#endif /* DT_HAS_COMPAT_STATUS_OKAY(zephyr_uart_emul) */

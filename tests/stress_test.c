@@ -26,7 +26,8 @@ static struct mock_transport client_transport;
 static struct mock_transport server_transport;
 static struct ninep_client client;
 static struct ninep_server server;
-static struct ninep_sysfs_ctx sysfs_ctx;
+static struct ninep_sysfs sysfs;
+static struct ninep_sysfs_entry sysfs_entries[32];
 
 /* Mock transport send */
 static int mock_send(struct ninep_transport *transport, const uint8_t *buf, size_t len)
@@ -65,6 +66,56 @@ static int mock_stop(struct ninep_transport *transport)
 	return 0;
 }
 
+static const struct ninep_transport_ops mock_ops = {
+	.send = mock_send,
+	.start = mock_start,
+	.stop = mock_stop,
+};
+
+/* Static content for test files */
+static const char *small_content = "tiny";
+static const char *deep_content = "Deep file";
+static char large_data[4096];
+
+/* Generator for static content */
+static int gen_static(uint8_t *buf, size_t buf_size,
+                      uint64_t offset, void *ctx)
+{
+	const char *content = (const char *)ctx;
+	size_t len = strlen(content);
+
+	if (offset >= len) {
+		return 0;
+	}
+
+	size_t to_copy = len - offset;
+	if (to_copy > buf_size) {
+		to_copy = buf_size;
+	}
+
+	memcpy(buf, content + offset, to_copy);
+	return to_copy;
+}
+
+/* Generator for large binary data */
+static int gen_large_bin(uint8_t *buf, size_t buf_size,
+                         uint64_t offset, void *ctx)
+{
+	size_t len = 4096; /* large_data is 4096 bytes */
+
+	if (offset >= len) {
+		return 0;
+	}
+
+	size_t to_copy = len - offset;
+	if (to_copy > buf_size) {
+		to_copy = buf_size;
+	}
+
+	memcpy(buf, large_data + offset, to_copy);
+	return to_copy;
+}
+
 /* Setup */
 static void *stress_setup(void)
 {
@@ -73,48 +124,38 @@ static void *stress_setup(void)
 	memset(&client_transport, 0, sizeof(client_transport));
 	memset(&server_transport, 0, sizeof(server_transport));
 
-	client_transport.base.send = mock_send;
-	client_transport.base.start = mock_start;
-	client_transport.base.stop = mock_stop;
+	client_transport.base.ops = &mock_ops;
 	client_transport.peer = &server_transport.base;
 
-	server_transport.base.send = mock_send;
-	server_transport.base.start = mock_start;
-	server_transport.base.stop = mock_stop;
+	server_transport.base.ops = &mock_ops;
 	server_transport.peer = &client_transport.base;
 
-	ret = ninep_sysfs_init(&sysfs_ctx);
+	/* Initialize large data array */
+	memset(large_data, 'A', sizeof(large_data));
+
+	ret = ninep_sysfs_init(&sysfs, sysfs_entries, ARRAY_SIZE(sysfs_entries));
 	zassert_equal(ret, 0, "Failed to init sysfs");
 
 	/* Add diverse test files */
-	ret = ninep_sysfs_add_file(&sysfs_ctx, "/", "small.txt", 0644, "tiny", 4);
-	zassert_equal(ret, 0, "Failed to add small.txt");
+	ninep_sysfs_register_file(&sysfs, "/small.txt", gen_static,
+	                           (void *)small_content);
 
 	/* Large file (near max message size) */
-	char large_data[4096];
-	memset(large_data, 'A', sizeof(large_data));
-	ret = ninep_sysfs_add_file(&sysfs_ctx, "/", "large.bin", 0644,
-	                           large_data, sizeof(large_data));
-	zassert_equal(ret, 0, "Failed to add large.bin");
+	ninep_sysfs_register_file(&sysfs, "/large.bin", gen_large_bin, NULL);
 
-	ret = ninep_sysfs_add_dir(&sysfs_ctx, "/", "dir1", 0755);
-	zassert_equal(ret, 0, "Failed to add dir1");
-
-	ret = ninep_sysfs_add_dir(&sysfs_ctx, "/dir1", "dir2", 0755);
-	zassert_equal(ret, 0, "Failed to add dir2");
-
-	ret = ninep_sysfs_add_file(&sysfs_ctx, "/dir1/dir2", "deep.txt", 0644,
-	                           "Deep file", 9);
-	zassert_equal(ret, 0, "Failed to add deep.txt");
+	ninep_sysfs_register_dir(&sysfs, "/dir1");
+	ninep_sysfs_register_dir(&sysfs, "/dir1/dir2");
+	ninep_sysfs_register_file(&sysfs, "/dir1/dir2/deep.txt", gen_static,
+	                           (void *)deep_content);
 
 	/* Writable file for stress tests */
-	ret = ninep_sysfs_add_file(&sysfs_ctx, "/", "writable.dat", 0666, "", 0);
-	zassert_equal(ret, 0, "Failed to add writable.dat");
+	ninep_sysfs_register_file(&sysfs, "/writable.dat", gen_static,
+	                           (void *)"");
 
 	/* Initialize server */
 	struct ninep_server_config server_config = {
-		.fs_ops = &ninep_sysfs_ops,
-		.fs_ctx = &sysfs_ctx,
+		.fs_ops = ninep_sysfs_get_ops(),
+		.fs_ctx = &sysfs,
 		.max_message_size = CONFIG_NINEP_MAX_MESSAGE_SIZE,
 		.version = "9P2000",
 	};
