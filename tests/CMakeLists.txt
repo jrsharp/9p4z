@@ -14,4 +14,5 @@ target_sources(app PRIVATE
   message_test.c
   message_builder_test.c
   uart_transport_test.c
+  client_server_test.c
 )
