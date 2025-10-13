@@ -56,8 +56,44 @@ jobs:
 
     strategy:
       matrix:
-        sample: [uart_echo]
-        board: [native_posix, qemu_x86, qemu_cortex_m3]
+        include:
+          # UART samples - basic platforms
+          - sample: uart_echo
+            board: native_posix
+          - sample: uart_echo
+            board: qemu_x86
+          - sample: uart_echo
+            board: qemu_cortex_m3
+
+          # TCP server samples
+          - sample: 9p_server_tcp
+            board: qemu_x86
+          - sample: 9p_server_tcp
+            board: native_posix
+
+          # Generic server sample
+          - sample: 9p_server
+            board: qemu_x86
+          - sample: 9p_server
+            board: native_posix
+          - sample: 9p_server
+            board: qemu_cortex_m3
+
+          # Client samples
+          - sample: 9p_client
+            board: qemu_x86
+          - sample: 9p_client
+            board: native_posix
+
+          - sample: 9p_client_test
+            board: qemu_x86
+
+          # Responder sample
+          - sample: 9p_responder
+            board: qemu_x86
+
+          # Note: L2CAP and all-transports samples require Bluetooth,
+          # which needs specific hardware/emulation not available in CI
 
     steps:
       - name: Checkout code
@@ -74,7 +110,7 @@ jobs:
       - name: Build sample
         run: |
           cd 9p4z
-          west build -b ${{ matrix.board }} samples/${{ matrix.sample }}/
+          west build -b ${{ matrix.board }} samples/${{ matrix.sample }}/ --pristine
 
       - name: Upload build artifacts
         if: always()
