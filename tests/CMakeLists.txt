@@ -16,4 +16,5 @@ target_sources(app PRIVATE
   uart_transport_test.c
   client_server_test.c
   stress_test.c
+  tcp_transport_test.c
 )
