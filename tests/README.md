@@ -2,6 +2,8 @@
 
 This directory contains the comprehensive test suite for the 9p4z project, implementing best practices from the Zephyr Test Framework (ztest).
 
+**📋 For overall test strategy and regression tracking, see [TEST_STRATEGY.md](TEST_STRATEGY.md)**
+
 ## Test Organization
 
 ### Test Suites
