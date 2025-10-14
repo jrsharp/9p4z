@@ -16,5 +16,9 @@ target_sources(app PRIVATE
   uart_transport_test.c
   client_server_test.c
   stress_test.c
-  tcp_transport_test.c
 )
+
+# Only include TCP transport tests when networking is enabled
+if(CONFIG_NETWORKING)
+  target_sources(app PRIVATE tcp_transport_test.c)
+endif()

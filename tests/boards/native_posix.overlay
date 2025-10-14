@@ -1,0 +1,16 @@
+/*
+ * Copyright (c) 2025 9p4z Contributors
+ * SPDX-License-Identifier: MIT
+ *
+ * Device tree overlay for UART emulator on native_posix
+ */
+
+/ {
+	uart_emul0: uart-emul@0 {
+		compatible = "zephyr,uart-emul";
+		reg = <0x0 0x100>;
+		status = "okay";
+		current-speed = <115200>;
+		loopback;
+	};
+};

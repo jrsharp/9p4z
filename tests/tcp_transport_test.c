@@ -34,12 +34,10 @@ LOG_MODULE_REGISTER(tcp_transport_test, LOG_LEVEL_DBG);
 static struct ninep_transport server_transport;
 static struct ninep_transport client_transport;
 static struct ninep_server server;
-static struct ninep_client client;
 static struct ninep_sysfs sysfs;
 static struct ninep_sysfs_entry sysfs_entries[8];
 
 static uint8_t server_rx_buf[4096];
-static uint8_t client_rx_buf[4096];
 
 static bool server_ready;
 static bool client_connected;

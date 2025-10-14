@@ -3,9 +3,13 @@
  * SPDX-License-Identifier: MIT
  *
  * Stress and Regression Tests
+ * Only compile when both client and server are enabled
  */
 
 #include <zephyr/ztest.h>
+
+#if defined(CONFIG_NINEP_CLIENT) && defined(CONFIG_NINEP_SERVER)
+
 #include <zephyr/9p/client.h>
 #include <zephyr/9p/server.h>
 #include <zephyr/9p/sysfs.h>
@@ -513,3 +517,5 @@ ZTEST(stress, test_repeated_operations)
 }
 
 ZTEST_SUITE(stress, NULL, stress_setup, NULL, NULL, stress_teardown);
+
+#endif /* CONFIG_NINEP_CLIENT && CONFIG_NINEP_SERVER */

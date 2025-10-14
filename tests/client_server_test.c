@@ -3,9 +3,13 @@
  * SPDX-License-Identifier: MIT
  *
  * Client-Server Integration Tests
+ * Only compile when both client and server are enabled
  */
 
 #include <zephyr/ztest.h>
+
+#if defined(CONFIG_NINEP_CLIENT) && defined(CONFIG_NINEP_SERVER)
+
 #include <zephyr/9p/client.h>
 #include <zephyr/9p/server.h>
 #include <zephyr/9p/sysfs.h>
@@ -463,3 +467,5 @@ ZTEST(client_server, test_walk_error)
 }
 
 ZTEST_SUITE(client_server, NULL, client_server_setup, NULL, NULL, client_server_teardown);
+
+#endif /* CONFIG_NINEP_CLIENT && CONFIG_NINEP_SERVER */
