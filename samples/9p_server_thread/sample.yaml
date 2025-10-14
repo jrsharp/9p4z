@@ -1,0 +1,5 @@
+sample:
+  name: 9P Server over OpenThread
+  description: >
+    Demonstrates a 9P filesystem server operating over OpenThread mesh
+    networking. Uses TCP transport over IPv6 provided by Thread.
