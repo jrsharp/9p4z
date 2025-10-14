@@ -359,6 +359,178 @@ static void handle_tstat(struct ninep_server *server, uint16_t tag,
 	}
 }
 
+/* Handle Tauth */
+static void handle_tauth(struct ninep_server *server, uint16_t tag,
+                         const uint8_t *msg, size_t len)
+{
+	LOG_DBG("Tauth: authentication not required");
+	/* We don't support authentication - return error */
+	send_error(server, tag, "authentication not required");
+}
+
+/* Handle Tflush */
+static void handle_tflush(struct ninep_server *server, uint16_t tag,
+                          const uint8_t *msg, size_t len)
+{
+	uint16_t oldtag = msg[7] | (msg[8] << 8);
+	LOG_DBG("Tflush: oldtag=%u", oldtag);
+
+	/* Simple implementation: just acknowledge the flush */
+	/* A full implementation would cancel pending operations for oldtag */
+	int ret = ninep_build_rflush(server->tx_buf, sizeof(server->tx_buf), tag);
+	if (ret > 0) {
+		ninep_transport_send(server->transport, server->tx_buf, ret);
+	}
+}
+
+/* Handle Tcreate */
+static void handle_tcreate(struct ninep_server *server, uint16_t tag,
+                           const uint8_t *msg, size_t len)
+{
+	uint32_t fid = msg[7] | (msg[8] << 8) | (msg[9] << 16) | (msg[10] << 24);
+	uint16_t name_len = msg[11] | (msg[12] << 8);
+	const char *name = (const char *)&msg[13];
+	uint32_t perm = msg[13 + name_len] | (msg[14 + name_len] << 8) |
+	                (msg[15 + name_len] << 16) | (msg[16 + name_len] << 24);
+	uint8_t mode = msg[17 + name_len];
+
+	LOG_DBG("Tcreate: fid=%u, name=%.*s, perm=0x%x, mode=%u",
+	        fid, name_len, name, perm, mode);
+
+	struct ninep_server_fid *sfid = find_fid(server, fid);
+	if (!sfid || !sfid->node) {
+		send_error(server, tag, "unknown fid");
+		return;
+	}
+
+	/* Check if filesystem supports create */
+	if (!server->config->fs_ops->create) {
+		send_error(server, tag, "create not supported");
+		return;
+	}
+
+	/* Create new file/directory */
+	struct ninep_fs_node *new_node = server->config->fs_ops->create(
+		sfid->node, name, name_len, perm, mode, server->config->fs_ctx);
+
+	if (!new_node) {
+		send_error(server, tag, "create failed");
+		return;
+	}
+
+	/* Update FID to point to new node */
+	sfid->node = new_node;
+	sfid->iounit = 0;
+
+	/* Send Rcreate */
+	int ret = ninep_build_rcreate(server->tx_buf, sizeof(server->tx_buf),
+	                               tag, &new_node->qid, sfid->iounit);
+	if (ret > 0) {
+		ninep_transport_send(server->transport, server->tx_buf, ret);
+	} else {
+		send_error(server, tag, "rcreate build failed");
+	}
+}
+
+/* Handle Twrite */
+static void handle_twrite(struct ninep_server *server, uint16_t tag,
+                          const uint8_t *msg, size_t len)
+{
+	uint32_t fid = msg[7] | (msg[8] << 8) | (msg[9] << 16) | (msg[10] << 24);
+	uint64_t offset = msg[11] | ((uint64_t)msg[12] << 8) | ((uint64_t)msg[13] << 16) |
+	                  ((uint64_t)msg[14] << 24) | ((uint64_t)msg[15] << 32) |
+	                  ((uint64_t)msg[16] << 40) | ((uint64_t)msg[17] << 48) |
+	                  ((uint64_t)msg[18] << 56);
+	uint32_t count = msg[19] | (msg[20] << 8) | (msg[21] << 16) | (msg[22] << 24);
+	const uint8_t *data = &msg[23];
+
+	LOG_DBG("Twrite: fid=%u, offset=%llu, count=%u", fid, offset, count);
+
+	struct ninep_server_fid *sfid = find_fid(server, fid);
+	if (!sfid || !sfid->node) {
+		send_error(server, tag, "unknown fid");
+		return;
+	}
+
+	/* Check if filesystem supports write */
+	if (!server->config->fs_ops->write) {
+		send_error(server, tag, "write not supported");
+		return;
+	}
+
+	/* Write data */
+	int bytes = server->config->fs_ops->write(sfid->node, offset, data, count,
+	                                           server->config->fs_ctx);
+	if (bytes < 0) {
+		send_error(server, tag, "write failed");
+		return;
+	}
+
+	/* Send Rwrite */
+	int ret = ninep_build_rwrite(server->tx_buf, sizeof(server->tx_buf),
+	                              tag, bytes);
+	if (ret > 0) {
+		ninep_transport_send(server->transport, server->tx_buf, ret);
+	} else {
+		send_error(server, tag, "rwrite build failed");
+	}
+}
+
+/* Handle Tremove */
+static void handle_tremove(struct ninep_server *server, uint16_t tag,
+                           const uint8_t *msg, size_t len)
+{
+	uint32_t fid = msg[7] | (msg[8] << 8) | (msg[9] << 16) | (msg[10] << 24);
+
+	LOG_DBG("Tremove: fid=%u", fid);
+
+	struct ninep_server_fid *sfid = find_fid(server, fid);
+	if (!sfid || !sfid->node) {
+		send_error(server, tag, "unknown fid");
+		return;
+	}
+
+	/* Check if filesystem supports remove */
+	if (!server->config->fs_ops->remove) {
+		send_error(server, tag, "remove not supported");
+		return;
+	}
+
+	/* Remove file/directory */
+	int ret = server->config->fs_ops->remove(sfid->node, server->config->fs_ctx);
+	if (ret < 0) {
+		send_error(server, tag, "remove failed");
+		return;
+	}
+
+	/* Free FID */
+	free_fid(server, fid);
+
+	/* Send Rremove */
+	ret = ninep_build_rremove(server->tx_buf, sizeof(server->tx_buf), tag);
+	if (ret > 0) {
+		ninep_transport_send(server->transport, server->tx_buf, ret);
+	}
+}
+
+/* Handle Twstat */
+static void handle_twstat(struct ninep_server *server, uint16_t tag,
+                          const uint8_t *msg, size_t len)
+{
+	uint32_t fid = msg[7] | (msg[8] << 8) | (msg[9] << 16) | (msg[10] << 24);
+
+	LOG_DBG("Twstat: fid=%u", fid);
+
+	struct ninep_server_fid *sfid = find_fid(server, fid);
+	if (!sfid || !sfid->node) {
+		send_error(server, tag, "unknown fid");
+		return;
+	}
+
+	/* Most embedded filesystems don't support metadata modification */
+	send_error(server, tag, "wstat not supported");
+}
+
 /* Handle Tclunk */
 static void handle_tclunk(struct ninep_server *server, uint16_t tag,
                           const uint8_t *msg, size_t len)
@@ -407,8 +579,14 @@ void ninep_server_process_message(struct ninep_server *server,
 	case NINEP_TVERSION:
 		handle_tversion(server, msg, len);
 		break;
+	case NINEP_TAUTH:
+		handle_tauth(server, hdr.tag, msg, len);
+		break;
 	case NINEP_TATTACH:
 		handle_tattach(server, hdr.tag, msg, len);
+		break;
+	case NINEP_TFLUSH:
+		handle_tflush(server, hdr.tag, msg, len);
 		break;
 	case NINEP_TWALK:
 		handle_twalk(server, hdr.tag, msg, len);
@@ -416,14 +594,26 @@ void ninep_server_process_message(struct ninep_server *server,
 	case NINEP_TOPEN:
 		handle_topen(server, hdr.tag, msg, len);
 		break;
+	case NINEP_TCREATE:
+		handle_tcreate(server, hdr.tag, msg, len);
+		break;
 	case NINEP_TREAD:
 		handle_tread(server, hdr.tag, msg, len);
+		break;
+	case NINEP_TWRITE:
+		handle_twrite(server, hdr.tag, msg, len);
+		break;
+	case NINEP_TCLUNK:
+		handle_tclunk(server, hdr.tag, msg, len);
+		break;
+	case NINEP_TREMOVE:
+		handle_tremove(server, hdr.tag, msg, len);
 		break;
 	case NINEP_TSTAT:
 		handle_tstat(server, hdr.tag, msg, len);
 		break;
-	case NINEP_TCLUNK:
-		handle_tclunk(server, hdr.tag, msg, len);
+	case NINEP_TWSTAT:
+		handle_twstat(server, hdr.tag, msg, len);
 		break;
 	default:
 		LOG_WRN("Unhandled message type: %u", hdr.type);

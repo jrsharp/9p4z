@@ -8,6 +8,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <zephyr/toolchain.h>
 
 #ifdef __cplusplus
 extern "C" {

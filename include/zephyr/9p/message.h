@@ -239,6 +239,60 @@ int ninep_build_tcreate(uint8_t *buf, size_t buf_len, uint16_t tag,
 int ninep_build_tremove(uint8_t *buf, size_t buf_len, uint16_t tag, uint32_t fid);
 
 /**
+ * @brief Build an Rflush message
+ *
+ * @param buf Output buffer
+ * @param buf_len Buffer length
+ * @param tag Message tag
+ * @return Number of bytes written, or negative error code
+ */
+int ninep_build_rflush(uint8_t *buf, size_t buf_len, uint16_t tag);
+
+/**
+ * @brief Build an Rcreate message
+ *
+ * @param buf Output buffer
+ * @param buf_len Buffer length
+ * @param tag Message tag
+ * @param qid QID of created file
+ * @param iounit I/O unit size
+ * @return Number of bytes written, or negative error code
+ */
+int ninep_build_rcreate(uint8_t *buf, size_t buf_len, uint16_t tag,
+                        const struct ninep_qid *qid, uint32_t iounit);
+
+/**
+ * @brief Build an Rwrite message
+ *
+ * @param buf Output buffer
+ * @param buf_len Buffer length
+ * @param tag Message tag
+ * @param count Number of bytes written
+ * @return Number of bytes written, or negative error code
+ */
+int ninep_build_rwrite(uint8_t *buf, size_t buf_len, uint16_t tag, uint32_t count);
+
+/**
+ * @brief Build an Rremove message
+ *
+ * @param buf Output buffer
+ * @param buf_len Buffer length
+ * @param tag Message tag
+ * @return Number of bytes written, or negative error code
+ */
+int ninep_build_rremove(uint8_t *buf, size_t buf_len, uint16_t tag);
+
+/**
+ * @brief Build an Rwstat message
+ *
+ * @param buf Output buffer
+ * @param buf_len Buffer length
+ * @param tag Message tag
+ * @return Number of bytes written, or negative error code
+ */
+int ninep_build_rwstat(uint8_t *buf, size_t buf_len, uint16_t tag);
+
+/**
  * @brief Build an Rerror message
  *
  * @param buf Output buffer

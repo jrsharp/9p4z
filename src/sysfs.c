@@ -7,6 +7,7 @@
 #include <zephyr/9p/protocol.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <stdio.h>
 #include <string.h>
 #include <errno.h>
 

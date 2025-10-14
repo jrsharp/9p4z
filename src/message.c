@@ -579,6 +579,123 @@ int ninep_build_tremove(uint8_t *buf, size_t buf_len, uint16_t tag, uint32_t fid
 	return offset;
 }
 
+int ninep_build_rflush(uint8_t *buf, size_t buf_len, uint16_t tag)
+{
+	if (!buf || buf_len < 7) {
+		return -EINVAL;
+	}
+
+	size_t offset = 0;
+	struct ninep_msg_header hdr = {
+		.size = 7,  /* Just header, no payload */
+		.type = NINEP_RFLUSH,
+		.tag = tag,
+	};
+
+	int ret = ninep_write_header(buf, buf_len, &hdr);
+	if (ret < 0) {
+		return ret;
+	}
+
+	return 7;
+}
+
+int ninep_build_rcreate(uint8_t *buf, size_t buf_len, uint16_t tag,
+                        const struct ninep_qid *qid, uint32_t iounit)
+{
+	if (!buf || !qid || buf_len < 7 + 13 + 4) {
+		return -EINVAL;
+	}
+
+	size_t offset = 0;
+	struct ninep_msg_header hdr = {
+		.size = 7 + 13 + 4,  /* header + qid + iounit */
+		.type = NINEP_RCREATE,
+		.tag = tag,
+	};
+
+	int ret = ninep_write_header(buf, buf_len, &hdr);
+	if (ret < 0) {
+		return ret;
+	}
+	offset = 7;
+
+	ret = ninep_write_qid(buf, buf_len, &offset, qid);
+	if (ret < 0) {
+		return ret;
+	}
+
+	write_u32_le(buf, &offset, iounit);
+
+	return offset;
+}
+
+int ninep_build_rwrite(uint8_t *buf, size_t buf_len, uint16_t tag, uint32_t count)
+{
+	if (!buf || buf_len < 7 + 4) {
+		return -EINVAL;
+	}
+
+	size_t offset = 0;
+	struct ninep_msg_header hdr = {
+		.size = 7 + 4,  /* header + count */
+		.type = NINEP_RWRITE,
+		.tag = tag,
+	};
+
+	int ret = ninep_write_header(buf, buf_len, &hdr);
+	if (ret < 0) {
+		return ret;
+	}
+	offset = 7;
+
+	write_u32_le(buf, &offset, count);
+
+	return offset;
+}
+
+int ninep_build_rremove(uint8_t *buf, size_t buf_len, uint16_t tag)
+{
+	if (!buf || buf_len < 7) {
+		return -EINVAL;
+	}
+
+	size_t offset = 0;
+	struct ninep_msg_header hdr = {
+		.size = 7,  /* Just header, no payload */
+		.type = NINEP_RREMOVE,
+		.tag = tag,
+	};
+
+	int ret = ninep_write_header(buf, buf_len, &hdr);
+	if (ret < 0) {
+		return ret;
+	}
+
+	return 7;
+}
+
+int ninep_build_rwstat(uint8_t *buf, size_t buf_len, uint16_t tag)
+{
+	if (!buf || buf_len < 7) {
+		return -EINVAL;
+	}
+
+	size_t offset = 0;
+	struct ninep_msg_header hdr = {
+		.size = 7,  /* Just header, no payload */
+		.type = NINEP_RWSTAT,
+		.tag = tag,
+	};
+
+	int ret = ninep_write_header(buf, buf_len, &hdr);
+	if (ret < 0) {
+		return ret;
+	}
+
+	return 7;
+}
+
 int ninep_build_rerror(uint8_t *buf, size_t buf_len, uint16_t tag,
                        const char *ename, uint16_t ename_len)
 {
