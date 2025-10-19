@@ -97,6 +97,45 @@ static const char *get_relative_path(const char *path, const char *mount_path)
 	return rel_path;
 }
 
+/**
+ * @brief Find which backend mount owns a given node
+ *
+ * @param fs Union filesystem instance
+ * @param node Node to look up
+ * @return Pointer to owning mount, or NULL if node is union root or not found
+ */
+static struct ninep_union_mount *find_node_owner(struct ninep_union_fs *fs,
+                                                   struct ninep_fs_node *node)
+{
+	/* Union root doesn't belong to any backend */
+	if (node == fs->root) {
+		return NULL;
+	}
+
+	/* Check each mount to see if this node belongs to it */
+	for (size_t i = 0; i < fs->num_mounts; i++) {
+		struct ninep_union_mount *mount = &fs->mounts[i];
+
+		/* Simple heuristic: check if node is the mount's root */
+		if (node == mount->root) {
+			return mount;
+		}
+
+		/* For nodes deeper in the tree, we rely on QID path ranges
+		 * or other backend-specific tracking. For now, we'll assume
+		 * the backend can handle any node it returned from walk */
+		/* This is a simplification - ideally we'd track node ownership */
+	}
+
+	/* If not found as a mount root, assume it belongs to the first mount
+	 * that can handle it. This is imperfect but works for single-backend cases */
+	if (fs->num_mounts > 0) {
+		return &fs->mounts[0];
+	}
+
+	return NULL;
+}
+
 /* Union filesystem operations - delegate to appropriate backend */
 
 static struct ninep_fs_node *union_walk(struct ninep_fs_node *parent,
@@ -105,48 +144,72 @@ static struct ninep_fs_node *union_walk(struct ninep_fs_node *parent,
 {
 	struct ninep_union_fs *fs = (struct ninep_union_fs *)fs_ctx;
 
-	/* Build full path for this walk operation */
-	char full_path[256];
-
-	/* If parent is the union root, path is just "/name" */
+	/* If parent is the union root, we need to figure out which backend to use */
 	if (parent == fs->root) {
+		/* Check if there's a backend mounted at "/" */
+		struct ninep_union_mount *root_mount = NULL;
+		for (size_t i = 0; i < fs->num_mounts; i++) {
+			if (strcmp(fs->mounts[i].path, "/") == 0) {
+				root_mount = &fs->mounts[i];
+				break;
+			}
+		}
+
+		/* If there's a root mount, delegate directly to it */
+		if (root_mount && root_mount->fs_ops->walk) {
+			return root_mount->fs_ops->walk(root_mount->root, name, name_len,
+			                                 root_mount->fs_ctx);
+		}
+
+		/* Otherwise, do mount point matching for multi-backend scenarios */
+		char full_path[256];
 		snprintf(full_path, sizeof(full_path), "/%.*s", name_len, name);
+
+		/* Find which backend should handle this path */
+		size_t match_len;
+		struct ninep_union_mount *mount = find_mount_point(fs, full_path, &match_len);
+
+		if (!mount) {
+			LOG_DBG("No mount point found for path: %s", full_path);
+			return NULL;
+		}
+
+		/* Special case: walking to mount point itself from root */
+		if (strcmp(full_path, mount->path) == 0) {
+			return mount->root;
+		}
+
+		/* Get relative path within this mount */
+		const char *rel_path = get_relative_path(full_path, mount->path);
+
+		/* Delegate to backend */
+		if (!mount->fs_ops->walk) {
+			return NULL;
+		}
+
+		/* Skip leading '/' in relative path */
+		const char *backend_path = rel_path + 1;
+		uint16_t backend_path_len = strlen(backend_path);
+
+		return mount->fs_ops->walk(mount->root, backend_path, backend_path_len,
+		                           mount->fs_ctx);
 	} else {
-		/* Need to reconstruct full path from node context */
-		/* For now, delegate to backend if node belongs to a backend */
-		/* This is simplified - real implementation needs path tracking */
-		LOG_ERR("Walk on non-root union node not yet implemented");
-		return NULL;
+		/* Parent is not union root - delegate to the backend that owns it */
+		struct ninep_union_mount *mount = find_node_owner(fs, parent);
+
+		if (!mount) {
+			LOG_ERR("Cannot find owner for parent node");
+			return NULL;
+		}
+
+		/* Delegate walk to backend */
+		if (!mount->fs_ops->walk) {
+			LOG_ERR("Backend does not support walk");
+			return NULL;
+		}
+
+		return mount->fs_ops->walk(parent, name, name_len, mount->fs_ctx);
 	}
-
-	/* Find which backend should handle this path */
-	size_t match_len;
-	struct ninep_union_mount *mount = find_mount_point(fs, full_path, &match_len);
-
-	if (!mount) {
-		LOG_DBG("No mount point found for path: %s", full_path);
-		return NULL;
-	}
-
-	/* Get relative path within this mount */
-	const char *rel_path = get_relative_path(full_path, mount->path);
-
-	/* Special case: walking to mount point itself from root */
-	if (strcmp(full_path, mount->path) == 0) {
-		return mount->root;
-	}
-
-	/* Delegate to backend */
-	if (!mount->fs_ops->walk) {
-		return NULL;
-	}
-
-	/* Skip leading '/' in relative path */
-	const char *backend_path = rel_path + 1;
-	uint16_t backend_path_len = strlen(backend_path);
-
-	return mount->fs_ops->walk(mount->root, backend_path, backend_path_len,
-	                           mount->fs_ctx);
 }
 
 static int union_read(struct ninep_fs_node *node, uint64_t offset,
@@ -154,9 +217,24 @@ static int union_read(struct ninep_fs_node *node, uint64_t offset,
 {
 	struct ninep_union_fs *fs = (struct ninep_union_fs *)fs_ctx;
 
-	/* If reading the union root directory, synthesize directory listing */
+	/* If reading the union root directory */
 	if (node == fs->root) {
-		/* Generate synthetic directory with mount points */
+		/* Check if there's a backend mounted at "/" */
+		struct ninep_union_mount *root_mount = NULL;
+		for (size_t i = 0; i < fs->num_mounts; i++) {
+			if (strcmp(fs->mounts[i].path, "/") == 0) {
+				root_mount = &fs->mounts[i];
+				break;
+			}
+		}
+
+		/* If there's a root mount, delegate directly to it */
+		if (root_mount && root_mount->fs_ops->read) {
+			return root_mount->fs_ops->read(root_mount->root, offset,
+			                                 buf, count, root_mount->fs_ctx);
+		}
+
+		/* Otherwise, synthesize directory with mount points */
 		uint32_t pos = 0;
 
 		/* Skip entries based on offset (simplified) */
@@ -165,7 +243,7 @@ static int union_read(struct ninep_fs_node *node, uint64_t offset,
 		for (size_t i = start_idx; i < fs->num_mounts && pos < count; i++) {
 			struct ninep_union_mount *mount = &fs->mounts[i];
 
-			/* Skip root mount (it's synthetic) */
+			/* Skip root mount (already handled above) */
 			if (strcmp(mount->path, "/") == 0) {
 				continue;
 			}
@@ -187,10 +265,21 @@ static int union_read(struct ninep_fs_node *node, uint64_t offset,
 		return pos;
 	}
 
-	/* Find which backend owns this node */
-	/* For now, this is simplified - need to track backend per node */
-	LOG_ERR("Read on union backend node not yet implemented");
-	return -ENOTSUP;
+	/* Find which backend owns this node and delegate */
+	struct ninep_union_mount *mount = find_node_owner(fs, node);
+
+	if (!mount) {
+		LOG_ERR("Cannot find owner for node");
+		return -ENOENT;
+	}
+
+	/* Delegate to backend */
+	if (!mount->fs_ops->read) {
+		LOG_ERR("Backend does not support read");
+		return -ENOTSUP;
+	}
+
+	return mount->fs_ops->read(node, offset, buf, count, mount->fs_ctx);
 }
 
 static int union_stat(struct ninep_fs_node *node, uint8_t *buf,
@@ -198,10 +287,24 @@ static int union_stat(struct ninep_fs_node *node, uint8_t *buf,
 {
 	struct ninep_union_fs *fs = (struct ninep_union_fs *)fs_ctx;
 
-	/* If stat on union root, return synthetic directory */
+	/* If stat on union root */
 	if (node == fs->root) {
-		/* Build a stat structure (simplified encoding) */
-		/* Real implementation should use proper 9P stat encoding */
+		/* Check if there's a backend mounted at "/" */
+		struct ninep_union_mount *root_mount = NULL;
+		for (size_t i = 0; i < fs->num_mounts; i++) {
+			if (strcmp(fs->mounts[i].path, "/") == 0) {
+				root_mount = &fs->mounts[i];
+				break;
+			}
+		}
+
+		/* If there's a root mount, delegate directly to it */
+		if (root_mount && root_mount->fs_ops->stat) {
+			return root_mount->fs_ops->stat(root_mount->root, buf,
+			                                 buf_len, root_mount->fs_ctx);
+		}
+
+		/* Otherwise, return synthetic directory stat */
 		struct ninep_stat stat;
 		memset(&stat, 0, sizeof(stat));
 		stat.qid = node->qid;
@@ -221,9 +324,21 @@ static int union_stat(struct ninep_fs_node *node, uint8_t *buf,
 		return sizeof(stat);
 	}
 
+	/* Find which backend owns this node and delegate */
+	struct ninep_union_mount *mount = find_node_owner(fs, node);
+
+	if (!mount) {
+		LOG_ERR("Cannot find owner for node");
+		return -ENOENT;
+	}
+
 	/* Delegate to backend */
-	LOG_ERR("Stat on union backend node not yet implemented");
-	return -ENOTSUP;
+	if (!mount->fs_ops->stat) {
+		LOG_ERR("Backend does not support stat");
+		return -ENOTSUP;
+	}
+
+	return mount->fs_ops->stat(node, buf, buf_len, mount->fs_ctx);
 }
 
 /* Get union filesystem root */
@@ -233,13 +348,125 @@ static struct ninep_fs_node *union_get_root(void *ctx)
 	return fs->root;
 }
 
+static int union_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
+{
+	struct ninep_union_fs *fs = (struct ninep_union_fs *)fs_ctx;
+
+	/* If opening the union root directory */
+	if (node == fs->root) {
+		/* Check if there's a backend mounted at "/" */
+		struct ninep_union_mount *root_mount = NULL;
+		for (size_t i = 0; i < fs->num_mounts; i++) {
+			if (strcmp(fs->mounts[i].path, "/") == 0) {
+				root_mount = &fs->mounts[i];
+				break;
+			}
+		}
+
+		/* If there's a root mount, delegate directly to it */
+		if (root_mount && root_mount->fs_ops->open) {
+			return root_mount->fs_ops->open(root_mount->root, mode,
+			                                 root_mount->fs_ctx);
+		}
+
+		/* Otherwise, allow opening synthetic root directory */
+		return 0;
+	}
+
+	/* Find which backend owns this node */
+	struct ninep_union_mount *mount = find_node_owner(fs, node);
+
+	if (!mount) {
+		LOG_ERR("Cannot find owner for node");
+		return -ENOENT;
+	}
+
+	/* Delegate to backend */
+	if (!mount->fs_ops->open) {
+		LOG_ERR("Backend does not support open");
+		return -ENOTSUP;
+	}
+
+	return mount->fs_ops->open(node, mode, mount->fs_ctx);
+}
+
+static int union_write(struct ninep_fs_node *node, uint64_t offset,
+                        const uint8_t *buf, uint32_t count, void *fs_ctx)
+{
+	struct ninep_union_fs *fs = (struct ninep_union_fs *)fs_ctx;
+
+	/* Find which backend owns this node */
+	struct ninep_union_mount *mount = find_node_owner(fs, node);
+
+	if (!mount) {
+		LOG_ERR("Cannot write to union root directory");
+		return -EISDIR;
+	}
+
+	/* Delegate to backend */
+	if (!mount->fs_ops->write) {
+		LOG_ERR("Backend does not support write");
+		return -ENOTSUP;
+	}
+
+	return mount->fs_ops->write(node, offset, buf, count, mount->fs_ctx);
+}
+
+static int union_create(struct ninep_fs_node *parent, const char *name,
+                         uint16_t name_len, uint32_t perm, uint8_t mode,
+                         struct ninep_fs_node **new_node, void *fs_ctx)
+{
+	struct ninep_union_fs *fs = (struct ninep_union_fs *)fs_ctx;
+
+	/* Find which backend owns the parent node */
+	struct ninep_union_mount *mount = find_node_owner(fs, parent);
+
+	if (!mount) {
+		LOG_ERR("Cannot create in union root directory");
+		return -EPERM;
+	}
+
+	/* Delegate to backend */
+	if (!mount->fs_ops->create) {
+		LOG_ERR("Backend does not support create");
+		return -ENOTSUP;
+	}
+
+	return mount->fs_ops->create(parent, name, name_len, perm, mode,
+	                              new_node, mount->fs_ctx);
+}
+
+static int union_remove(struct ninep_fs_node *node, void *fs_ctx)
+{
+	struct ninep_union_fs *fs = (struct ninep_union_fs *)fs_ctx;
+
+	/* Find which backend owns this node */
+	struct ninep_union_mount *mount = find_node_owner(fs, node);
+
+	if (!mount) {
+		LOG_ERR("Cannot remove union root directory");
+		return -EPERM;
+	}
+
+	/* Delegate to backend */
+	if (!mount->fs_ops->remove) {
+		LOG_ERR("Backend does not support remove");
+		return -ENOTSUP;
+	}
+
+	return mount->fs_ops->remove(node, mount->fs_ctx);
+}
+
 /* Union filesystem operations table */
 static const struct ninep_fs_ops union_fs_ops = {
 	.get_root = union_get_root,
 	.walk = union_walk,
+	.open = union_open,
 	.read = union_read,
+	.write = union_write,
 	.stat = union_stat,
-	/* Other operations would be delegated similarly */
+	.create = union_create,
+	.remove = union_remove,
 };
 
 /* Public API */

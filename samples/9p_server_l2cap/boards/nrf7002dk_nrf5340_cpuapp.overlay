@@ -29,17 +29,17 @@
 /delete-node/ &storage_partition;
 
 /* Add LittleFS partition
- * Note: This uses space at the end of flash (last 256KB of 1MB)
+ * Note: This uses space at the end of flash (last 64KB of 1MB)
  */
 &flash0 {
 	partitions {
 		/*
-		 * LittleFS partition: 256 KB at end of 1MB flash
-		 * Located at 0x0C0000 - 0x100000
+		 * LittleFS partition: 64 KB at end of 1MB flash
+		 * Located at 0x0F0000 - 0x100000
 		 */
-		lfs_partition: partition@c0000 {
+		lfs_partition: partition@f0000 {
 			label = "littlefs_storage";
-			reg = <0x000C0000 0x00040000>;
+			reg = <0x000F0000 0x00010000>;
 		};
 	};
 };
