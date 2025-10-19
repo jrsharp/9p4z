@@ -410,10 +410,11 @@ static void handle_tcreate(struct ninep_server *server, uint16_t tag,
 	}
 
 	/* Create new file/directory */
-	struct ninep_fs_node *new_node = server->config->fs_ops->create(
-		sfid->node, name, name_len, perm, mode, server->config->fs_ctx);
+	struct ninep_fs_node *new_node = NULL;
+	int ret = server->config->fs_ops->create(
+		sfid->node, name, name_len, perm, mode, &new_node, server->config->fs_ctx);
 
-	if (!new_node) {
+	if (ret < 0 || !new_node) {
 		send_error(server, tag, "create failed");
 		return;
 	}
@@ -423,8 +424,8 @@ static void handle_tcreate(struct ninep_server *server, uint16_t tag,
 	sfid->iounit = 0;
 
 	/* Send Rcreate */
-	int ret = ninep_build_rcreate(server->tx_buf, sizeof(server->tx_buf),
-	                               tag, &new_node->qid, sfid->iounit);
+	ret = ninep_build_rcreate(server->tx_buf, sizeof(server->tx_buf),
+	                          tag, &new_node->qid, sfid->iounit);
 	if (ret > 0) {
 		ninep_transport_send(server->transport, server->tx_buf, ret);
 	} else {

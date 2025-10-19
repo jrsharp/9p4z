@@ -38,6 +38,25 @@ config NINEP_SERVER
 	help
 	  Enable 9P server functionality.
 
+if NINEP_SERVER
+
+config NINEP_FS_PASSTHROUGH
+	bool "Passthrough Filesystem Backend"
+	depends on FILE_SYSTEM
+	help
+	  Enable passthrough filesystem backend that exposes any mounted
+	  Zephyr filesystem (LittleFS, FAT, etc.) via 9P.
+
+	  This allows exposing real storage (flash, SD card) as a
+	  "Bluetooth hard drive" or network file share.
+
+	  Example uses:
+	  - Expose LittleFS partition on internal flash
+	  - Share SD card contents over Bluetooth L2CAP
+	  - Remote file access over TCP/IP
+
+endif # NINEP_SERVER
+
 config NINEP_CLIENT
 	bool "9P Client Support"
 	default y
@@ -100,6 +119,23 @@ config NINEP_L2CAP_MTU
 	  Default: 4096 bytes.
 
 endif # NINEP_TRANSPORT_L2CAP
+
+config NINEP_GATT_9PIS
+	bool "9P Information Service (9PIS) GATT Service"
+	depends on BT_GATT_DYNAMIC_DB || BT
+	help
+	  Enable the 9P Information Service (9PIS) GATT service.
+	  This service provides discoverability and metadata about
+	  available 9P services on the device. When enabled, clients
+	  can read service information including:
+	  - Service description
+	  - Available features
+	  - Transport connection details
+	  - App download link
+	  - Protocol version
+
+	  This is particularly useful for mobile apps to discover
+	  and connect to 9P servers over Bluetooth.
 
 module = NINEP
 module-str = 9p

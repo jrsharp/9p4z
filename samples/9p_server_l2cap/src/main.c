@@ -12,6 +12,20 @@
 #include <zephyr/9p/server.h>
 #include <zephyr/9p/transport_l2cap.h>
 #include <zephyr/9p/sysfs.h>
+#include <zephyr/9p/gatt_9pis.h>
+
+#include <zephyr/9p/union_fs.h>
+
+#ifdef CONFIG_NINEP_FS_PASSTHROUGH
+#include <zephyr/9p/passthrough_fs.h>
+#include <zephyr/fs/fs.h>
+#include <zephyr/fs/littlefs.h>
+#include <zephyr/storage/flash_map.h>
+#define USE_LITTLEFS 1
+#define LITTLEFS_MOUNT_POINT "/lfs1"
+#else
+#define USE_LITTLEFS 0
+#endif
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 
@@ -27,9 +41,27 @@ static char firmware_last_write[32] = "No uploads yet";
 static struct ninep_server server;
 static struct ninep_transport transport;
 
-/* Sysfs instance - increased for all our demo files! */
+/* Sysfs instance - always present for system files */
 static struct ninep_sysfs sysfs;
 static struct ninep_sysfs_entry sysfs_entries[64];
+
+#if USE_LITTLEFS
+/* LittleFS storage backend */
+FS_LITTLEFS_DECLARE_DEFAULT_CONFIG(storage);
+static struct fs_mount_t lfs_mnt = {
+	.type = FS_LITTLEFS,
+	.fs_data = &storage,
+	.storage_dev = (void *)FIXED_PARTITION_ID(lfs_partition),
+	.mnt_point = LITTLEFS_MOUNT_POINT,
+};
+
+/* Passthrough FS instance */
+static struct ninep_passthrough_fs passthrough_fs;
+#endif
+
+/* Union FS instance for namespace composition - always available! */
+static struct ninep_union_fs union_fs;
+static struct ninep_union_mount union_mounts[4];  /* Space for up to 4 backends */
 
 /* RX buffer for L2CAP transport */
 static uint8_t rx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
@@ -170,14 +202,14 @@ static void thread_list_cb(const struct k_thread *thread, void *user_data)
 		return;  /* Buffer nearly full */
 	}
 
-	const char *name = k_thread_name_get(thread);
+	const char *name = k_thread_name_get((k_tid_t)thread);
 	if (!name) {
 		name = "<unnamed>";
 	}
 
 	ctx->pos += snprintf(ctx->buf + ctx->pos, ctx->buf_size - ctx->pos,
 	                     "%s (prio=%d)\n",
-	                     name, k_thread_priority_get(thread));
+	                     name, k_thread_priority_get((k_tid_t)thread));
 }
 
 /* Generate sys/threads content - LIVE thread list! */
@@ -439,6 +471,136 @@ static int gen_9p_intro(uint8_t *buf, size_t buf_size, uint64_t offset, void *ct
 	return to_copy;
 }
 
+#if USE_LITTLEFS
+/* Pre-populate LittleFS with initial files */
+static int populate_littlefs(void)
+{
+	struct fs_file_t file;
+	int ret;
+
+	LOG_INF("Populating LittleFS with initial files...");
+
+	/* Check if already populated (marker file exists) */
+	const char *marker_path = LITTLEFS_MOUNT_POINT "/.populated";
+	struct fs_dirent entry;
+	ret = fs_stat(marker_path, &entry);
+	if (ret == 0) {
+		LOG_INF("Filesystem already populated, skipping");
+		return 0;
+	}
+
+	/* Create welcome file */
+	const char *welcome_path = LITTLEFS_MOUNT_POINT "/welcome.txt";
+	const char *welcome_content =
+		"Welcome to 9P over Bluetooth!\n"
+		"\n"
+		"This is a persistent LittleFS filesystem stored in flash.\n"
+		"All files you create here will survive reboots!\n"
+		"\n"
+		"Try creating files, directories, and exploring!\n";
+
+	fs_file_t_init(&file);
+	ret = fs_open(&file, welcome_path, FS_O_CREATE | FS_O_WRITE);
+	if (ret < 0) {
+		LOG_ERR("Failed to create welcome.txt: %d", ret);
+		return ret;
+	}
+	fs_write(&file, welcome_content, strlen(welcome_content));
+	fs_close(&file);
+	LOG_INF("Created: %s", welcome_path);
+
+	/* Create docs directory */
+	const char *docs_dir = LITTLEFS_MOUNT_POINT "/docs";
+	ret = fs_mkdir(docs_dir);
+	if (ret < 0) {
+		LOG_ERR("Failed to create /docs: %d", ret);
+		return ret;
+	}
+	LOG_INF("Created: %s/", docs_dir);
+
+	/* Create README in docs */
+	const char *readme_path = LITTLEFS_MOUNT_POINT "/docs/README.md";
+	const char *readme_content =
+		"# 9P File Server\n"
+		"\n"
+		"## Features\n"
+		"\n"
+		"- Persistent storage on flash\n"
+		"- Wireless access via Bluetooth\n"
+		"- Standard 9P protocol\n"
+		"\n"
+		"## Usage\n"
+		"\n"
+		"Connect via Bluetooth and use any 9P client to access files.\n"
+		"All changes are immediately saved to flash!\n";
+
+	fs_file_t_init(&file);
+	ret = fs_open(&file, readme_path, FS_O_CREATE | FS_O_WRITE);
+	if (ret < 0) {
+		LOG_ERR("Failed to create README.md: %d", ret);
+		return ret;
+	}
+	fs_write(&file, readme_content, strlen(readme_content));
+	fs_close(&file);
+	LOG_INF("Created: %s", readme_path);
+
+	/* Create shared directory */
+	const char *shared_dir = LITTLEFS_MOUNT_POINT "/shared";
+	ret = fs_mkdir(shared_dir);
+	if (ret < 0) {
+		LOG_ERR("Failed to create /shared: %d", ret);
+		return ret;
+	}
+	LOG_INF("Created: %s/", shared_dir);
+
+	/* Create notes directory */
+	const char *notes_dir = LITTLEFS_MOUNT_POINT "/notes";
+	ret = fs_mkdir(notes_dir);
+	if (ret < 0) {
+		LOG_ERR("Failed to create /notes: %d", ret);
+		return ret;
+	}
+	LOG_INF("Created: %s/", notes_dir);
+
+	/* Create example note */
+	const char *note_path = LITTLEFS_MOUNT_POINT "/notes/example.txt";
+	const char *note_content =
+		"Example Note\n"
+		"============\n"
+		"\n"
+		"This is an example note file. Feel free to:\n"
+		"- Edit this file\n"
+		"- Delete this file\n"
+		"- Create new notes\n"
+		"\n"
+		"All changes persist to flash!\n";
+
+	fs_file_t_init(&file);
+	ret = fs_open(&file, note_path, FS_O_CREATE | FS_O_WRITE);
+	if (ret < 0) {
+		LOG_ERR("Failed to create example.txt: %d", ret);
+		return ret;
+	}
+	fs_write(&file, note_content, strlen(note_content));
+	fs_close(&file);
+	LOG_INF("Created: %s", note_path);
+
+	/* Create marker file to indicate population is complete */
+	fs_file_t_init(&file);
+	ret = fs_open(&file, marker_path, FS_O_CREATE | FS_O_WRITE);
+	if (ret < 0) {
+		LOG_ERR("Failed to create marker file: %d", ret);
+		return ret;
+	}
+	const char *marker = "v1\n";
+	fs_write(&file, marker, strlen(marker));
+	fs_close(&file);
+
+	LOG_INF("Filesystem population complete!");
+	return 0;
+}
+#endif /* USE_LITTLEFS */
+
 /* Setup synthetic filesystem */
 static int setup_filesystem(void)
 {
@@ -600,6 +762,25 @@ int main(void)
 
 	LOG_INF("Bluetooth initialized");
 
+#ifdef CONFIG_NINEP_GATT_9PIS
+	/* Initialize 9P Information Service (9PIS) for discoverability */
+	struct ninep_9pis_config gatt_config = {
+		.service_description = "9P File Server",
+		.service_features = "file-sharing,sensor-data,led-control,firmware-update",
+		.transport_info = "l2cap:psm=0x0009,mtu=4096",
+		.app_store_link = "https://9p4z.org/clients",
+		.protocol_version = "9P2000;9p4z;1.0.0",
+	};
+
+	ret = ninep_9pis_init(&gatt_config);
+	if (ret < 0) {
+		LOG_ERR("Failed to initialize 9PIS GATT service: %d", ret);
+		return 0;
+	}
+
+	LOG_INF("9PIS GATT service initialized - device discoverable!");
+#endif
+
 	/* Start advertising */
 	ret = bt_le_adv_start(BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN, BT_GAP_ADV_FAST_INT_MIN_2,
 	                                       BT_GAP_ADV_FAST_INT_MAX_2, NULL),
@@ -623,12 +804,75 @@ int main(void)
 		}
 	}
 
-	/* Setup filesystem */
+	/* Always setup sysfs with system files */
 	ret = setup_filesystem();
 	if (ret < 0) {
-		LOG_ERR("Failed to setup filesystem: %d", ret);
+		LOG_ERR("Failed to setup sysfs: %d", ret);
 		return 0;
 	}
+
+#if USE_LITTLEFS
+	/* Mount LittleFS */
+	ret = fs_mount(&lfs_mnt);
+	if (ret < 0) {
+		LOG_ERR("Failed to mount LittleFS: %d", ret);
+		LOG_ERR("Try erasing flash: west flash --erase");
+		return 0;
+	}
+	LOG_INF("LittleFS mounted at %s", LITTLEFS_MOUNT_POINT);
+
+	/* Populate filesystem with initial files (first boot only) */
+	ret = populate_littlefs();
+	if (ret < 0) {
+		LOG_ERR("Failed to populate filesystem: %d", ret);
+		return 0;
+	}
+
+	/* Initialize passthrough filesystem */
+	ret = ninep_passthrough_fs_init(&passthrough_fs, LITTLEFS_MOUNT_POINT);
+	if (ret < 0) {
+		LOG_ERR("Failed to initialize passthrough FS: %d", ret);
+		return 0;
+	}
+	LOG_INF("Passthrough filesystem initialized");
+#endif
+
+	/* Initialize union filesystem for namespace composition */
+	ret = ninep_union_fs_init(&union_fs, union_mounts, ARRAY_SIZE(union_mounts));
+	if (ret < 0) {
+		LOG_ERR("Failed to initialize union FS: %d", ret);
+		return 0;
+	}
+
+	/* Mount sysfs at root "/" - provides /dev, /sys, /lib, etc. */
+	ret = ninep_union_fs_mount(&union_fs, "/",
+	                            ninep_sysfs_get_ops(), &sysfs);
+	if (ret < 0) {
+		LOG_ERR("Failed to mount sysfs at /: %d", ret);
+		return 0;
+	}
+	LOG_INF("Mounted sysfs at /");
+
+#if USE_LITTLEFS
+	/* Mount passthrough_fs at "/files" - provides persistent storage */
+	ret = ninep_union_fs_mount(&union_fs, "/files",
+	                            ninep_passthrough_fs_get_ops(), &passthrough_fs);
+	if (ret < 0) {
+		LOG_ERR("Failed to mount passthrough FS at /files: %d", ret);
+		return 0;
+	}
+	LOG_INF("Mounted LittleFS at /files");
+	LOG_INF("===================================================");
+	LOG_INF("UNIFIED NAMESPACE:");
+	LOG_INF("  /dev, /sys, /sensors, /lib  -> sysfs (dynamic)");
+	LOG_INF("  /files/*                    -> LittleFS (persistent)");
+	LOG_INF("===================================================");
+#else
+	LOG_INF("===================================================");
+	LOG_INF("NAMESPACE:");
+	LOG_INF("  /dev, /sys, /sensors, /lib  -> sysfs (dynamic)");
+	LOG_INF("===================================================");
+#endif
 
 	/* Initialize L2CAP transport */
 	struct ninep_transport_l2cap_config l2cap_config = {
@@ -645,10 +889,10 @@ int main(void)
 
 	LOG_INF("L2CAP transport initialized");
 
-	/* Initialize 9P server with sysfs */
+	/* Initialize 9P server - always use union filesystem for namespace composition */
 	struct ninep_server_config server_config = {
-		.fs_ops = ninep_sysfs_get_ops(),
-		.fs_ctx = &sysfs,
+		.fs_ops = ninep_union_fs_get_ops(),
+		.fs_ctx = &union_fs,
 		.max_message_size = CONFIG_NINEP_MAX_MESSAGE_SIZE,
 		.version = "9P2000",
 	};

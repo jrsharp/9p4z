@@ -19,7 +19,12 @@ if(CONFIG_NINEP_SERVER)
     src/server.c
     src/ramfs.c
     src/sysfs.c
+    src/union_fs.c
   )
+
+  if(CONFIG_NINEP_FS_PASSTHROUGH)
+    zephyr_library_sources(src/passthrough_fs.c)
+  endif()
 endif()
 
 if(CONFIG_NINEP_CLIENT)
@@ -36,6 +41,10 @@ endif()
 
 if(CONFIG_NINEP_TRANSPORT_L2CAP)
   zephyr_library_sources(src/transport_l2cap.c)
+endif()
+
+if(CONFIG_NINEP_GATT_9PIS)
+  zephyr_library_sources(src/gatt_9pis.c)
 endif()
 
 endif() # CONFIG_NINEP

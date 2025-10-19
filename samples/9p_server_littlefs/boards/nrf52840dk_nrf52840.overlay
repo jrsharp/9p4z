@@ -1,0 +1,60 @@
+/*
+ * Copyright (c) 2025 9p4z Contributors
+ * SPDX-License-Identifier: MIT
+ */
+
+/*
+ * Device tree overlay for nRF52840 DK
+ * Creates a storage partition for LittleFS on internal flash
+ */
+
+/ {
+	fstab {
+		compatible = "zephyr,fstab";
+		lfs1: lfs1 {
+			compatible = "zephyr,fstab,littlefs";
+			mount-point = "/lfs1";
+			partition = <&storage_partition>;
+			automount;
+			read-size = <16>;
+			prog-size = <16>;
+			cache-size = <64>;
+			lookahead-size = <32>;
+			block-cycles = <512>;
+		};
+	};
+};
+
+/* Resize existing partitions to make room for storage */
+&flash0 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/*
+		 * nRF52840 has 1MB (0x100000) of flash
+		 * Layout:
+		 * 0x000000 - 0x0C0000: Application (768 KB)
+		 * 0x0C0000 - 0x100000: Storage for LittleFS (256 KB)
+		 */
+
+		boot_partition: partition@0 {
+			label = "mcuboot";
+			reg = <0x00000000 0x0000C000>;
+		};
+		slot0_partition: partition@c000 {
+			label = "image-0";
+			reg = <0x0000C000 0x000B4000>;
+		};
+
+		/*
+		 * Storage partition for LittleFS: 256 KB
+		 * This gives plenty of space for user files
+		 */
+		storage_partition: partition@c0000 {
+			label = "storage";
+			reg = <0x000C0000 0x00040000>;
+		};
+	};
+};

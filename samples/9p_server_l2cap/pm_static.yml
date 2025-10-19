@@ -1,0 +1,20 @@
+# Partition Manager static configuration for nRF7002 DK
+# Defines flash layout for L2CAP server with LittleFS
+
+mcuboot:
+  address: 0x0
+  size: 0x10000  # 64KB
+
+mcuboot_primary:
+  address: 0x10000
+  region: flash_primary
+  size: 0xA0000  # 640KB
+
+mcuboot_primary_app:
+  address: 0x10000
+  size: 0xA0000  # 640KB
+
+lfs_partition:
+  address: 0xC0000
+  size: 0x40000  # 256KB for LittleFS
+  region: flash_primary

@@ -1,0 +1,45 @@
+/*
+ * Copyright (c) 2025 9p4z Contributors
+ * SPDX-License-Identifier: MIT
+ */
+
+/*
+ * Device tree overlay for nRF7002 DK (nRF5340 application core)
+ * Creates a storage partition for LittleFS on internal flash
+ */
+
+/ {
+	fstab {
+		compatible = "zephyr,fstab";
+		lfs1: lfs1 {
+			compatible = "zephyr,fstab,littlefs";
+			mount-point = "/lfs1";
+			partition = <&lfs_partition>;
+			automount;
+			read-size = <16>;
+			prog-size = <16>;
+			cache-size = <64>;
+			lookahead-size = <32>;
+			block-cycles = <512>;
+		};
+	};
+};
+
+/* Delete existing storage partition if present */
+/delete-node/ &storage_partition;
+
+/* Add LittleFS partition
+ * Note: This uses space at the end of flash (last 256KB of 1MB)
+ */
+&flash0 {
+	partitions {
+		/*
+		 * LittleFS partition: 256 KB at end of 1MB flash
+		 * Located at 0x0C0000 - 0x100000
+		 */
+		lfs_partition: partition@c0000 {
+			label = "littlefs_storage";
+			reg = <0x000C0000 0x00040000>;
+		};
+	};
+};
