@@ -33,6 +33,20 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 static bool led_state = false;
 
+/* GPIO for button inputs */
+static const struct gpio_dt_spec button1 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+static const struct gpio_dt_spec button2 = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
+static struct gpio_callback button1_cb_data;
+static struct gpio_callback button2_cb_data;
+
+/* Button state tracking */
+static uint32_t button1_press_count = 0;
+static uint32_t button2_press_count = 0;
+static bool button1_state = false;
+static bool button2_state = false;
+static uint64_t button1_last_press_time = 0;
+static uint64_t button2_last_press_time = 0;
+
 /* Firmware update tracking */
 static size_t firmware_bytes_written = 0;
 static char firmware_last_write[32] = "No uploads yet";
@@ -72,6 +86,12 @@ static const struct bt_data ad[] = {
 	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
 
+/* Bluetooth connection tracking */
+static uint32_t bt_connection_count = 0;
+static uint32_t bt_total_connections = 0;
+static char bt_last_connected_addr[BT_ADDR_LE_STR_LEN] = "None";
+static uint64_t bt_last_connected_time = 0;
+
 /* Bluetooth connection callbacks */
 static void connected(struct bt_conn *conn, uint8_t err)
 {
@@ -85,6 +105,12 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	}
 
 	LOG_INF("Connected: %s", addr);
+
+	/* Update connection stats */
+	bt_connection_count++;
+	bt_total_connections++;
+	strncpy(bt_last_connected_addr, addr, sizeof(bt_last_connected_addr) - 1);
+	bt_last_connected_time = k_uptime_get();
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
@@ -94,12 +120,34 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
 	LOG_INF("Disconnected: %s (reason %u)", addr, reason);
+
+	/* Update connection stats */
+	if (bt_connection_count > 0) {
+		bt_connection_count--;
+	}
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = connected,
 	.disconnected = disconnected,
 };
+
+/* Button interrupt handlers */
+static void button1_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	button1_state = gpio_pin_get_dt(&button1);
+	button1_press_count++;
+	button1_last_press_time = k_uptime_get();
+	LOG_INF("Button 1 pressed! Count: %u", button1_press_count);
+}
+
+static void button2_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	button2_state = gpio_pin_get_dt(&button2);
+	button2_press_count++;
+	button2_last_press_time = k_uptime_get();
+	LOG_INF("Button 2 pressed! Count: %u", button2_press_count);
+}
 
 /* Generate hello.txt content */
 static int gen_hello(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx)
@@ -278,6 +326,66 @@ static int gen_stats(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx)
 
 /* ========== DEVICE CONTROL - LED ========== */
 
+/* Generate dev/button1 content - show button state and counter */
+static int gen_button1(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx)
+{
+	char btn_str[256];
+	uint64_t now = k_uptime_get();
+	uint64_t time_since_press = button1_last_press_time ? (now - button1_last_press_time) : 0;
+
+	int len = snprintf(btn_str, sizeof(btn_str),
+	                  "Button 1 Status\n"
+	                  "===============\n"
+	                  "State:          %s\n"
+	                  "Press Count:    %u\n"
+	                  "Last Press:     %llu ms ago\n"
+	                  "\n"
+	                  "Press the button to increment the counter!\n",
+	                  button1_state ? "pressed" : "released",
+	                  button1_press_count,
+	                  time_since_press);
+
+	if (offset >= len) {
+		return 0;
+	}
+
+	size_t remaining = len - offset;
+	size_t to_copy = MIN(remaining, buf_size);
+
+	memcpy(buf, btn_str + offset, to_copy);
+	return to_copy;
+}
+
+/* Generate dev/button2 content - show button state and counter */
+static int gen_button2(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx)
+{
+	char btn_str[256];
+	uint64_t now = k_uptime_get();
+	uint64_t time_since_press = button2_last_press_time ? (now - button2_last_press_time) : 0;
+
+	int len = snprintf(btn_str, sizeof(btn_str),
+	                  "Button 2 Status\n"
+	                  "===============\n"
+	                  "State:          %s\n"
+	                  "Press Count:    %u\n"
+	                  "Last Press:     %llu ms ago\n"
+	                  "\n"
+	                  "Press the button to increment the counter!\n",
+	                  button2_state ? "pressed" : "released",
+	                  button2_press_count,
+	                  time_since_press);
+
+	if (offset >= len) {
+		return 0;
+	}
+
+	size_t remaining = len - offset;
+	size_t to_copy = MIN(remaining, buf_size);
+
+	memcpy(buf, btn_str + offset, to_copy);
+	return to_copy;
+}
+
 /* Generate dev/led content - show LED state */
 static int gen_led(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx)
 {
@@ -396,6 +504,76 @@ static int write_firmware(const uint8_t *buf, uint32_t count, uint64_t offset, v
 	return count;
 }
 
+/* ========== NETWORK STATS - Bluetooth ========== */
+
+/* Generate net/bt/connections content - active BT connections */
+static int gen_bt_connections(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx)
+{
+	char conn_str[512];
+	int len = snprintf(conn_str, sizeof(conn_str),
+	                  "Bluetooth Connection Statistics\n"
+	                  "================================\n"
+	                  "Active Connections: %u\n"
+	                  "Total Connections:  %u\n"
+	                  "Last Connected:     %s\n"
+	                  "Time Since Connect: %llu ms\n"
+	                  "\n"
+	                  "Connection Details:\n"
+	                  "-------------------\n"
+	                  "You are currently %s via Bluetooth L2CAP!\n"
+	                  "PSM: 0x%04x\n"
+	                  "Protocol: 9P2000 over L2CAP\n",
+	                  bt_connection_count,
+	                  bt_total_connections,
+	                  bt_last_connected_addr,
+	                  bt_last_connected_time ? (k_uptime_get() - bt_last_connected_time) : 0,
+	                  bt_connection_count > 0 ? "connected" : "disconnected",
+	                  CONFIG_NINEP_L2CAP_PSM);
+
+	if (offset >= len) {
+		return 0;
+	}
+
+	size_t remaining = len - offset;
+	size_t to_copy = MIN(remaining, buf_size);
+
+	memcpy(buf, conn_str + offset, to_copy);
+	return to_copy;
+}
+
+/* Generate net/bt/address content - device BT address */
+static int gen_bt_address(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx)
+{
+	char addr_str[256];
+	bt_addr_le_t addr;
+	char addr_string[BT_ADDR_LE_STR_LEN];
+
+	/* Get local BT address */
+	size_t count = 1;
+	bt_id_get(&addr, &count);
+	bt_addr_le_to_str(&addr, addr_string, sizeof(addr_string));
+
+	int len = snprintf(addr_str, sizeof(addr_str),
+	                  "Bluetooth Device Information\n"
+	                  "============================\n"
+	                  "Device Name:    %s\n"
+	                  "Device Address: %s\n"
+	                  "Device Type:    Peripheral\n"
+	                  "Capabilities:   L2CAP, 9P Server\n",
+	                  CONFIG_BT_DEVICE_NAME,
+	                  addr_string);
+
+	if (offset >= len) {
+		return 0;
+	}
+
+	size_t remaining = len - offset;
+	size_t to_copy = MIN(remaining, buf_size);
+
+	memcpy(buf, addr_str + offset, to_copy);
+	return to_copy;
+}
+
 /* ========== LIBRARY FILES - Reference Material ========== */
 
 /* Generate lib/9p-intro.txt - large reference file */
@@ -438,10 +616,13 @@ static int gen_9p_intro(uint8_t *buf, size_t buf_size, uint64_t offset, void *ct
 		"You're viewing this file over Bluetooth L2CAP using 9P!\n"
 		"Browse the filesystem to see:\n"
 		"\n"
-		"/dev/led      - Control an LED by writing 'on' or 'off'\n"
-		"/sensors/temp0 - Read live temperature sensor\n"
-		"/sys/threads  - See all running threads\n"
-		"/sys/firmware - Upload firmware over BLE!\n"
+		"/dev/led        - Control an LED by writing 'on' or 'off'\n"
+		"/dev/button1    - Live button state and press counter\n"
+		"/dev/button2    - Live button state and press counter\n"
+		"/sensors/temp0  - Read live temperature sensor\n"
+		"/sys/threads    - See all running threads\n"
+		"/sys/firmware   - Upload firmware over BLE!\n"
+		"/net/bt/*       - Bluetooth connection statistics\n"
 		"\n"
 		"The Future:\n"
 		"----------\n"
@@ -693,6 +874,20 @@ static int setup_filesystem(void)
 		return ret;
 	}
 
+	/* Create /dev/button1 - Button state and press counter! */
+	ret = ninep_sysfs_register_file(&sysfs, "dev/button1", gen_button1, NULL);
+	if (ret < 0) {
+		LOG_ERR("Failed to add dev/button1: %d", ret);
+		return ret;
+	}
+
+	/* Create /dev/button2 - Button state and press counter! */
+	ret = ninep_sysfs_register_file(&sysfs, "dev/button2", gen_button2, NULL);
+	if (ret < 0) {
+		LOG_ERR("Failed to add dev/button2: %d", ret);
+		return ret;
+	}
+
 	/* ========== SENSORS ========== */
 
 	/* Create /sensors directory */
@@ -719,6 +914,36 @@ static int setup_filesystem(void)
 		return ret;
 	}
 
+	/* ========== NETWORK STATISTICS ========== */
+
+	/* Create /net directory */
+	ret = ninep_sysfs_register_dir(&sysfs, "net");
+	if (ret < 0) {
+		LOG_ERR("Failed to add net directory: %d", ret);
+		return ret;
+	}
+
+	/* Create /net/bt directory */
+	ret = ninep_sysfs_register_dir(&sysfs, "net/bt");
+	if (ret < 0) {
+		LOG_ERR("Failed to add net/bt directory: %d", ret);
+		return ret;
+	}
+
+	/* Create /net/bt/connections - Live BT connection stats! */
+	ret = ninep_sysfs_register_file(&sysfs, "net/bt/connections", gen_bt_connections, NULL);
+	if (ret < 0) {
+		LOG_ERR("Failed to add net/bt/connections: %d", ret);
+		return ret;
+	}
+
+	/* Create /net/bt/address - BT device address and info! */
+	ret = ninep_sysfs_register_file(&sysfs, "net/bt/address", gen_bt_address, NULL);
+	if (ret < 0) {
+		LOG_ERR("Failed to add net/bt/address: %d", ret);
+		return ret;
+	}
+
 	/* ========== LIBRARY / REFERENCE MATERIAL ========== */
 
 	/* Create /lib directory */
@@ -738,10 +963,20 @@ static int setup_filesystem(void)
 	LOG_INF("===================================================");
 	LOG_INF("Filesystem setup complete with AMAZING DEMO FEATURES!");
 	LOG_INF("===================================================");
-	LOG_INF("- /dev/led: Control hardware by writing 'on'/'off'");
-	LOG_INF("- /sensors/temp0: Live temperature readings");
-	LOG_INF("- /sys/firmware: Upload firmware over BLE!");
-	LOG_INF("- /lib/9p-intro.txt: Learn about 9P");
+	LOG_INF("Device Control:");
+	LOG_INF("  - /dev/led: Control hardware by writing 'on'/'off'");
+	LOG_INF("  - /dev/button1: Live button state & press counter");
+	LOG_INF("  - /dev/button2: Live button state & press counter");
+	LOG_INF("System Stats:");
+	LOG_INF("  - /sys/uptime, /sys/threads, /sys/memory");
+	LOG_INF("  - /sensors/temp0: Live temperature readings");
+	LOG_INF("Network:");
+	LOG_INF("  - /net/bt/connections: BT connection statistics");
+	LOG_INF("  - /net/bt/address: Device BT information");
+	LOG_INF("Firmware:");
+	LOG_INF("  - /sys/firmware: Upload firmware over BLE!");
+	LOG_INF("Documentation:");
+	LOG_INF("  - /lib/9p-intro.txt: Learn about 9P");
 	LOG_INF("===================================================");
 	return 0;
 }
@@ -805,6 +1040,46 @@ int main(void)
 	}
 
 	/* Always setup sysfs with system files */
+
+	/* Initialize Button 1 GPIO */
+	if (!gpio_is_ready_dt(&button1)) {
+		LOG_WRN("Button 1 GPIO not ready - button tracking will not work");
+	} else {
+		ret = gpio_pin_configure_dt(&button1, GPIO_INPUT);
+		if (ret < 0) {
+			LOG_WRN("Failed to configure button 1 GPIO: %d", ret);
+		} else {
+			ret = gpio_pin_interrupt_configure_dt(&button1, GPIO_INT_EDGE_TO_ACTIVE);
+			if (ret < 0) {
+				LOG_WRN("Failed to configure button 1 interrupt: %d", ret);
+			} else {
+				gpio_init_callback(&button1_cb_data, button1_pressed, BIT(button1.pin));
+				gpio_add_callback(button1.port, &button1_cb_data);
+				LOG_INF("Button 1 configured - press count available at /dev/button1!");
+			}
+		}
+	}
+
+	/* Initialize Button 2 GPIO */
+	if (!gpio_is_ready_dt(&button2)) {
+		LOG_WRN("Button 2 GPIO not ready - button tracking will not work");
+	} else {
+		ret = gpio_pin_configure_dt(&button2, GPIO_INPUT);
+		if (ret < 0) {
+			LOG_WRN("Failed to configure button 2 GPIO: %d", ret);
+		} else {
+			ret = gpio_pin_interrupt_configure_dt(&button2, GPIO_INT_EDGE_TO_ACTIVE);
+			if (ret < 0) {
+				LOG_WRN("Failed to configure button 2 interrupt: %d", ret);
+			} else {
+				gpio_init_callback(&button2_cb_data, button2_pressed, BIT(button2.pin));
+				gpio_add_callback(button2.port, &button2_cb_data);
+				LOG_INF("Button 2 configured - press count available at /dev/button2!");
+			}
+		}
+	}
+
+	/* Setup filesystem */
 	ret = setup_filesystem();
 	if (ret < 0) {
 		LOG_ERR("Failed to setup sysfs: %d", ret);
