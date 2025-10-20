@@ -5,6 +5,7 @@
 
 #include <zephyr/9p/union_fs.h>
 #include <zephyr/9p/server.h>
+#include <zephyr/9p/protocol.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <string.h>
@@ -104,35 +105,69 @@ static const char *get_relative_path(const char *path, const char *mount_path)
  * @param node Node to look up
  * @return Pointer to owning mount, or NULL if node is union root or not found
  */
+/**
+ * @brief Register a node as being owned by a specific mount
+ */
+static void register_node_owner(struct ninep_union_fs *fs,
+                                 struct ninep_fs_node *node,
+                                 struct ninep_union_mount *mount)
+{
+	/* Check if already registered */
+	for (size_t i = 0; i < fs->num_node_owners; i++) {
+		if (fs->node_owners[i].node == node) {
+			/* Already registered, update mount */
+			fs->node_owners[i].mount = mount;
+			return;
+		}
+	}
+
+	/* Add new entry if space available */
+	if (fs->num_node_owners < ARRAY_SIZE(fs->node_owners)) {
+		fs->node_owners[fs->num_node_owners].node = node;
+		fs->node_owners[fs->num_node_owners].mount = mount;
+		fs->num_node_owners++;
+		LOG_DBG("Registered node=%p name='%s' -> mount '%s' (total=%zu)",
+		        node, node->name, mount->path, fs->num_node_owners);
+	} else {
+		LOG_WRN("Node ownership table full! Cannot track node=%p", node);
+	}
+}
+
 static struct ninep_union_mount *find_node_owner(struct ninep_union_fs *fs,
                                                    struct ninep_fs_node *node)
 {
+	LOG_DBG("find_node_owner: looking for node=%p name='%s'", node, node->name);
+
 	/* Union root doesn't belong to any backend */
 	if (node == fs->root) {
+		LOG_DBG("  Node is union root, returning NULL");
 		return NULL;
 	}
 
-	/* Check each mount to see if this node belongs to it */
+	/* First check the ownership tracking table */
+	for (size_t i = 0; i < fs->num_node_owners; i++) {
+		if (fs->node_owners[i].node == node) {
+			LOG_DBG("  Found in tracking table -> mount '%s'",
+			        fs->node_owners[i].mount->path);
+			return fs->node_owners[i].mount;
+		}
+	}
+
+	/* Check each mount to see if this node is a mount root */
 	for (size_t i = 0; i < fs->num_mounts; i++) {
 		struct ninep_union_mount *mount = &fs->mounts[i];
 
-		/* Simple heuristic: check if node is the mount's root */
+		LOG_DBG("  Checking mount[%zu]: path='%s' root=%p", i, mount->path, mount->root);
+
+		/* Check if node is the mount's root */
 		if (node == mount->root) {
+			LOG_DBG("  MATCH! Node is root of mount '%s'", mount->path);
 			return mount;
 		}
-
-		/* For nodes deeper in the tree, we rely on QID path ranges
-		 * or other backend-specific tracking. For now, we'll assume
-		 * the backend can handle any node it returned from walk */
-		/* This is a simplification - ideally we'd track node ownership */
 	}
 
-	/* If not found as a mount root, assume it belongs to the first mount
-	 * that can handle it. This is imperfect but works for single-backend cases */
-	if (fs->num_mounts > 0) {
-		return &fs->mounts[0];
-	}
-
+	/* Not found in tracking table or mount roots */
+	LOG_WRN("  No owner found for node=%p name='%s'!", node, node->name);
 	return NULL;
 }
 
@@ -146,26 +181,23 @@ static struct ninep_fs_node *union_walk(struct ninep_fs_node *parent,
 
 	/* If parent is the union root, we need to figure out which backend to use */
 	if (parent == fs->root) {
-		/* Check if there's a backend mounted at "/" */
-		struct ninep_union_mount *root_mount = NULL;
-		for (size_t i = 0; i < fs->num_mounts; i++) {
-			if (strcmp(fs->mounts[i].path, "/") == 0) {
-				root_mount = &fs->mounts[i];
-				break;
-			}
-		}
-
-		/* If there's a root mount, delegate directly to it */
-		if (root_mount && root_mount->fs_ops->walk) {
-			return root_mount->fs_ops->walk(root_mount->root, name, name_len,
-			                                 root_mount->fs_ctx);
-		}
-
-		/* Otherwise, do mount point matching for multi-backend scenarios */
+		/* Build full path */
 		char full_path[256];
 		snprintf(full_path, sizeof(full_path), "/%.*s", name_len, name);
 
-		/* Find which backend should handle this path */
+		/* First check if this is an exact mount point match */
+		for (size_t i = 0; i < fs->num_mounts; i++) {
+			if (strcmp(fs->mounts[i].path, full_path) == 0) {
+				/* Walking directly to a mount point - return its root */
+				LOG_DBG("Walk matched mount point '%s', returning root=%p name='%s'",
+				        full_path, fs->mounts[i].root,
+				        fs->mounts[i].root ? fs->mounts[i].root->name : "NULL");
+				/* Mount roots are implicitly owned by their mount, no need to register */
+				return fs->mounts[i].root;
+			}
+		}
+
+		/* Not an exact mount point - find which backend should handle it */
 		size_t match_len;
 		struct ninep_union_mount *mount = find_mount_point(fs, full_path, &match_len);
 
@@ -174,12 +206,17 @@ static struct ninep_fs_node *union_walk(struct ninep_fs_node *parent,
 			return NULL;
 		}
 
-		/* Special case: walking to mount point itself from root */
-		if (strcmp(full_path, mount->path) == 0) {
-			return mount->root;
+		/* If matched the "/" mount, delegate to it */
+		if (strcmp(mount->path, "/") == 0) {
+			struct ninep_fs_node *node = mount->fs_ops->walk(mount->root, name, name_len,
+			                                                   mount->fs_ctx);
+			if (node) {
+				register_node_owner(fs, node, mount);
+			}
+			return node;
 		}
 
-		/* Get relative path within this mount */
+		/* For other mounts, get relative path */
 		const char *rel_path = get_relative_path(full_path, mount->path);
 
 		/* Delegate to backend */
@@ -191,8 +228,12 @@ static struct ninep_fs_node *union_walk(struct ninep_fs_node *parent,
 		const char *backend_path = rel_path + 1;
 		uint16_t backend_path_len = strlen(backend_path);
 
-		return mount->fs_ops->walk(mount->root, backend_path, backend_path_len,
-		                           mount->fs_ctx);
+		struct ninep_fs_node *node = mount->fs_ops->walk(mount->root, backend_path,
+		                                                   backend_path_len, mount->fs_ctx);
+		if (node) {
+			register_node_owner(fs, node, mount);
+		}
+		return node;
 	} else {
 		/* Parent is not union root - delegate to the backend that owns it */
 		struct ninep_union_mount *mount = find_node_owner(fs, parent);
@@ -208,7 +249,12 @@ static struct ninep_fs_node *union_walk(struct ninep_fs_node *parent,
 			return NULL;
 		}
 
-		return mount->fs_ops->walk(parent, name, name_len, mount->fs_ctx);
+		struct ninep_fs_node *node = mount->fs_ops->walk(parent, name, name_len,
+		                                                   mount->fs_ctx);
+		if (node) {
+			register_node_owner(fs, node, mount);
+		}
+		return node;
 	}
 }
 
@@ -221,20 +267,89 @@ static int union_read(struct ninep_fs_node *node, uint64_t offset,
 	if (node == fs->root) {
 		/* Check if there's a backend mounted at "/" */
 		struct ninep_union_mount *root_mount = NULL;
+		int root_mount_idx = -1;
 		for (size_t i = 0; i < fs->num_mounts; i++) {
 			if (strcmp(fs->mounts[i].path, "/") == 0) {
 				root_mount = &fs->mounts[i];
+				root_mount_idx = i;
 				break;
 			}
 		}
 
-		/* If there's a root mount, delegate directly to it */
-		if (root_mount && root_mount->fs_ops->read) {
+		/* Count non-root mounts */
+		size_t num_other_mounts = 0;
+		for (size_t i = 0; i < fs->num_mounts; i++) {
+			if (strcmp(fs->mounts[i].path, "/") != 0) {
+				num_other_mounts++;
+			}
+		}
+
+		/* If there's a root mount AND no other mounts, just delegate */
+		if (root_mount && num_other_mounts == 0 && root_mount->fs_ops->read) {
 			return root_mount->fs_ops->read(root_mount->root, offset,
 			                                 buf, count, root_mount->fs_ctx);
 		}
 
-		/* Otherwise, synthesize directory with mount points */
+		/* If there's a root mount AND other mounts, we need to merge listings */
+		if (root_mount && num_other_mounts > 0) {
+			/* First, get the "/" mount's entries */
+			int ret = root_mount->fs_ops->read(root_mount->root, offset,
+			                                    buf, count, root_mount->fs_ctx);
+
+			if (ret < 0) {
+				return ret;
+			}
+
+			/* Only append mount points on the FIRST read (offset == 0) or
+			 * when sysfs still has data. This prevents infinite loops where
+			 * we keep appending mount points on every paginated read. */
+			if (offset == 0 && ret > 0) {
+				size_t buf_offset = ret;  /* Bytes used by "/" mount's entries */
+
+				/* Now append stat entries for mount points */
+				for (size_t i = 0; i < fs->num_mounts; i++) {
+					struct ninep_union_mount *mount = &fs->mounts[i];
+
+					/* Skip root mount */
+					if (strcmp(mount->path, "/") == 0) {
+						continue;
+					}
+
+					/* Extract mount point name (skip leading '/') */
+					const char *name = mount->path + 1;
+					uint16_t name_len = strlen(name);
+
+					/* Create a synthetic QID for this mount point */
+					struct ninep_qid mount_qid = {
+						.type = NINEP_QTDIR,
+						.version = 0,
+						.path = (uint64_t)mount  /* Use mount address as unique path */
+					};
+
+					/* Write stat structure for mount point directory */
+					size_t write_offset = 0;
+					int write_ret = ninep_write_stat(buf + buf_offset, count - buf_offset,
+					                                  &write_offset, &mount_qid,
+					                                  0755 | NINEP_DMDIR,  /* Directory mode */
+					                                  0,  /* length */
+					                                  name, name_len);
+
+					if (write_ret < 0) {
+						/* No more space - return what we have */
+						break;
+					}
+
+					buf_offset += write_offset;
+				}
+
+				return buf_offset;
+			}
+
+			/* For subsequent reads (offset > 0), just return what sysfs gives us */
+			return ret;
+		}
+
+		/* No root mount - synthesize directory with mount points only */
 		uint32_t pos = 0;
 
 		/* Skip entries based on offset (simplified) */
@@ -269,7 +384,15 @@ static int union_read(struct ninep_fs_node *node, uint64_t offset,
 	struct ninep_union_mount *mount = find_node_owner(fs, node);
 
 	if (!mount) {
-		LOG_ERR("Cannot find owner for node");
+		LOG_ERR("Cannot find owner for node '%s' (qid.path=%llu)",
+		        node->name, node->qid.path);
+		/* Debug: print all mount roots */
+		for (size_t i = 0; i < fs->num_mounts; i++) {
+			LOG_ERR("  Mount[%zu]: path='%s' root=%p root->name='%s'",
+			        i, fs->mounts[i].path, fs->mounts[i].root,
+			        fs->mounts[i].root ? fs->mounts[i].root->name : "NULL");
+		}
+		LOG_ERR("  Node we're looking for: %p", node);
 		return -ENOENT;
 	}
 
@@ -279,6 +402,8 @@ static int union_read(struct ninep_fs_node *node, uint64_t offset,
 		return -ENOTSUP;
 	}
 
+	LOG_DBG("Delegating read to mount '%s' for node '%s'",
+	        mount->path, node->name);
 	return mount->fs_ops->read(node, offset, buf, count, mount->fs_ctx);
 }
 

@@ -960,6 +960,9 @@ static int setup_filesystem(void)
 		return ret;
 	}
 
+	/* Note: /files mount point will appear automatically in directory listings
+	 * thanks to union_fs merging sysfs entries with mount point entries */
+
 	LOG_INF("===================================================");
 	LOG_INF("Filesystem setup complete with AMAZING DEMO FEATURES!");
 	LOG_INF("===================================================");
@@ -1087,21 +1090,134 @@ int main(void)
 	}
 
 #if USE_LITTLEFS
-	/* Mount LittleFS */
-	ret = fs_mount(&lfs_mnt);
-	if (ret < 0) {
-		LOG_ERR("Failed to mount LittleFS: %d", ret);
-		LOG_ERR("Try erasing flash: west flash --erase");
-		return 0;
-	}
-	LOG_INF("LittleFS mounted at %s", LITTLEFS_MOUNT_POINT);
+	LOG_INF("*** LittleFS support is ENABLED ***");
+	/* LittleFS is auto-mounted by device tree at /lfs1 */
+	LOG_INF("Using auto-mounted LittleFS at %s", LITTLEFS_MOUNT_POINT);
+#else
+	LOG_WRN("*** LittleFS support is DISABLED - check CONFIG_NINEP_FS_PASSTHROUGH ***");
+#endif
 
-	/* Populate filesystem with initial files (first boot only) */
-	ret = populate_littlefs();
+#if USE_LITTLEFS
+
+	/* List LittleFS contents to verify flash image */
+	LOG_INF("===== LittleFS Contents =====");
+	k_sleep(K_MSEC(50));  /* Give UART time to flush */
+
+	struct fs_dir_t dir;
+	fs_dir_t_init(&dir);
+	ret = fs_opendir(&dir, LITTLEFS_MOUNT_POINT);
 	if (ret < 0) {
-		LOG_ERR("Failed to populate filesystem: %d", ret);
-		return 0;
+		LOG_ERR("Failed to open LFS root: %d", ret);
+	} else {
+		struct fs_dirent entry;
+		int entry_count = 0;
+		while (fs_readdir(&dir, &entry) == 0) {
+			if (entry.name[0] == 0) {
+				break;  /* End of directory */
+			}
+			entry_count++;
+			LOG_INF("  %s %s (%zu bytes)",
+			        entry.type == FS_DIR_ENTRY_DIR ? "[DIR]" : "[FILE]",
+			        entry.name,
+			        entry.size);
+
+			/* If it's a directory, list its contents too */
+			if (entry.type == FS_DIR_ENTRY_DIR) {
+				char subdir_path[256];
+				snprintf(subdir_path, sizeof(subdir_path), "%s/%s",
+				         LITTLEFS_MOUNT_POINT, entry.name);
+
+				struct fs_dir_t subdir;
+				fs_dir_t_init(&subdir);
+				if (fs_opendir(&subdir, subdir_path) == 0) {
+					struct fs_dirent subentry;
+					while (fs_readdir(&subdir, &subentry) == 0) {
+						if (subentry.name[0] == 0) {
+							break;
+						}
+						LOG_INF("    %s %s/%s (%zu bytes)",
+						        subentry.type == FS_DIR_ENTRY_DIR ? "[DIR]" : "[FILE]",
+						        entry.name, subentry.name,
+						        subentry.size);
+					}
+					fs_closedir(&subdir);
+				}
+			}
+		}
+		fs_closedir(&dir);
+
+		if (entry_count == 0) {
+			LOG_WRN("LittleFS is EMPTY! Creating demo files...");
+
+			/* Create /lib directory */
+			char lib_dir[64];
+			snprintf(lib_dir, sizeof(lib_dir), "%s/lib", LITTLEFS_MOUNT_POINT);
+			ret = fs_mkdir(lib_dir);
+			if (ret == 0 || ret == -EEXIST) {
+				LOG_INF("  Created: /lib/");
+
+				/* Create /lib/readme.txt */
+				char readme_path[128];
+				snprintf(readme_path, sizeof(readme_path), "%s/readme.txt", lib_dir);
+				struct fs_file_t file;
+				fs_file_t_init(&file);
+
+				ret = fs_open(&file, readme_path, FS_O_CREATE | FS_O_WRITE);
+				if (ret == 0) {
+					const char *content =
+						"Welcome to 9P over Bluetooth!\n"
+						"\n"
+						"This filesystem is stored in flash and persists across reboots.\n"
+						"You can create, edit, and delete files via 9P.\n"
+						"\n"
+						"Try:\n"
+						"  - Creating new files and directories\n"
+						"  - Editing this file\n"
+						"  - Uploading firmware to /sys/firmware\n"
+						"\n"
+						"Learn more about 9P at http://9p.io/\n";
+
+					fs_write(&file, content, strlen(content));
+					fs_close(&file);
+					LOG_INF("  Created: /lib/readme.txt");
+				}
+			}
+
+			/* Create /notes directory */
+			char notes_dir[64];
+			snprintf(notes_dir, sizeof(notes_dir), "%s/notes", LITTLEFS_MOUNT_POINT);
+			ret = fs_mkdir(notes_dir);
+			if (ret == 0 || ret == -EEXIST) {
+				LOG_INF("  Created: /notes/");
+
+				/* Create /notes/example.txt */
+				char note_path[128];
+				snprintf(note_path, sizeof(note_path), "%s/example.txt", notes_dir);
+				struct fs_file_t file;
+				fs_file_t_init(&file);
+
+				ret = fs_open(&file, note_path, FS_O_CREATE | FS_O_WRITE);
+				if (ret == 0) {
+					const char *content =
+						"Example Note\n"
+						"============\n"
+						"\n"
+						"This is a small demo file.\n"
+						"Feel free to edit or delete it!\n";
+
+					fs_write(&file, content, strlen(content));
+					fs_close(&file);
+					LOG_INF("  Created: /notes/example.txt");
+				}
+			}
+
+			LOG_INF("Demo files created!");
+		} else {
+			LOG_INF("Found %d entries in LittleFS", entry_count);
+		}
 	}
+	LOG_INF("=============================");
+	k_sleep(K_MSEC(100));  /* Give UART time to flush all logs */
 
 	/* Initialize passthrough filesystem */
 	ret = ninep_passthrough_fs_init(&passthrough_fs, LITTLEFS_MOUNT_POINT);

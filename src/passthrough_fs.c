@@ -181,7 +181,7 @@ static int passthrough_read(struct ninep_fs_node *node, uint64_t offset,
 
 	if (node->type == NINEP_NODE_DIR) {
 		/* Read directory entries */
-		LOG_DBG("Reading directory: '%s'", fs_path);
+		LOG_DBG("Reading directory: '%s' (offset=%llu, count=%u)", fs_path, offset, count);
 
 		struct fs_dir_t dir;
 		fs_dir_t_init(&dir);
@@ -219,111 +219,55 @@ static int passthrough_read(struct ninep_fs_node *node, uint64_t offset,
 			LOG_DBG("  Entry: %s (type=%d, size=%zu)",
 			        entry.name, entry.type, entry.size);
 
-			/* Build 9P stat for this entry */
+			/* Build QID for this entry */
+			struct ninep_qid entry_qid = {
+				.type = (entry.type == FS_DIR_ENTRY_DIR) ? NINEP_QTDIR : NINEP_QTFILE,
+				.version = 0,
+				.path = fs->next_qid_path++
+			};
+
+			/* Build mode */
+			uint32_t mode = (entry.type == FS_DIR_ENTRY_DIR) ? 0755 : 0644;
+			if (entry.type == FS_DIR_ENTRY_DIR) {
+				mode |= NINEP_DMDIR;
+			}
+
+			/* Calculate stat size using ninep_write_stat's format:
+			 * type[2] + dev[4] + qid[13] + mode[4] + atime[4] + mtime[4] +
+			 * length[8] + name[2+len] + uid[2+6] + gid[2+6] + muid[2+6]
+			 */
 			uint16_t name_len = strlen(entry.name);
 			uint16_t stat_size = 2 + 4 + 13 + 4 + 4 + 4 + 8 +
-			                      2 + name_len +
-			                      2 + 0 +  /* uid */
-			                      2 + 0 +  /* gid */
-			                      2 + 0;   /* muid */
-			uint32_t entry_size = 2 + stat_size;
+			                     (2 + name_len) + (2 + 6) + (2 + 6) + (2 + 6);
 
 			/* Check if this entry is past the requested offset */
 			if (current_offset >= offset) {
 				/* Check if we have space */
-				if (buf_offset + entry_size > count) {
+				LOG_DBG("    Checking space: buf_offset=%zu + stat_size=%u > count=%u?",
+				        buf_offset, stat_size, count);
+				if (buf_offset + stat_size > count) {
+					LOG_DBG("    NO SPACE! Breaking.");
 					break;
 				}
 
-				/* Write stat entry */
-				/* size[2] */
-				buf[buf_offset++] = stat_size & 0xFF;
-				buf[buf_offset++] = (stat_size >> 8) & 0xFF;
+				/* Write stat structure using helper */
+				size_t write_offset = 0;
+				int write_ret = ninep_write_stat(buf + buf_offset, count - buf_offset,
+				                                  &write_offset, &entry_qid, mode,
+				                                  entry.size, entry.name, name_len);
 
-				/* type[2] */
-				buf[buf_offset++] = 0;
-				buf[buf_offset++] = 0;
-
-				/* dev[4] */
-				buf[buf_offset++] = 0;
-				buf[buf_offset++] = 0;
-				buf[buf_offset++] = 0;
-				buf[buf_offset++] = 0;
-
-				/* qid[13] - generate unique QID based on path */
-				uint8_t qid_type = (entry.type == FS_DIR_ENTRY_DIR) ?
-				                   NINEP_QTDIR : NINEP_QTFILE;
-				uint64_t qid_path = fs->next_qid_path++;
-
-				buf[buf_offset++] = qid_type;
-				buf[buf_offset++] = 0;  /* version */
-				buf[buf_offset++] = 0;
-				buf[buf_offset++] = 0;
-				buf[buf_offset++] = 0;
-				buf[buf_offset++] = qid_path & 0xFF;
-				buf[buf_offset++] = (qid_path >> 8) & 0xFF;
-				buf[buf_offset++] = (qid_path >> 16) & 0xFF;
-				buf[buf_offset++] = (qid_path >> 24) & 0xFF;
-				buf[buf_offset++] = (qid_path >> 32) & 0xFF;
-				buf[buf_offset++] = (qid_path >> 40) & 0xFF;
-				buf[buf_offset++] = (qid_path >> 48) & 0xFF;
-				buf[buf_offset++] = (qid_path >> 56) & 0xFF;
-
-				/* mode[4] */
-				uint32_t mode = (entry.type == FS_DIR_ENTRY_DIR) ? 0755 : 0644;
-				if (entry.type == FS_DIR_ENTRY_DIR) {
-					mode |= NINEP_DMDIR;
+				if (write_ret < 0) {
+					LOG_ERR("ninep_write_stat failed: %d", write_ret);
+					break;
 				}
-				buf[buf_offset++] = mode & 0xFF;
-				buf[buf_offset++] = (mode >> 8) & 0xFF;
-				buf[buf_offset++] = (mode >> 16) & 0xFF;
-				buf[buf_offset++] = (mode >> 24) & 0xFF;
 
-				/* atime[4] */
-				buf[buf_offset++] = 0;
-				buf[buf_offset++] = 0;
-				buf[buf_offset++] = 0;
-				buf[buf_offset++] = 0;
-
-				/* mtime[4] */
-				buf[buf_offset++] = 0;
-				buf[buf_offset++] = 0;
-				buf[buf_offset++] = 0;
-				buf[buf_offset++] = 0;
-
-				/* length[8] */
-				uint64_t len = entry.size;
-				buf[buf_offset++] = len & 0xFF;
-				buf[buf_offset++] = (len >> 8) & 0xFF;
-				buf[buf_offset++] = (len >> 16) & 0xFF;
-				buf[buf_offset++] = (len >> 24) & 0xFF;
-				buf[buf_offset++] = (len >> 32) & 0xFF;
-				buf[buf_offset++] = (len >> 40) & 0xFF;
-				buf[buf_offset++] = (len >> 48) & 0xFF;
-				buf[buf_offset++] = (len >> 56) & 0xFF;
-
-				/* name[s] */
-				buf[buf_offset++] = name_len & 0xFF;
-				buf[buf_offset++] = (name_len >> 8) & 0xFF;
-				memcpy(&buf[buf_offset], entry.name, name_len);
-				buf_offset += name_len;
-
-				/* uid[s] */
-				buf[buf_offset++] = 0;
-				buf[buf_offset++] = 0;
-
-				/* gid[s] */
-				buf[buf_offset++] = 0;
-				buf[buf_offset++] = 0;
-
-				/* muid[s] */
-				buf[buf_offset++] = 0;
-				buf[buf_offset++] = 0;
-
+				buf_offset += write_offset;
+				current_offset += write_offset;
 				entry_count++;
+			} else {
+				/* Skip this entry - update offset */
+				current_offset += stat_size;
 			}
-
-			current_offset += entry_size;
 		}
 
 		fs_closedir(&dir);
