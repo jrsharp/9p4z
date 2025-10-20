@@ -198,6 +198,16 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	bt_total_connections++;
 	strncpy(bt_last_connected_addr, addr, sizeof(bt_last_connected_addr) - 1);
 	bt_last_connected_time = k_uptime_get();
+
+	/* Restart advertising if we haven't hit the connection limit */
+	if (bt_connection_count < CONFIG_BT_MAX_CONN) {
+		k_work_reschedule(&restart_adv_work, K_MSEC(100));
+		LOG_INF("Restarting advertising for additional connections (%u/%d)",
+		        bt_connection_count, CONFIG_BT_MAX_CONN);
+	} else {
+		LOG_INF("Max connections reached (%u/%d) - advertising stopped",
+		        bt_connection_count, CONFIG_BT_MAX_CONN);
+	}
 }
 
 static void restart_advertising_work_handler(struct k_work *work)
@@ -227,6 +237,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
 	/* Restart advertising after a short delay to allow BT stack cleanup */
 	k_work_reschedule(&restart_adv_work, K_MSEC(100));
+	LOG_INF("Connection slot freed, restarting advertising (%u/%d)",
+	        bt_connection_count, CONFIG_BT_MAX_CONN);
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
