@@ -152,6 +152,11 @@ static struct ninep_fs_node *sysfs_walk(struct ninep_fs_node *parent,
 			return NULL;
 		}
 
+		/* Update mode for writable files */
+		if (!entry->is_dir && entry->writable) {
+			node->mode = 0644;  /* Read-write for owner, read-only for others */
+		}
+
 		return node;
 	}
 
