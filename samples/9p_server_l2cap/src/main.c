@@ -51,10 +51,6 @@ static uint64_t button2_last_press_time = 0;
 static size_t firmware_bytes_written = 0;
 static char firmware_last_write[32] = "No uploads yet";
 
-/* 9P server instance */
-static struct ninep_server server;
-static struct ninep_transport transport;
-
 /* Sysfs instance - always present for system files */
 static struct ninep_sysfs sysfs;
 static struct ninep_sysfs_entry sysfs_entries[64];
@@ -65,7 +61,7 @@ FS_LITTLEFS_DECLARE_DEFAULT_CONFIG(storage);
 static struct fs_mount_t lfs_mnt = {
 	.type = FS_LITTLEFS,
 	.fs_data = &storage,
-	.storage_dev = (void *)FIXED_PARTITION_ID(lfs_partition),
+	.storage_dev = (void *)FIXED_PARTITION_ID(littlefs_storage),
 	.mnt_point = LITTLEFS_MOUNT_POINT,
 };
 
@@ -77,8 +73,28 @@ static struct ninep_passthrough_fs passthrough_fs;
 static struct ninep_union_fs union_fs;
 static struct ninep_union_mount union_mounts[4];  /* Space for up to 4 backends */
 
-/* RX buffer for L2CAP transport */
-static uint8_t rx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
+/* Multi-session 9P support */
+#define MAX_9P_SESSIONS 4
+#define FIXED_PSM CONFIG_NINEP_L2CAP_PSM  /* 0x0009 */
+#define DYNAMIC_PSM_START 0x0080
+#define DYNAMIC_PSM_END 0x00FF
+
+struct ninep_session {
+	/* L2CAP layer */
+	struct ninep_transport transport;
+	uint8_t rx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
+
+	/* 9P server instance */
+	struct ninep_server server;
+
+	/* Session metadata */
+	uint16_t psm;
+	bool active;
+	struct bt_conn *conn;  /* Associated BT connection */
+};
+
+static struct ninep_session sessions[MAX_9P_SESSIONS];
+static struct k_mutex sessions_mutex;
 
 /* Bluetooth advertising data */
 static const struct bt_data ad[] = {
@@ -91,6 +107,77 @@ static uint32_t bt_connection_count = 0;
 static uint32_t bt_total_connections = 0;
 static char bt_last_connected_addr[BT_ADDR_LE_STR_LEN] = "None";
 static uint64_t bt_last_connected_time = 0;
+
+/* Work item for restarting advertising after disconnect */
+static void restart_advertising_work_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(restart_adv_work, restart_advertising_work_handler);
+
+/* Session management functions */
+static struct ninep_session *allocate_session(struct bt_conn *conn)
+{
+	k_mutex_lock(&sessions_mutex, K_FOREVER);
+
+	for (int i = 0; i < MAX_9P_SESSIONS; i++) {
+		if (!sessions[i].active) {
+			sessions[i].active = true;
+			sessions[i].conn = conn;
+			k_mutex_unlock(&sessions_mutex);
+			LOG_INF("Allocated session %d (PSM 0x%04x)", i, sessions[i].psm);
+			return &sessions[i];
+		}
+	}
+
+	k_mutex_unlock(&sessions_mutex);
+	LOG_ERR("No free sessions available!");
+	return NULL;
+}
+
+static void free_session(struct ninep_session *session)
+{
+	if (!session) {
+		return;
+	}
+
+	k_mutex_lock(&sessions_mutex, K_FOREVER);
+
+	int idx = session - sessions;
+	LOG_INF("Freeing session %d (PSM 0x%04x)", idx, session->psm);
+
+	session->active = false;
+	session->conn = NULL;
+
+	k_mutex_unlock(&sessions_mutex);
+}
+
+static struct ninep_session *find_session_by_conn(struct bt_conn *conn)
+{
+	k_mutex_lock(&sessions_mutex, K_FOREVER);
+
+	for (int i = 0; i < MAX_9P_SESSIONS; i++) {
+		if (sessions[i].active && sessions[i].conn == conn) {
+			k_mutex_unlock(&sessions_mutex);
+			return &sessions[i];
+		}
+	}
+
+	k_mutex_unlock(&sessions_mutex);
+	return NULL;
+}
+
+static int count_active_sessions(void)
+{
+	int count = 0;
+
+	k_mutex_lock(&sessions_mutex, K_FOREVER);
+	for (int i = 0; i < MAX_9P_SESSIONS; i++) {
+		if (sessions[i].active) {
+			count++;
+		}
+	}
+	k_mutex_unlock(&sessions_mutex);
+
+	return count;
+}
 
 /* Bluetooth connection callbacks */
 static void connected(struct bt_conn *conn, uint8_t err)
@@ -113,6 +200,18 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	bt_last_connected_time = k_uptime_get();
 }
 
+static void restart_advertising_work_handler(struct k_work *work)
+{
+	int err = bt_le_adv_start(BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN, BT_GAP_ADV_FAST_INT_MIN_2,
+	                                           BT_GAP_ADV_FAST_INT_MAX_2, NULL),
+	                          ad, ARRAY_SIZE(ad), NULL, 0);
+	if (err) {
+		LOG_ERR("Failed to restart advertising: %d", err);
+	} else {
+		LOG_INF("Advertising restarted - ready for new connections");
+	}
+}
+
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
@@ -125,6 +224,9 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	if (bt_connection_count > 0) {
 		bt_connection_count--;
 	}
+
+	/* Restart advertising after a short delay to allow BT stack cleanup */
+	k_work_reschedule(&restart_adv_work, K_MSEC(100));
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
@@ -510,6 +612,8 @@ static int write_firmware(const uint8_t *buf, uint32_t count, uint64_t offset, v
 static int gen_bt_connections(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx)
 {
 	char conn_str[512];
+	int active_sessions = count_active_sessions();
+
 	int len = snprintf(conn_str, sizeof(conn_str),
 	                  "Bluetooth Connection Statistics\n"
 	                  "================================\n"
@@ -518,17 +622,26 @@ static int gen_bt_connections(uint8_t *buf, size_t buf_size, uint64_t offset, vo
 	                  "Last Connected:     %s\n"
 	                  "Time Since Connect: %llu ms\n"
 	                  "\n"
+	                  "9P Session Statistics:\n"
+	                  "---------------------\n"
+	                  "Active 9P Sessions: %d / %d\n"
+	                  "Primary PSM:        0x%04x (fixed)\n"
+	                  "Dynamic PSM Range:  0x%04x-0x%04x\n"
+	                  "\n"
 	                  "Connection Details:\n"
 	                  "-------------------\n"
 	                  "You are currently %s via Bluetooth L2CAP!\n"
-	                  "PSM: 0x%04x\n"
 	                  "Protocol: 9P2000 over L2CAP\n",
 	                  bt_connection_count,
 	                  bt_total_connections,
 	                  bt_last_connected_addr,
 	                  bt_last_connected_time ? (k_uptime_get() - bt_last_connected_time) : 0,
-	                  bt_connection_count > 0 ? "connected" : "disconnected",
-	                  CONFIG_NINEP_L2CAP_PSM);
+	                  active_sessions,
+	                  MAX_9P_SESSIONS,
+	                  FIXED_PSM,
+	                  DYNAMIC_PSM_START,
+	                  DYNAMIC_PSM_START + MAX_9P_SESSIONS - 2,
+	                  bt_connection_count > 0 ? "connected" : "disconnected");
 
 	if (offset >= len) {
 		return 0;
@@ -1005,7 +1118,7 @@ int main(void)
 	struct ninep_9pis_config gatt_config = {
 		.service_description = "9P File Server",
 		.service_features = "file-sharing,sensor-data,led-control,firmware-update",
-		.transport_info = "l2cap:psm=0x0009,mtu=4096",
+		.transport_info = "l2cap:psm=9,mtu=4096,dynamic,sessions=4,range=80-ff",
 		.app_store_link = "https://9p4z.org/clients",
 		.protocol_version = "9P2000;9p4z;1.0.0",
 	};
@@ -1093,11 +1206,42 @@ int main(void)
 	LOG_INF("*** LittleFS support is ENABLED ***");
 	/* LittleFS is auto-mounted by device tree at /lfs1 */
 	LOG_INF("Using auto-mounted LittleFS at %s", LITTLEFS_MOUNT_POINT);
+	LOG_INF("NOTE: Check boot logs for actual LittleFS size reported during mount");
 #else
 	LOG_WRN("*** LittleFS support is DISABLED - check CONFIG_NINEP_FS_PASSTHROUGH ***");
 #endif
 
 #if USE_LITTLEFS
+
+	/* Check LittleFS space usage */
+	struct fs_statvfs stats;
+	ret = fs_statvfs(LITTLEFS_MOUNT_POINT, &stats);
+	if (ret == 0) {
+		unsigned long total_size = stats.f_bsize * stats.f_blocks;
+
+		LOG_INF("===== LittleFS Space Usage =====");
+		LOG_INF("Block size: %lu bytes", stats.f_bsize);
+		LOG_INF("Total blocks: %lu", stats.f_blocks);
+		LOG_INF("Free blocks: %lu", stats.f_bfree);
+		LOG_INF("Total size: %lu bytes (%lu KB)", total_size, total_size / 1024);
+		LOG_INF("Free space: %lu bytes (%lu KB)",
+		        stats.f_bsize * stats.f_bfree,
+		        (stats.f_bsize * stats.f_bfree) / 1024);
+		LOG_INF("Used space: %lu bytes (%lu KB)",
+		        stats.f_bsize * (stats.f_blocks - stats.f_bfree),
+		        (stats.f_bsize * (stats.f_blocks - stats.f_bfree)) / 1024);
+		LOG_INF("================================");
+		k_sleep(K_MSEC(50));
+
+		/* Note: fs_statvfs reports incorrect block size (uses read-size instead of erase block)
+		 * The actual filesystem size is correct - check LittleFS boot logs for real size */
+		if (total_size < 1024) {
+			LOG_WRN("fs_statvfs reports %lu bytes (incorrect - using read-size as block size)", total_size);
+			LOG_INF("Actual LittleFS partition is 64KB - check boot logs for confirmation");
+		}
+	} else {
+		LOG_ERR("Failed to get filesystem stats: %d", ret);
+	}
 
 	/* List LittleFS contents to verify flash image */
 	LOG_INF("===== LittleFS Contents =====");
@@ -1265,46 +1409,66 @@ int main(void)
 	LOG_INF("===================================================");
 #endif
 
-	/* Initialize L2CAP transport */
-	struct ninep_transport_l2cap_config l2cap_config = {
-		.psm = CONFIG_NINEP_L2CAP_PSM,
-		.rx_buf = rx_buf,
-		.rx_buf_size = sizeof(rx_buf),
-	};
+	/* Initialize sessions mutex */
+	k_mutex_init(&sessions_mutex);
 
-	ret = ninep_transport_l2cap_init(&transport, &l2cap_config, NULL, NULL);
-	if (ret < 0) {
-		LOG_ERR("Failed to initialize L2CAP transport: %d", ret);
-		return 0;
+	/* Initialize all 9P sessions */
+	LOG_INF("Initializing %d 9P sessions...", MAX_9P_SESSIONS);
+
+	for (int i = 0; i < MAX_9P_SESSIONS; i++) {
+		struct ninep_session *session = &sessions[i];
+
+		/* Assign PSM: first session gets fixed PSM, others get dynamic */
+		session->psm = (i == 0) ? FIXED_PSM : (DYNAMIC_PSM_START + i - 1);
+		session->active = false;
+		session->conn = NULL;
+
+		/* Initialize L2CAP transport for this session */
+		struct ninep_transport_l2cap_config l2cap_config = {
+			.psm = session->psm,
+			.rx_buf = session->rx_buf,
+			.rx_buf_size = sizeof(session->rx_buf),
+		};
+
+		ret = ninep_transport_l2cap_init(&session->transport, &l2cap_config, NULL, NULL);
+		if (ret < 0) {
+			LOG_ERR("Failed to initialize transport for session %d (PSM 0x%04x): %d",
+			        i, session->psm, ret);
+			return 0;
+		}
+
+		/* Initialize 9P server for this session */
+		struct ninep_server_config server_config = {
+			.fs_ops = ninep_union_fs_get_ops(),
+			.fs_ctx = &union_fs,  /* All sessions share the same filesystem */
+			.max_message_size = CONFIG_NINEP_MAX_MESSAGE_SIZE,
+			.version = "9P2000",
+		};
+
+		ret = ninep_server_init(&session->server, &server_config, &session->transport);
+		if (ret < 0) {
+			LOG_ERR("Failed to initialize server for session %d: %d", i, ret);
+			return 0;
+		}
+
+		/* Start the server (registers L2CAP PSM and starts listening) */
+		ret = ninep_server_start(&session->server);
+		if (ret < 0) {
+			LOG_ERR("Failed to start server for session %d: %d", i, ret);
+			return 0;
+		}
+
+		LOG_INF("Session %d initialized: PSM 0x%04x", i, session->psm);
 	}
 
-	LOG_INF("L2CAP transport initialized");
-
-	/* Initialize 9P server - always use union filesystem for namespace composition */
-	struct ninep_server_config server_config = {
-		.fs_ops = ninep_union_fs_get_ops(),
-		.fs_ctx = &union_fs,
-		.max_message_size = CONFIG_NINEP_MAX_MESSAGE_SIZE,
-		.version = "9P2000",
-	};
-
-	ret = ninep_server_init(&server, &server_config, &transport);
-	if (ret < 0) {
-		LOG_ERR("Failed to initialize 9P server: %d", ret);
-		return 0;
-	}
-
-	LOG_INF("9P server initialized");
-
-	/* Start server (starts transport and begins accepting messages) */
-	ret = ninep_server_start(&server);
-	if (ret < 0) {
-		LOG_ERR("Failed to start server: %d", ret);
-		return 0;
-	}
-
-	LOG_INF("L2CAP server started on PSM 0x%04x", CONFIG_NINEP_L2CAP_PSM);
-	LOG_INF("Waiting for iOS client connection...");
+	LOG_INF("===================================================");
+	LOG_INF("All sessions ready!");
+	LOG_INF("  Primary session:   PSM 0x%04x (fixed)", FIXED_PSM);
+	LOG_INF("  Additional sessions: PSM 0x%04x-0x%04x (dynamic)",
+	        DYNAMIC_PSM_START, DYNAMIC_PSM_START + MAX_9P_SESSIONS - 2);
+	LOG_INF("  Max concurrent sessions: %d", MAX_9P_SESSIONS);
+	LOG_INF("===================================================");
+	LOG_INF("Waiting for client connections...");
 
 	/* Server runs in background via callbacks */
 	return 0;

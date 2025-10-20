@@ -557,8 +557,15 @@ static int union_create(struct ninep_fs_node *parent, const char *name,
 		return -ENOTSUP;
 	}
 
-	return mount->fs_ops->create(parent, name, name_len, perm, mode,
-	                              new_node, mount->fs_ctx);
+	int ret = mount->fs_ops->create(parent, name, name_len, perm, mode,
+	                                  new_node, mount->fs_ctx);
+
+	/* Register the newly created node so subsequent operations can find its owner */
+	if (ret == 0 && new_node && *new_node) {
+		register_node_owner(fs, *new_node, mount);
+	}
+
+	return ret;
 }
 
 static int union_remove(struct ninep_fs_node *node, void *fs_ctx)

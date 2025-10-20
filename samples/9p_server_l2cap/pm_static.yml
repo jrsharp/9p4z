@@ -4,7 +4,8 @@
 
 # No MCUboot - app starts at 0x0 for simpler development
 
-lfs_partition:
+# LittleFS partition - name must match device tree label "littlefs_storage"
+littlefs_storage:
   address: 0xF0000
-  size: 0x10000  # 64KB for LittleFS (demo purposes)
+  size: 0x10000  # 64KB for LittleFS
   region: flash_primary

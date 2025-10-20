@@ -14,12 +14,12 @@
 		lfs1: lfs1 {
 			compatible = "zephyr,fstab,littlefs";
 			mount-point = "/lfs1";
-			partition = <&lfs_partition>;
+			partition = <&littlefs_storage>;
 			automount;
 			read-size = <16>;
 			prog-size = <16>;
-			cache-size = <64>;
-			lookahead-size = <32>;
+			cache-size = <256>;       /* Larger cache for better performance */
+			lookahead-size = <16>;    /* Must be multiple of 8 */
 			block-cycles = <512>;
 		};
 	};
@@ -30,6 +30,7 @@
 
 /* Add LittleFS partition
  * Note: This uses space at the end of flash (last 64KB of 1MB)
+ * Name must match pm_static.yml entry for Partition Manager
  */
 &flash0 {
 	partitions {
@@ -37,7 +38,7 @@
 		 * LittleFS partition: 64 KB at end of 1MB flash
 		 * Located at 0x0F0000 - 0x100000
 		 */
-		lfs_partition: partition@f0000 {
+		littlefs_storage: partition@f0000 {
 			label = "littlefs_storage";
 			reg = <0x000F0000 0x00010000>;
 		};
