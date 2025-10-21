@@ -80,9 +80,16 @@ static void handle_tversion(struct ninep_server *server, const uint8_t *msg, siz
 	}
 	LOG_DBG("All fids cleared for new session");
 
-	/* Negotiate message size */
+	/* Negotiate message size - use minimum of client, config, and transport MTU */
 	if (msize > CONFIG_NINEP_MAX_MESSAGE_SIZE) {
 		msize = CONFIG_NINEP_MAX_MESSAGE_SIZE;
+	}
+
+	/* Further limit by transport MTU if available */
+	int transport_mtu = ninep_transport_get_mtu(server->transport);
+	if (transport_mtu > 0 && (uint32_t)transport_mtu < msize) {
+		LOG_INF("Limiting msize to transport MTU: %u -> %d", msize, transport_mtu);
+		msize = transport_mtu;
 	}
 
 	/* Check version */
@@ -545,6 +552,15 @@ static void handle_tclunk(struct ninep_server *server, uint16_t tag,
 	if (!sfid) {
 		send_error(server, tag, "unknown fid");
 		return;
+	}
+
+	/* Call filesystem clunk handler if available */
+	if (server->config->fs_ops->clunk && sfid->node) {
+		int clunk_ret = server->config->fs_ops->clunk(sfid->node, server->config->fs_ctx);
+		if (clunk_ret < 0) {
+			LOG_WRN("Filesystem clunk failed: %d", clunk_ret);
+			/* Continue anyway - client expects Rclunk */
+		}
 	}
 
 	/* Free FID */

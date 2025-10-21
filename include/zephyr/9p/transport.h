@@ -66,6 +66,18 @@ struct ninep_transport_ops {
 	 * @return 0 on success, negative error code on failure
 	 */
 	int (*stop)(struct ninep_transport *transport);
+
+	/**
+	 * @brief Get maximum transmission unit (MTU)
+	 *
+	 * Returns the maximum size of a single message that can be sent
+	 * over this transport. This may be smaller than the configured
+	 * max message size due to transport limitations (e.g., L2CAP MTU).
+	 *
+	 * @param transport Transport instance
+	 * @return MTU in bytes, or negative error code
+	 */
+	int (*get_mtu)(struct ninep_transport *transport);
 };
 
 /**
@@ -134,6 +146,24 @@ static inline int ninep_transport_stop(struct ninep_transport *transport)
 		return -EINVAL;
 	}
 	return transport->ops->stop(transport);
+}
+
+/**
+ * @brief Get transport MTU
+ *
+ * @param transport Transport instance
+ * @return MTU in bytes, or negative error code. Returns -ENOTSUP if
+ *         transport doesn't implement get_mtu.
+ */
+static inline int ninep_transport_get_mtu(struct ninep_transport *transport)
+{
+	if (!transport || !transport->ops) {
+		return -EINVAL;
+	}
+	if (!transport->ops->get_mtu) {
+		return -ENOTSUP;  /* Transport doesn't support MTU query */
+	}
+	return transport->ops->get_mtu(transport);
 }
 
 /** @} */

@@ -108,6 +108,25 @@ static const char *get_relative_path(const char *path, const char *mount_path)
 /**
  * @brief Register a node as being owned by a specific mount
  */
+static void unregister_node_owner(struct ninep_union_fs *fs,
+                                   struct ninep_fs_node *node)
+{
+	/* Find and remove the node from tracking */
+	for (size_t i = 0; i < fs->num_node_owners; i++) {
+		if (fs->node_owners[i].node == node) {
+			LOG_DBG("Unregistering node=%p name='%s' (was at index %zu)",
+			        node, node->name, i);
+
+			/* Shift remaining entries down */
+			for (size_t j = i; j < fs->num_node_owners - 1; j++) {
+				fs->node_owners[j] = fs->node_owners[j + 1];
+			}
+			fs->num_node_owners--;
+			return;
+		}
+	}
+}
+
 static void register_node_owner(struct ninep_union_fs *fs,
                                  struct ninep_fs_node *node,
                                  struct ninep_union_mount *mount)
@@ -589,6 +608,34 @@ static int union_remove(struct ninep_fs_node *node, void *fs_ctx)
 	return mount->fs_ops->remove(node, mount->fs_ctx);
 }
 
+static int union_clunk(struct ninep_fs_node *node, void *fs_ctx)
+{
+	struct ninep_union_fs *fs = (struct ninep_union_fs *)fs_ctx;
+
+	/* Don't clunk the union root itself */
+	if (node == fs->root) {
+		return 0;
+	}
+
+	/* Find which backend owns this node */
+	struct ninep_union_mount *mount = find_node_owner(fs, node);
+
+	if (!mount) {
+		LOG_WRN("Clunking node with no owner: %p", node);
+		return -EINVAL;
+	}
+
+	/* Unregister from tracking BEFORE delegating (backend may free the node) */
+	unregister_node_owner(fs, node);
+
+	/* Delegate to backend if it has a clunk handler */
+	if (mount->fs_ops->clunk) {
+		return mount->fs_ops->clunk(node, mount->fs_ctx);
+	}
+
+	return 0;
+}
+
 /* Union filesystem operations table */
 static const struct ninep_fs_ops union_fs_ops = {
 	.get_root = union_get_root,
@@ -599,6 +646,7 @@ static const struct ninep_fs_ops union_fs_ops = {
 	.stat = union_stat,
 	.create = union_create,
 	.remove = union_remove,
+	.clunk = union_clunk,
 };
 
 /* Public API */

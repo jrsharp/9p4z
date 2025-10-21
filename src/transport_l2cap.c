@@ -323,10 +323,28 @@ static int l2cap_stop(struct ninep_transport *transport)
 	return 0;
 }
 
+static int l2cap_get_mtu(struct ninep_transport *transport)
+{
+	struct l2cap_transport_data *data = transport->priv_data;
+
+	if (!data) {
+		return -EINVAL;
+	}
+
+	/* Return TX MTU if connected, otherwise return configured MTU */
+	if (data->connected) {
+		return data->channel.le.tx.mtu;
+	}
+
+	/* Not connected yet - return configured MTU from prj.conf */
+	return CONFIG_NINEP_L2CAP_MTU;
+}
+
 static const struct ninep_transport_ops l2cap_transport_ops = {
 	.send = l2cap_send,
 	.start = l2cap_start,
 	.stop = l2cap_stop,
+	.get_mtu = l2cap_get_mtu,
 };
 
 int ninep_transport_l2cap_init(struct ninep_transport *transport,

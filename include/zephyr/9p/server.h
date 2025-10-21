@@ -152,6 +152,19 @@ struct ninep_fs_ops {
 	 * @brief Remove file/directory
 	 */
 	int (*remove)(struct ninep_fs_node *node, void *fs_ctx);
+
+	/**
+	 * @brief Clunk (close) node
+	 *
+	 * Called when a fid is clunked (closed). Allows filesystem to free
+	 * resources associated with the node. The node may be freed by this
+	 * operation, so callers should not use it afterward.
+	 *
+	 * @param node Node to clunk
+	 * @param fs_ctx Filesystem context
+	 * @return 0 on success, negative error code on failure
+	 */
+	int (*clunk)(struct ninep_fs_node *node, void *fs_ctx);
 };
 
 /**

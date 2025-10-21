@@ -183,8 +183,15 @@ static int sysfs_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 {
 	struct ninep_sysfs *sysfs = fs_ctx;
 
+	LOG_DBG("sysfs_open: node->name='%s', mode=0x%02x, node->mode=0%o",
+	        node->name, mode, node->mode);
+
 	/* Find entry to check if writable */
 	struct ninep_sysfs_entry *entry = find_entry(sysfs, node->name);
+
+	LOG_DBG("sysfs_open: entry %s, writable=%d",
+	        entry ? "found" : "NOT FOUND",
+	        entry ? entry->writable : 0);
 
 	/* Directories are always read-only */
 	if (node->type == NINEP_NODE_DIR) {
@@ -195,12 +202,17 @@ static int sysfs_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 	}
 
 	/* Files: check if writable */
-	if (mode == NINEP_OREAD || mode == NINEP_OEXEC) {
+	/* Mask out flag bits (OTRUNC, OCEXEC, ORCLOSE) to get base access mode */
+	uint8_t access_mode = mode & 0x03;  /* Keep only bottom 2 bits */
+
+	if (access_mode == NINEP_OREAD || access_mode == NINEP_OEXEC) {
 		return 0;  /* Read always allowed */
 	}
 
-	if (mode == NINEP_OWRITE || mode == NINEP_ORDWR) {
+	if (access_mode == NINEP_OWRITE || access_mode == NINEP_ORDWR) {
 		if (!entry || !entry->writable) {
+			LOG_ERR("sysfs_open: Write denied - entry=%p, writable=%d",
+			        entry, entry ? entry->writable : 0);
 			return -EACCES;  /* Not writable */
 		}
 		return 0;
