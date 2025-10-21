@@ -120,6 +120,47 @@ config NINEP_L2CAP_MTU
 
 endif # NINEP_TRANSPORT_L2CAP
 
+config NINEP_TRANSPORT_COAP
+	bool "CoAP Transport (Server Mode)"
+	depends on NETWORKING && COAP
+	help
+	  Enable 9P over CoAP (Constrained Application Protocol) transport
+	  in SERVER mode.
+
+	  The device acts as a CoAP server, listening for incoming 9P requests.
+	  This transport tunnels 9P messages over CoAP using confirmable (CON)
+	  messages for reliable delivery over UDP. Large messages are handled
+	  using RFC 7959 block-wise transfer when they exceed the CoAP MTU.
+
+	  Use this for LAN scenarios where the device is directly reachable.
+
+	  Ideal for constrained networks such as Thread/6LoWPAN where CoAP
+	  infrastructure already exists.
+
+config NINEP_TRANSPORT_COAP_CLIENT
+	bool "CoAP Transport (Client Mode)"
+	depends on NETWORKING && COAP
+	select COAP_CLIENT
+	help
+	  Enable 9P over CoAP transport in CLIENT mode with NAT traversal.
+
+	  The device acts as a CoAP client, connecting to a cloud-hosted CoAP
+	  server. It uses CoAP Observe (RFC 7641) to receive 9P requests from
+	  the cloud as push notifications.
+
+	  This enables remote access to devices behind NAT/firewalls without
+	  port forwarding. The device initiates the connection, and the cloud
+	  sends requests via Observe notifications.
+
+	  Architecture:
+	    [Device] --Observe--> [Cloud CoAP Server] <--9P--> [Remote Users]
+
+	  Use cases:
+	    - Device behind home/office NAT
+	    - Remote access from anywhere
+	    - IoT cloud platforms
+	    - Mobile app gateway scenarios
+
 config NINEP_GATT_9PIS
 	bool "9P Information Service (9PIS) GATT Service"
 	depends on BT_GATT_DYNAMIC_DB || BT

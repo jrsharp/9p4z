@@ -43,6 +43,14 @@ if(CONFIG_NINEP_TRANSPORT_L2CAP)
   zephyr_library_sources(src/transport_l2cap.c)
 endif()
 
+if(CONFIG_NINEP_TRANSPORT_COAP)
+  zephyr_library_sources(src/transport_coap.c)
+endif()
+
+if(CONFIG_NINEP_TRANSPORT_COAP_CLIENT)
+  zephyr_library_sources(src/transport_coap_client.c)
+endif()
+
 if(CONFIG_NINEP_GATT_9PIS)
   zephyr_library_sources(src/gatt_9pis.c)
 endif()

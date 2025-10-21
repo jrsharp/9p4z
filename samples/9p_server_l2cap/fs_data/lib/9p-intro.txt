@@ -1,0 +1,57 @@
+Introduction to the 9P Protocol
+================================
+
+The 9P protocol (originally named Styx) is a network protocol
+developed for Plan 9 from Bell Labs. It provides a unified
+interface to distributed resources using a file system paradigm.
+
+Key Concepts:
+-------------
+
+1. Everything is a File
+   All resources are represented as files in a hierarchical
+   namespace. Want to control hardware? Read/write a file!
+
+2. Simple Protocol
+   9P uses a simple request-response model with just 14 message
+   types. This makes it easy to implement and debug.
+
+3. Network Transparent
+   Resources can be accessed locally or remotely using the same
+   file operations. The network becomes transparent.
+
+Why 9P for Embedded/IoT?
+------------------------
+
+- Lightweight: Small memory footprint
+- Flexible: Works over any transport (TCP, BLE, UART...)
+- Powerful: Expose ANY device capability as a file!
+- Standard: Well-defined protocol with multiple implementations
+
+This Demo:
+---------
+
+You're viewing this file over Bluetooth L2CAP using 9P!
+Browse the filesystem to see:
+
+/dev/led        - Control an LED by writing 'on' or 'off'
+/dev/button1    - Live button state and press counter
+/dev/button2    - Live button state and press counter
+/sensors/temp0  - Read live temperature sensor
+/sys/threads    - See all running threads
+/sys/firmware   - Upload firmware over BLE!
+/net/bt/*       - Bluetooth connection statistics
+
+The Future:
+----------
+
+Imagine your IoT devices exposing everything as files:
+- Configuration via text files
+- Sensor data as readable streams
+- Control interfaces as writable files
+- Firmware updates as file uploads
+
+All accessible from your phone, computer, or another device
+using a simple, universal protocol. That's the power of 9P!
+
+Learn more: http://9p.io/

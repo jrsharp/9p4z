@@ -625,14 +625,15 @@ static int union_clunk(struct ninep_fs_node *node, void *fs_ctx)
 		return -EINVAL;
 	}
 
-	/* Unregister from tracking BEFORE delegating (backend may free the node) */
-	unregister_node_owner(fs, node);
-
-	/* Delegate to backend if it has a clunk handler */
+	/* Only delegate if backend has a clunk handler */
 	if (mount->fs_ops->clunk) {
+		/* Unregister from tracking BEFORE delegating (backend will free the node) */
+		unregister_node_owner(fs, node);
 		return mount->fs_ops->clunk(node, mount->fs_ctx);
 	}
 
+	/* Backend doesn't have clunk handler - it manages nodes itself (e.g., sysfs cache)
+	 * Don't unregister because the node pointer may be reused */
 	return 0;
 }
 

@@ -96,9 +96,19 @@ struct ninep_session {
 static struct ninep_session sessions[MAX_9P_SESSIONS];
 static struct k_mutex sessions_mutex;
 
-/* Bluetooth advertising data */
+/* Bluetooth advertising data - include 9PIS service UUID for discoverability */
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+#ifdef CONFIG_NINEP_GATT_9PIS
+	/* Advertise 9PIS service UUID so iOS can filter for 9P devices */
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL,
+		0x01, 0xc0, 0xe4, 0xf6, 0xe0, 0xa1, 0x88, 0xba,
+		0x91, 0x4a, 0xed, 0xfe, 0x01, 0x00, 0x50, 0x39),  /* 39500001-feed-4a91-ba88-a1e0f6e4c001 */
+#endif
+};
+
+/* Scan response data - device name (doesn't fit in advertising data) */
+static const struct bt_data sd[] = {
 	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
 
@@ -214,7 +224,7 @@ static void restart_advertising_work_handler(struct k_work *work)
 {
 	int err = bt_le_adv_start(BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN, BT_GAP_ADV_FAST_INT_MIN_2,
 	                                           BT_GAP_ADV_FAST_INT_MAX_2, NULL),
-	                          ad, ARRAY_SIZE(ad), NULL, 0);
+	                          ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
 	if (err) {
 		LOG_ERR("Failed to restart advertising: %d", err);
 	} else {
@@ -1147,7 +1157,7 @@ int main(void)
 	/* Start advertising */
 	ret = bt_le_adv_start(BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN, BT_GAP_ADV_FAST_INT_MIN_2,
 	                                       BT_GAP_ADV_FAST_INT_MAX_2, NULL),
-	                      ad, ARRAY_SIZE(ad), NULL, 0);
+	                      ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
 	if (ret) {
 		LOG_ERR("Advertising failed to start (err %d)", ret);
 		return 0;
