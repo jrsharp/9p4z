@@ -346,8 +346,10 @@ static int sysfs_read(struct ninep_fs_node *node, uint64_t offset,
 
 /* Write to file */
 static int sysfs_write(struct ninep_fs_node *node, uint64_t offset,
-                       const uint8_t *buf, uint32_t count, void *fs_ctx)
+                       const uint8_t *buf, uint32_t count, const char *uname,
+                       void *fs_ctx)
 {
+	ARG_UNUSED(uname);
 	struct ninep_sysfs *sysfs = fs_ctx;
 
 	if (node->type == NINEP_NODE_DIR) {

@@ -231,8 +231,10 @@ static int ramfs_read(struct ninep_fs_node *node, uint64_t offset,
 
 /* Write (not implemented) */
 static int ramfs_write(struct ninep_fs_node *node, uint64_t offset,
-                       const uint8_t *buf, uint32_t count, void *fs_ctx)
+                       const uint8_t *buf, uint32_t count, const char *uname,
+                       void *fs_ctx)
 {
+	ARG_UNUSED(uname);
 	return -ENOTSUP;
 }
 
@@ -260,8 +262,10 @@ static int ramfs_stat(struct ninep_fs_node *node, uint8_t *buf,
 /* Create (not implemented) */
 static int ramfs_create(struct ninep_fs_node *parent, const char *name,
                         uint16_t name_len, uint32_t perm, uint8_t mode,
-                        struct ninep_fs_node **new_node, void *fs_ctx)
+                        const char *uname, struct ninep_fs_node **new_node,
+                        void *fs_ctx)
 {
+	ARG_UNUSED(uname);
 	return -ENOTSUP;
 }
 

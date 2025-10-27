@@ -311,8 +311,10 @@ static int passthrough_read(struct ninep_fs_node *node, uint64_t offset,
 
 /* Write to file */
 static int passthrough_write(struct ninep_fs_node *node, uint64_t offset,
-                              const uint8_t *buf, uint32_t count, void *fs_ctx)
+                              const uint8_t *buf, uint32_t count, const char *uname,
+                              void *fs_ctx)
 {
+	ARG_UNUSED(uname);
 	struct ninep_passthrough_fs *fs = fs_ctx;
 	const char *node_path = get_node_path(node);
 	if (!node_path) {
@@ -388,8 +390,10 @@ static int passthrough_stat(struct ninep_fs_node *node, uint8_t *buf,
 /* Create file or directory */
 static int passthrough_create(struct ninep_fs_node *parent, const char *name,
                                uint16_t name_len, uint32_t perm, uint8_t mode,
-                               struct ninep_fs_node **new_node, void *fs_ctx)
+                               const char *uname, struct ninep_fs_node **new_node,
+                               void *fs_ctx)
 {
+	ARG_UNUSED(uname);
 	struct ninep_passthrough_fs *fs = fs_ctx;
 	const char *parent_path = get_node_path(parent);
 	if (!parent_path) {

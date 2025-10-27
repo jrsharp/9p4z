@@ -21,6 +21,85 @@ When you connect with a generic BLE scanner (like LightBlue), you'll see the 9PI
 service with UUID `39500001-feed-4a91-ba88-a1e0f6e4c001` and can read all the
 service information characteristics.
 
+### 9P Beacon Discovery
+
+**NEW!** The device broadcasts a custom **beacon service data** in its BLE advertising packets,
+allowing mobile apps to discover nearby 9P+BBS hotspots **without connecting**!
+
+#### Beacon Format
+
+The beacon uses **Service Data** with custom UUID `0x9B50` ("9P" + "BS") and includes 8 bytes:
+
+```
+Byte 0:    Protocol version (0x01)
+Byte 1:    Feature flags
+           - Bit 0: BBS available (bulletin board system)
+           - Bit 1: File storage available
+           - Bit 2: Sysfs available
+           - Bits 3-7: Reserved for future use
+Bytes 2-3: Primary PSM (little-endian, typically 0x0009)
+Byte 4:    Number of BBS rooms
+Byte 5:    Number of registered users
+Bytes 6-7: Total message count (little-endian)
+```
+
+#### Scanning for 9P Beacons
+
+Mobile apps can scan for this service data to discover and display nearby 9P services:
+
+**iOS (Swift):**
+```swift
+func centralManager(_ central: CBCentralManager,
+                   didDiscover peripheral: CBPeripheral,
+                   advertisementData: [String : Any], rssi RSSI: NSNumber) {
+    if let serviceData = advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data] {
+        let uuid = CBUUID(string: "9B50")
+        if let data = serviceData[uuid] {
+            let version = data[0]
+            let features = data[1]
+            let hasBBS = (features & 0x01) != 0
+            let hasFiles = (features & 0x02) != 0
+            let psm = UInt16(data[2]) | (UInt16(data[3]) << 8)
+            let roomCount = data[4]
+            let userCount = data[5]
+            let msgCount = UInt16(data[6]) | (UInt16(data[7]) << 8)
+
+            print("Found 9P beacon: PSM=\(psm), Rooms=\(roomCount), Users=\(userCount), Messages=\(msgCount)")
+            print("  Features: BBS=\(hasBBS), Files=\(hasFiles)")
+        }
+    }
+}
+```
+
+**Android (Kotlin):**
+```kotlin
+override fun onScanResult(callbackType: Int, result: ScanResult) {
+    val serviceData = result.scanRecord?.serviceData
+    val uuid = ParcelUuid.fromString("00009B50-0000-1000-8000-00805f9b34fb")
+
+    serviceData?.get(uuid)?.let { data ->
+        val version = data[0]
+        val features = data[1]
+        val hasBBS = (features.toInt() and 0x01) != 0
+        val hasFiles = (features.toInt() and 0x02) != 0
+        val psm = (data[2].toInt() and 0xFF) or ((data[3].toInt() and 0xFF) shl 8)
+        val roomCount = data[4]
+        val userCount = data[5]
+        val msgCount = (data[6].toInt() and 0xFF) or ((data[7].toInt() and 0xFF) shl 8)
+
+        Log.d("9PBeacon", "Found: PSM=$psm, Rooms=$roomCount, Users=$userCount, Messages=$msgCount")
+    }
+}
+```
+
+#### Use Cases
+
+- **Proximity Detection**: Show "9P BBS nearby!" notification when user enters range
+- **Service Browser**: Display list of nearby 9P services with live stats
+- **Auto-Connect**: Connect to strongest signal automatically
+- **Mesh Network Map**: Visualize network of 9P nodes in area
+- **Community Discovery**: Find local BBS communities at events/meetups
+
 ### File System
 
 The server provides a rich synthetic filesystem with:
@@ -45,6 +124,19 @@ The server provides a rich synthetic filesystem with:
 
 #### Documentation (`/docs/`)
 - `/docs/readme.md` - Basic documentation
+
+#### Bulletin Board System (`/bbs/`)
+**NEW!** Plan 9-style BBS accessible as a filesystem:
+- `/bbs/rooms/lobby/1` - Read messages as files (RFC822 format)
+- `/bbs/rooms/lobby/2` - Second message
+- `/bbs/rooms/tech/1` - Tech discussion room
+- `/bbs/rooms/general/1` - General discussion
+- `/bbs/etc/roomlist` - List of all rooms
+
+The BBS demonstrates in-process 9P servers - the bulletin board runs in the same
+address space but is accessed through the 9P filesystem interface. Messages are
+stored in RAM and formatted as RFC822-style files. Perfect for demonstrating how
+"everything is a file" works with Plan 9!
 
 ## Requirements
 
@@ -175,11 +267,44 @@ iOS -> Zephyr: T-read (fid=1, offset=0, count=4096)
 Zephyr -> iOS: R-read (data="Hello from 9P over L2CAP!")
 ```
 
+### Reading BBS Messages
+
+From your 9P client, you can read bulletin board messages like regular files:
+
+```bash
+# List available rooms
+cat /bbs/etc/roomlist
+
+# Read first message in lobby
+cat /bbs/rooms/lobby/1
+```
+
+Output:
+```
+From: alice
+To: lobby
+Date: 1234567890
+X-Date-N: 1234567890
+
+Welcome to 9bbs over Bluetooth L2CAP!
+
+This is a Plan 9-style bulletin board system accessible
+as a filesystem. Read and post messages by navigating to
+/bbs/rooms/<room>/<message_number>
+
+alice
+```
+
+The BBS demonstrates **in-process 9P servers** - no network serialization happens
+when accessing BBS files locally, yet the same filesystem can be exported over
+Bluetooth and accessed from your phone!
+
 ## Configuration
 
 Key Kconfig options (in prj.conf):
 
 - `CONFIG_NINEP_GATT_9PIS=y` - **Enable 9PIS discovery service**
+- `CONFIG_NINEP_9BBS=y` - **Enable bulletin board system**
 - `CONFIG_NINEP_L2CAP_PSM=0x0009` - L2CAP PSM (must match client)
 - `CONFIG_NINEP_L2CAP_MTU=4096` - Maximum L2CAP MTU
 - `CONFIG_NINEP_MAX_MESSAGE_SIZE=8192` - Max 9P message size
@@ -202,6 +327,13 @@ The sample supports multiple filesystem backends that can be composed into a uni
 - Requires `CONFIG_NINEP_FS_PASSTHROUGH=y`
 - Storage partition defined in device tree overlay
 
+**Bulletin Board System (9bbs):**
+- In-process 9P server demonstrating driver-as-filesystem
+- Messages stored in RAM (could be backed by LittleFS)
+- RFC822-style message format
+- Multiple rooms (lobby, tech, general)
+- Requires `CONFIG_NINEP_9BBS=y`
+
 **Namespace Composition (union_fs):**
 - Plan 9-style namespace composition
 - Mounts multiple backends into a unified namespace
@@ -216,6 +348,13 @@ The namespace is always composed using union_fs. When building with LittleFS (`p
 ├── sensors/         -> sysfs (live sensor data)
 ├── lib/             -> sysfs (reference material)
 ├── docs/            -> sysfs (documentation)
+├── bbs/             -> 9bbs (in-process 9P server)
+│   ├── rooms/
+│   │   ├── lobby/
+│   │   ├── tech/
+│   │   └── general/
+│   └── etc/
+│       └── roomlist
 └── files/           -> passthrough_fs -> LittleFS (persistent storage)
     ├── welcome.txt
     ├── docs/
@@ -228,6 +367,7 @@ When building without LittleFS (default `prj.conf`), union_fs still provides a s
 /                    -> union_fs (namespace multiplexer)
 ├── dev/             -> sysfs (device control)
 ├── sys/             -> sysfs (system info)
+├── bbs/             -> 9bbs (in-process 9P server)
 ├── sensors/         -> sysfs (live sensor data)
 ├── lib/             -> sysfs (reference material)
 └── docs/            -> sysfs (documentation)

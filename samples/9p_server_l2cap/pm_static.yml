@@ -4,8 +4,16 @@
 
 # No MCUboot - app starts at 0x0 for simpler development
 
-# LittleFS partition - name must match device tree label "littlefs_storage"
+# LittleFS storage for BBS - 128KB
+# Using the default littlefs_storage name that PM auto-creates
 littlefs_storage:
+  address: 0xD0000
+  size: 0x20000  # 128KB for BBS
+  region: flash_primary
+
+# Unused space at end - fill gap so PM has only one gap for app
+# This prevents "Incorrect amount of gaps" error
+unused_partition:
   address: 0xF0000
-  size: 0x10000  # 64KB for LittleFS
+  size: 0x10000  # 64KB
   region: flash_primary

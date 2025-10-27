@@ -15,6 +15,12 @@
 #include <zephyr/9p/gatt_9pis.h>
 
 #include <zephyr/9p/union_fs.h>
+#include <zephyr/namespace/srv.h>
+#include <zephyr/namespace/namespace.h>
+
+#ifdef CONFIG_NINEP_9BBS
+#include <zephyr/9bbs/9bbs.h>
+#endif
 
 #ifdef CONFIG_NINEP_FS_PASSTHROUGH
 #include <zephyr/9p/passthrough_fs.h>
@@ -22,7 +28,7 @@
 #include <zephyr/fs/littlefs.h>
 #include <zephyr/storage/flash_map.h>
 #define USE_LITTLEFS 1
-#define LITTLEFS_MOUNT_POINT "/lfs1"
+#define LFS_BBS_MOUNT_POINT "/lfs_bbs"      /* BBS backing store - 128KB */
 #else
 #define USE_LITTLEFS 0
 #endif
@@ -57,13 +63,7 @@ static struct ninep_sysfs_entry sysfs_entries[64];
 
 #if USE_LITTLEFS
 /* LittleFS storage backend */
-FS_LITTLEFS_DECLARE_DEFAULT_CONFIG(storage);
-static struct fs_mount_t lfs_mnt = {
-	.type = FS_LITTLEFS,
-	.fs_data = &storage,
-	.storage_dev = (void *)FIXED_PARTITION_ID(littlefs_storage),
-	.mnt_point = LITTLEFS_MOUNT_POINT,
-};
+/* LittleFS is auto-mounted by device tree - no manual mount needed */
 
 /* Passthrough FS instance */
 static struct ninep_passthrough_fs passthrough_fs;
@@ -71,7 +71,12 @@ static struct ninep_passthrough_fs passthrough_fs;
 
 /* Union FS instance for namespace composition - always available! */
 static struct ninep_union_fs union_fs;
-static struct ninep_union_mount union_mounts[4];  /* Space for up to 4 backends */
+static struct ninep_union_mount union_mounts[8];  /* Space for up to 8 backends */
+
+#ifdef CONFIG_NINEP_9BBS
+/* 9bbs instance */
+static struct bbs_instance bbs;
+#endif
 
 /* Multi-session 9P support */
 #define MAX_9P_SESSIONS 4
@@ -787,7 +792,7 @@ static int gen_9p_intro(uint8_t *buf, size_t buf_size, uint64_t offset, void *ct
 	return to_copy;
 }
 
-#if USE_LITTLEFS
+#if 0  /* Disabled - removed general file storage partition */
 /* Pre-populate LittleFS with initial files */
 static int populate_littlefs(void)
 {
@@ -797,7 +802,7 @@ static int populate_littlefs(void)
 	LOG_INF("Populating LittleFS with initial files...");
 
 	/* Check if already populated (marker file exists) */
-	const char *marker_path = LITTLEFS_MOUNT_POINT "/.populated";
+	const char *marker_path = LFS_FILES_MOUNT_POINT "/.populated";
 	struct fs_dirent entry;
 	ret = fs_stat(marker_path, &entry);
 	if (ret == 0) {
@@ -806,7 +811,7 @@ static int populate_littlefs(void)
 	}
 
 	/* Create welcome file */
-	const char *welcome_path = LITTLEFS_MOUNT_POINT "/welcome.txt";
+	const char *welcome_path = LFS_FILES_MOUNT_POINT "/welcome.txt";
 	const char *welcome_content =
 		"Welcome to 9P over Bluetooth!\n"
 		"\n"
@@ -826,7 +831,7 @@ static int populate_littlefs(void)
 	LOG_INF("Created: %s", welcome_path);
 
 	/* Create docs directory */
-	const char *docs_dir = LITTLEFS_MOUNT_POINT "/docs";
+	const char *docs_dir = LFS_FILES_MOUNT_POINT "/docs";
 	ret = fs_mkdir(docs_dir);
 	if (ret < 0) {
 		LOG_ERR("Failed to create /docs: %d", ret);
@@ -835,7 +840,7 @@ static int populate_littlefs(void)
 	LOG_INF("Created: %s/", docs_dir);
 
 	/* Create README in docs */
-	const char *readme_path = LITTLEFS_MOUNT_POINT "/docs/README.md";
+	const char *readme_path = LFS_FILES_MOUNT_POINT "/docs/README.md";
 	const char *readme_content =
 		"# 9P File Server\n"
 		"\n"
@@ -861,7 +866,7 @@ static int populate_littlefs(void)
 	LOG_INF("Created: %s", readme_path);
 
 	/* Create shared directory */
-	const char *shared_dir = LITTLEFS_MOUNT_POINT "/shared";
+	const char *shared_dir = LFS_FILES_MOUNT_POINT "/shared";
 	ret = fs_mkdir(shared_dir);
 	if (ret < 0) {
 		LOG_ERR("Failed to create /shared: %d", ret);
@@ -870,7 +875,7 @@ static int populate_littlefs(void)
 	LOG_INF("Created: %s/", shared_dir);
 
 	/* Create notes directory */
-	const char *notes_dir = LITTLEFS_MOUNT_POINT "/notes";
+	const char *notes_dir = LFS_FILES_MOUNT_POINT "/notes";
 	ret = fs_mkdir(notes_dir);
 	if (ret < 0) {
 		LOG_ERR("Failed to create /notes: %d", ret);
@@ -879,7 +884,7 @@ static int populate_littlefs(void)
 	LOG_INF("Created: %s/", notes_dir);
 
 	/* Create example note */
-	const char *note_path = LITTLEFS_MOUNT_POINT "/notes/example.txt";
+	const char *note_path = LFS_FILES_MOUNT_POINT "/notes/example.txt";
 	const char *note_content =
 		"Example Note\n"
 		"============\n"
@@ -1227,17 +1232,19 @@ int main(void)
 #if USE_LITTLEFS
 	LOG_INF("*** LittleFS support is ENABLED ***");
 	/* LittleFS is auto-mounted by device tree at /lfs1 */
-	LOG_INF("Using auto-mounted LittleFS at %s", LITTLEFS_MOUNT_POINT);
+	LOG_INF("Using auto-mounted LittleFS at %s", LFS_BBS_MOUNT_POINT);
 	LOG_INF("NOTE: Check boot logs for actual LittleFS size reported during mount");
 #else
 	LOG_WRN("*** LittleFS support is DISABLED - check CONFIG_NINEP_FS_PASSTHROUGH ***");
 #endif
 
 #if USE_LITTLEFS
+	/* General file storage removed - only using BBS partition now */
 
+#if 0  /* Disabled - no separate general file storage partition */
 	/* Check LittleFS space usage */
 	struct fs_statvfs stats;
-	ret = fs_statvfs(LITTLEFS_MOUNT_POINT, &stats);
+	ret = fs_statvfs(LFS_BBS_MOUNT_POINT, &stats);
 	if (ret == 0) {
 		unsigned long total_size = stats.f_bsize * stats.f_blocks;
 
@@ -1259,7 +1266,7 @@ int main(void)
 		 * The actual filesystem size is correct - check LittleFS boot logs for real size */
 		if (total_size < 1024) {
 			LOG_WRN("fs_statvfs reports %lu bytes (incorrect - using read-size as block size)", total_size);
-			LOG_INF("Actual LittleFS partition is 64KB - check boot logs for confirmation");
+			LOG_INF("Actual LittleFS partition is 128KB - check boot logs for confirmation");
 		}
 	} else {
 		LOG_ERR("Failed to get filesystem stats: %d", ret);
@@ -1271,7 +1278,7 @@ int main(void)
 
 	struct fs_dir_t dir;
 	fs_dir_t_init(&dir);
-	ret = fs_opendir(&dir, LITTLEFS_MOUNT_POINT);
+	ret = fs_opendir(&dir, LFS_FILES_MOUNT_POINT);
 	if (ret < 0) {
 		LOG_ERR("Failed to open LFS root: %d", ret);
 	} else {
@@ -1291,7 +1298,7 @@ int main(void)
 			if (entry.type == FS_DIR_ENTRY_DIR) {
 				char subdir_path[256];
 				snprintf(subdir_path, sizeof(subdir_path), "%s/%s",
-				         LITTLEFS_MOUNT_POINT, entry.name);
+				         LFS_FILES_MOUNT_POINT, entry.name);
 
 				struct fs_dir_t subdir;
 				fs_dir_t_init(&subdir);
@@ -1317,7 +1324,7 @@ int main(void)
 
 			/* Create /lib directory */
 			char lib_dir[64];
-			snprintf(lib_dir, sizeof(lib_dir), "%s/lib", LITTLEFS_MOUNT_POINT);
+			snprintf(lib_dir, sizeof(lib_dir), "%s/lib", LFS_FILES_MOUNT_POINT);
 			ret = fs_mkdir(lib_dir);
 			if (ret == 0 || ret == -EEXIST) {
 				LOG_INF("  Created: /lib/");
@@ -1351,7 +1358,7 @@ int main(void)
 
 			/* Create /notes directory */
 			char notes_dir[64];
-			snprintf(notes_dir, sizeof(notes_dir), "%s/notes", LITTLEFS_MOUNT_POINT);
+			snprintf(notes_dir, sizeof(notes_dir), "%s/notes", LFS_FILES_MOUNT_POINT);
 			ret = fs_mkdir(notes_dir);
 			if (ret == 0 || ret == -EEXIST) {
 				LOG_INF("  Created: /notes/");
@@ -1385,14 +1392,39 @@ int main(void)
 	LOG_INF("=============================");
 	k_sleep(K_MSEC(100));  /* Give UART time to flush all logs */
 
-	/* Initialize passthrough filesystem */
-	ret = ninep_passthrough_fs_init(&passthrough_fs, LITTLEFS_MOUNT_POINT);
+	/* Initialize passthrough filesystem for general file storage */
+	ret = ninep_passthrough_fs_init(&passthrough_fs, LFS_BBS_MOUNT_POINT);
 	if (ret < 0) {
 		LOG_ERR("Failed to initialize passthrough FS: %d", ret);
 		return 0;
 	}
 	LOG_INF("Passthrough filesystem initialized");
-#endif
+#endif  /* #if 0 - Disabled general file storage */
+#endif  /* USE_LITTLEFS */
+
+	/* Initialize /srv service registry */
+	ret = srv_init();
+	if (ret < 0) {
+		LOG_ERR("Failed to initialize /srv: %d", ret);
+		return 0;
+	}
+	LOG_INF("/srv service registry initialized");
+
+	/* Initialize namespace subsystem */
+	ret = ns_init();
+	if (ret < 0) {
+		LOG_ERR("Failed to initialize namespace subsystem: %d", ret);
+		return 0;
+	}
+	LOG_INF("Namespace subsystem initialized");
+
+	/* Create namespace for main thread */
+	ret = ns_create(NULL);
+	if (ret < 0) {
+		LOG_ERR("Failed to create namespace for main thread: %d", ret);
+		return 0;
+	}
+	LOG_INF("Created namespace for main thread");
 
 	/* Initialize union filesystem for namespace composition */
 	ret = ninep_union_fs_init(&union_fs, union_mounts, ARRAY_SIZE(union_mounts));
@@ -1410,6 +1442,16 @@ int main(void)
 	}
 	LOG_INF("Mounted sysfs at /");
 
+	/* Mount /srv service registry */
+	ret = ninep_union_fs_mount(&union_fs, "/srv",
+	                            srv_get_fs_ops(), NULL);
+	if (ret < 0) {
+		LOG_ERR("Failed to mount /srv: %d", ret);
+		return 0;
+	}
+	LOG_INF("Mounted /srv service registry");
+
+#if 0  /* Disabled - no separate general file storage partition */
 #if USE_LITTLEFS
 	/* Mount passthrough_fs at "/files" - provides persistent storage */
 	ret = ninep_union_fs_mount(&union_fs, "/files",
@@ -1419,16 +1461,365 @@ int main(void)
 		return 0;
 	}
 	LOG_INF("Mounted LittleFS at /files");
+#endif
+#endif  /* Disabled general file storage */
+
+#ifdef CONFIG_NINEP_9BBS
+	/* Create LittleFS directory structure for 9bbs */
+#if USE_LITTLEFS
+	LOG_INF("Setting up LittleFS-backed 9bbs structure...");
+
+	const char *bbs_marker = LFS_BBS_MOUNT_POINT "/.initialized";
+	struct fs_dirent marker_entry;
+	ret = fs_stat(bbs_marker, &marker_entry);
+
+	if (ret != 0) {
+		/* Create BBS directory structure */
+		LOG_INF("Creating 9bbs directory structure in LittleFS...");
+
+		/* Create /bbs root */
+		char path[128];
+		/* Note: /lfs_bbs root already exists from automount */
+
+		/* Create /rooms */
+		snprintf(path, sizeof(path), "%s/rooms", LFS_BBS_MOUNT_POINT);
+		ret = fs_mkdir(path);
+		if (ret < 0 && ret != -EEXIST) {
+			LOG_ERR("Failed to create /bbs/rooms: %d", ret);
+		}
+
+		/* Create /rooms/lobby */
+		snprintf(path, sizeof(path), "%s/rooms/lobby", LFS_BBS_MOUNT_POINT);
+		ret = fs_mkdir(path);
+		if (ret == 0 || ret == -EEXIST) {
+			/* Create example message: /bbs/rooms/lobby/1 */
+			struct fs_file_t file;
+			fs_file_t_init(&file);
+			snprintf(path, sizeof(path), "%s/rooms/lobby/1", LFS_BBS_MOUNT_POINT);
+			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+			if (ret == 0) {
+				const char *msg =
+					"From: alice\n"
+					"To: lobby\n"
+					"Date: Wed, 23 Oct 2024 00:00:00 EST\n"
+					"X-Date-N: 1729648800\n"
+					"\n"
+					"Welcome to 9bbs over Bluetooth L2CAP!\n"
+					"\n"
+					"This is a Plan 9-style bulletin board system accessible\n"
+					"as a filesystem. Read and post messages by navigating to\n"
+					"/bbs/rooms/<room>/<message_number>\n"
+					"\n"
+					"-- alice\n";
+				fs_write(&file, msg, strlen(msg));
+				fs_close(&file);
+				LOG_INF("Created: /bbs/rooms/lobby/1");
+			}
+
+			/* Create message 2 */
+			snprintf(path, sizeof(path), "%s/rooms/lobby/2", LFS_BBS_MOUNT_POINT);
+			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+			if (ret == 0) {
+				const char *msg =
+					"From: bob\n"
+					"To: lobby\n"
+					"Date: Wed, 23 Oct 2024 00:05:00 EST\n"
+					"X-Date-N: 1729649100\n"
+					"\n"
+					"Hi Alice! This is amazing - a BBS accessible via\n"
+					"9P over Bluetooth from my iPhone!\n"
+					"\n"
+					"-- bob\n";
+				fs_write(&file, msg, strlen(msg));
+				fs_close(&file);
+				LOG_INF("Created: /bbs/rooms/lobby/2");
+			}
+		}
+
+		/* Create /bbs/rooms/tech */
+		snprintf(path, sizeof(path), "%s/rooms/tech", LFS_BBS_MOUNT_POINT);
+		ret = fs_mkdir(path);
+		if (ret == 0 || ret == -EEXIST) {
+			struct fs_file_t file;
+			fs_file_t_init(&file);
+			snprintf(path, sizeof(path), "%s/rooms/tech/1", LFS_BBS_MOUNT_POINT);
+			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+			if (ret == 0) {
+				const char *msg =
+					"From: alice\n"
+					"To: tech\n"
+					"Date: Wed, 23 Oct 2024 00:10:00 EST\n"
+					"X-Date-N: 1729649400\n"
+					"\n"
+					"Discuss embedded systems, Zephyr RTOS, and Plan 9 here!\n"
+					"\n"
+					"Topics:\n"
+					"- Bluetooth L2CAP optimization\n"
+					"- 9P protocol implementation\n"
+					"- nRF52 development\n"
+					"\n"
+					"-- alice\n";
+				fs_write(&file, msg, strlen(msg));
+				fs_close(&file);
+				LOG_INF("Created: /bbs/rooms/tech/1");
+			}
+		}
+
+		/* Create /bbs/rooms/general */
+		snprintf(path, sizeof(path), "%s/rooms/general", LFS_BBS_MOUNT_POINT);
+		ret = fs_mkdir(path);
+		if (ret == 0 || ret == -EEXIST) {
+			struct fs_file_t file;
+			fs_file_t_init(&file);
+			snprintf(path, sizeof(path), "%s/rooms/general/1", LFS_BBS_MOUNT_POINT);
+			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+			if (ret == 0) {
+				const char *msg =
+					"From: bob\n"
+					"To: general\n"
+					"Date: Wed, 23 Oct 2024 00:15:00 EST\n"
+					"X-Date-N: 1729649700\n"
+					"\n"
+					"General discussion room for off-topic chatter.\n"
+					"\n"
+					"Feel free to discuss anything here!\n"
+					"\n"
+					"-- bob\n";
+				fs_write(&file, msg, strlen(msg));
+				fs_close(&file);
+				LOG_INF("Created: /bbs/rooms/general/1");
+			}
+		}
+
+		/* Create /etc */
+		snprintf(path, sizeof(path), "%s/etc", LFS_BBS_MOUNT_POINT);
+		ret = fs_mkdir(path);
+		if (ret < 0 && ret != -EEXIST) {
+			LOG_ERR("Failed to create /etc: %d", ret);
+		}
+
+		/* Create /bbs/etc/roomlist */
+		struct fs_file_t file;
+		fs_file_t_init(&file);
+		snprintf(path, sizeof(path), "%s/etc/roomlist", LFS_BBS_MOUNT_POINT);
+		ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+		if (ret == 0) {
+			const char *roomlist = "lobby\ntech\ngeneral\n";
+			fs_write(&file, roomlist, strlen(roomlist));
+			fs_close(&file);
+			LOG_INF("Created: /bbs/etc/roomlist");
+		}
+
+		/* Create /bbs/etc/users */
+		snprintf(path, sizeof(path), "%s/etc/users", LFS_BBS_MOUNT_POINT);
+		ret = fs_mkdir(path);
+
+		/* Create alice user */
+		snprintf(path, sizeof(path), "%s/etc/users/alice", LFS_BBS_MOUNT_POINT);
+		ret = fs_mkdir(path);
+		if (ret == 0 || ret == -EEXIST) {
+			/* alice/password */
+			snprintf(path, sizeof(path), "%s/etc/users/alice/password", LFS_BBS_MOUNT_POINT);
+			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+			if (ret == 0) {
+				fs_write(&file, "password123", 11);
+				fs_close(&file);
+			}
+
+			/* alice/room */
+			snprintf(path, sizeof(path), "%s/etc/users/alice/room", LFS_BBS_MOUNT_POINT);
+			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+			if (ret == 0) {
+				fs_write(&file, "lobby", 5);
+				fs_close(&file);
+			}
+
+			/* alice/rooms (read positions) */
+			snprintf(path, sizeof(path), "%s/etc/users/alice/rooms", LFS_BBS_MOUNT_POINT);
+			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+			if (ret == 0) {
+				const char *rooms = "lobby/2\ntech/1\ngeneral/0\n";
+				fs_write(&file, rooms, strlen(rooms));
+				fs_close(&file);
+			}
+
+			/* alice/sig */
+			snprintf(path, sizeof(path), "%s/etc/users/alice/sig", LFS_BBS_MOUNT_POINT);
+			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+			if (ret == 0) {
+				const char *sig = "-- alice\nEmbedded systems enthusiast\n";
+				fs_write(&file, sig, strlen(sig));
+				fs_close(&file);
+			}
+
+			LOG_INF("Created user: alice");
+		}
+
+		/* Create bob user */
+		snprintf(path, sizeof(path), "%s/etc/users/bob", LFS_BBS_MOUNT_POINT);
+		ret = fs_mkdir(path);
+		if (ret == 0 || ret == -EEXIST) {
+			snprintf(path, sizeof(path), "%s/etc/users/bob/password", LFS_BBS_MOUNT_POINT);
+			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+			if (ret == 0) {
+				fs_write(&file, "password456", 11);
+				fs_close(&file);
+			}
+
+			snprintf(path, sizeof(path), "%s/etc/users/bob/room", LFS_BBS_MOUNT_POINT);
+			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+			if (ret == 0) {
+				fs_write(&file, "lobby", 5);
+				fs_close(&file);
+			}
+
+			snprintf(path, sizeof(path), "%s/etc/users/bob/rooms", LFS_BBS_MOUNT_POINT);
+			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+			if (ret == 0) {
+				const char *rooms = "lobby/2\ntech/0\ngeneral/1\n";
+				fs_write(&file, rooms, strlen(rooms));
+				fs_close(&file);
+			}
+
+			snprintf(path, sizeof(path), "%s/etc/users/bob/sig", LFS_BBS_MOUNT_POINT);
+			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+			if (ret == 0) {
+				const char *sig = "-- bob\niPhone 9P client tester\n";
+				fs_write(&file, sig, strlen(sig));
+				fs_close(&file);
+			}
+
+			LOG_INF("Created user: bob");
+		}
+
+		/* Create marker file */
+		snprintf(path, sizeof(path), "%s/.initialized", LFS_BBS_MOUNT_POINT);
+		ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+		if (ret == 0) {
+			fs_write(&file, "1", 1);
+			fs_close(&file);
+		}
+
+		LOG_INF("9bbs LittleFS structure created successfully!");
+	} else {
+		LOG_INF("9bbs structure already exists in LittleFS");
+	}
+#endif
+
+	/* Initialize 9bbs - bulletin board system */
+	ret = bbs_init(&bbs);
+	if (ret < 0) {
+		LOG_ERR("Failed to initialize BBS: %d", ret);
+		return 0;
+	}
+	LOG_INF("9bbs initialized");
+
+	/* Create demo users */
+	bbs_create_user(&bbs, "alice", "password123");
+	bbs_create_user(&bbs, "bob", "password456");
+	LOG_INF("Created demo users: alice, bob");
+
+	/* Create additional rooms */
+	bbs_create_room(&bbs, "tech");
+	bbs_create_room(&bbs, "general");
+	LOG_INF("Created rooms: lobby, tech, general");
+
+	/* Post welcome messages */
+	bbs_post_message(&bbs, "lobby", "alice",
+	                 "Welcome to 9bbs over Bluetooth L2CAP!\n\n"
+	                 "This is a Plan 9-style bulletin board system accessible "
+	                 "as a filesystem. Read and post messages by navigating to "
+	                 "/bbs/rooms/<room>/<message_number>", 0);
+	bbs_post_message(&bbs, "lobby", "bob",
+	                 "Hi Alice! This is amazing - a BBS accessible via "
+	                 "9P over Bluetooth from my iPhone!", 0);
+	bbs_post_message(&bbs, "tech", "alice",
+	                 "Discuss embedded systems, Zephyr RTOS, and Plan 9 here!\n\n"
+	                 "Topics:\n"
+	                 "- Bluetooth L2CAP optimization\n"
+	                 "- 9P protocol implementation\n"
+	                 "- nRF52 development", 0);
+	bbs_post_message(&bbs, "general", "bob",
+	                 "General discussion room for off-topic chatter.", 0);
+	LOG_INF("Posted welcome messages");
+
+	/* Post BBS to /srv for dynamic mounting */
+#if USE_LITTLEFS
+	/* Create a passthrough FS instance for LittleFS-backed BBS */
+	static struct ninep_passthrough_fs bbs_passthrough_fs;
+	char bbs_path[64];
+	/* BBS is now at root of dedicated partition */
+	snprintf(bbs_path, sizeof(bbs_path), "%s", LFS_BBS_MOUNT_POINT);
+	ret = ninep_passthrough_fs_init(&bbs_passthrough_fs, bbs_path);
+	if (ret < 0) {
+		LOG_ERR("Failed to initialize BBS passthrough FS: %d", ret);
+		return 0;
+	}
+
+	/* Register as in-process server */
+	struct ninep_server_config bbs_srv_config = {
+		.fs_ops = bbs_get_fs_ops(),
+		.fs_ctx = &bbs,
+		.max_message_size = CONFIG_NINEP_MAX_MESSAGE_SIZE,
+		.version = "9P2000",
+	};
+
+	static struct ninep_server bbs_ninep_server;
+	ret = ninep_server_init(&bbs_ninep_server, &bbs_srv_config, NULL);
+	if (ret < 0) {
+		LOG_ERR("Failed to initialize BBS server: %d", ret);
+		return 0;
+	}
+
+	/* Post to /srv/bbs */
+	ret = srv_post("bbs", &bbs_ninep_server);
+	if (ret < 0) {
+		LOG_ERR("Failed to post BBS to /srv: %d", ret);
+		return 0;
+	}
+	LOG_INF("Posted LittleFS-backed BBS to /srv/bbs");
+	LOG_INF("Clients can access BBS by walking to /srv/bbs");
+
+#else
+	/* Fallback: In-memory BBS */
+	struct ninep_server *bbs_server = bbs_register_server(&bbs);
+	if (!bbs_server) {
+		LOG_ERR("Failed to register BBS server");
+		return 0;
+	}
+
+	ret = srv_post("bbs", bbs_server);
+	if (ret < 0) {
+		LOG_ERR("Failed to post BBS to /srv: %d", ret);
+		return 0;
+	}
+	LOG_INF("Posted in-memory BBS to /srv/bbs");
+	LOG_INF("Clients can access BBS by walking to /srv/bbs");
+#endif
+#endif
+
+	/* Display unified namespace */
 	LOG_INF("===================================================");
 	LOG_INF("UNIFIED NAMESPACE:");
 	LOG_INF("  /dev, /sys, /sensors, /lib  -> sysfs (dynamic)");
+	LOG_INF("  /srv/*                      -> service registry");
+#if USE_LITTLEFS
 	LOG_INF("  /files/*                    -> LittleFS (persistent)");
+#endif
+#ifdef CONFIG_NINEP_9BBS
+	LOG_INF("  /srv/bbs/*                  -> BBS service (client-mountable)");
+	LOG_INF("  /srv/bbs/rooms/*/[1-N]      -> 9bbs (bulletin board)");
+	LOG_INF("  /srv/bbs/etc/roomlist       -> Room listing");
+#endif
 	LOG_INF("===================================================");
-#else
-	LOG_INF("===================================================");
-	LOG_INF("NAMESPACE:");
-	LOG_INF("  /dev, /sys, /sensors, /lib  -> sysfs (dynamic)");
-	LOG_INF("===================================================");
+#ifdef CONFIG_NINEP_9BBS
+	LOG_INF("");
+	LOG_INF("Client can access BBS via /srv/bbs:");
+	LOG_INF("  cat /srv/bbs/rooms/lobby/1");
+	LOG_INF("  cat /srv/bbs/rooms/tech/1");
+	LOG_INF("  cat /srv/bbs/etc/roomlist");
+	LOG_INF("Or mount it locally: mount /srv/bbs /bbs");
+	LOG_INF("");
 #endif
 
 	/* Initialize sessions mutex */

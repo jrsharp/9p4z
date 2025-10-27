@@ -56,3 +56,24 @@ if(CONFIG_NINEP_GATT_9PIS)
 endif()
 
 endif() # CONFIG_NINEP
+
+# Plan 9-style Namespaces
+if(CONFIG_NAMESPACE)
+  zephyr_library_sources(
+    src/namespace/namespace.c
+    src/namespace/ns_file_ops.c
+  )
+
+  if(CONFIG_NINEP_VFS)
+    zephyr_library_sources(src/namespace/fs_9p.c)
+  endif()
+
+  if(CONFIG_SRV_REGISTRY)
+    zephyr_library_sources(src/namespace/srv.c)
+  endif()
+endif() # CONFIG_NAMESPACE
+
+# 9bbs - Plan 9-style BBS
+if(CONFIG_NINEP_9BBS)
+  zephyr_library_sources(src/9bbs/9bbs.c)
+endif() # CONFIG_NINEP_9BBS

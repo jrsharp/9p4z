@@ -37,6 +37,7 @@ static struct ninep_server_fid *alloc_fid(struct ninep_server *server, uint32_t 
 			server->fids[i].in_use = true;
 			server->fids[i].node = NULL;
 			server->fids[i].iounit = 0;
+			server->fids[i].uname[0] = '\0';  /* Empty by default */
 			return &server->fids[i];
 		}
 	}
@@ -143,6 +144,18 @@ static void handle_tattach(struct ninep_server *server, uint16_t tag,
 	}
 	LOG_DBG("get_root=%p", ops->get_root);
 
+	/* Parse uname from Tattach message
+	 * Format: size[4] type[1] tag[2] fid[4] afid[4] uname[s] aname[s]
+	 * uname starts at offset 15 */
+	uint16_t uname_len = 0;
+	const char *uname = "anonymous";  /* Default if parsing fails */
+	if (len > 17) {  /* Need at least 2 bytes for length */
+		uname_len = msg[15] | (msg[16] << 8);
+		if (len >= 17 + uname_len && uname_len > 0) {
+			uname = (const char *)&msg[17];
+		}
+	}
+
 	/* Allocate FID */
 	struct ninep_server_fid *sfid = alloc_fid(server, fid);
 
@@ -150,6 +163,14 @@ static void handle_tattach(struct ninep_server *server, uint16_t tag,
 		send_error(server, tag, "FID already in use");
 		return;
 	}
+
+	/* Store uname (truncate if necessary) */
+	size_t copy_len = uname_len < sizeof(sfid->uname) - 1 ?
+	                  uname_len : sizeof(sfid->uname) - 1;
+	memcpy(sfid->uname, uname, copy_len);
+	sfid->uname[copy_len] = '\0';
+
+	LOG_INF("Tattach: fid=%u, uname='%s'", fid, sfid->uname);
 
 	/* Get root node */
 	sfid->node = server->config->fs_ops->get_root(server->config->fs_ctx);
@@ -193,6 +214,9 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 			return;
 		}
 		new_sfid->node = sfid->node;
+		/* Copy uname from parent fid */
+		strncpy(new_sfid->uname, sfid->uname, sizeof(new_sfid->uname) - 1);
+		new_sfid->uname[sizeof(new_sfid->uname) - 1] = '\0';
 
 		/* Send Rwalk with 0 qids */
 		int ret = ninep_build_rwalk(server->tx_buf, sizeof(server->tx_buf),
@@ -233,6 +257,9 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 		return;
 	}
 	new_sfid->node = node;
+	/* Copy uname from parent fid */
+	strncpy(new_sfid->uname, sfid->uname, sizeof(new_sfid->uname) - 1);
+	new_sfid->uname[sizeof(new_sfid->uname) - 1] = '\0';
 
 	/* Send Rwalk */
 	int ret = ninep_build_rwalk(server->tx_buf, sizeof(server->tx_buf),
@@ -419,7 +446,7 @@ static void handle_tcreate(struct ninep_server *server, uint16_t tag,
 	/* Create new file/directory */
 	struct ninep_fs_node *new_node = NULL;
 	int ret = server->config->fs_ops->create(
-		sfid->node, name, name_len, perm, mode, &new_node, server->config->fs_ctx);
+		sfid->node, name, name_len, perm, mode, sfid->uname, &new_node, server->config->fs_ctx);
 
 	if (ret < 0 || !new_node) {
 		send_error(server, tag, "create failed");
@@ -468,7 +495,7 @@ static void handle_twrite(struct ninep_server *server, uint16_t tag,
 
 	/* Write data */
 	int bytes = server->config->fs_ops->write(sfid->node, offset, data, count,
-	                                           server->config->fs_ctx);
+	                                           sfid->uname, server->config->fs_ctx);
 	if (bytes < 0) {
 		send_error(server, tag, "write failed");
 		return;
@@ -652,7 +679,7 @@ int ninep_server_init(struct ninep_server *server,
                       const struct ninep_server_config *config,
                       struct ninep_transport *transport)
 {
-	if (!server || !config || !transport) {
+	if (!server || !config) {
 		return -EINVAL;
 	}
 
@@ -660,18 +687,28 @@ int ninep_server_init(struct ninep_server *server,
 	server->config = config;
 	server->transport = transport;
 
-	/* Set transport callback */
-	transport->recv_cb = server_recv_callback;
-	transport->user_data = server;
+	/* Set transport callback (only for network servers) */
+	if (transport) {
+		transport->recv_cb = server_recv_callback;
+		transport->user_data = server;
+		LOG_INF("9P server initialized (network transport)");
+	} else {
+		LOG_INF("9P server initialized (in-process)");
+	}
 
-	LOG_INF("9P server initialized");
 	return 0;
 }
 
 int ninep_server_start(struct ninep_server *server)
 {
-	if (!server || !server->transport) {
+	if (!server) {
 		return -EINVAL;
+	}
+
+	/* In-process servers don't have a transport to start */
+	if (!server->transport) {
+		LOG_DBG("In-process server - no transport to start");
+		return 0;
 	}
 
 	int ret = ninep_transport_start(server->transport);
@@ -687,8 +724,14 @@ int ninep_server_start(struct ninep_server *server)
 
 int ninep_server_stop(struct ninep_server *server)
 {
-	if (!server || !server->transport) {
+	if (!server) {
 		return -EINVAL;
+	}
+
+	/* In-process servers don't have a transport to stop */
+	if (!server->transport) {
+		LOG_DBG("In-process server - no transport to stop");
+		return 0;
 	}
 
 	int ret = ninep_transport_stop(server->transport);

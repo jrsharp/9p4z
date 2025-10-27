@@ -9,6 +9,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <string.h>
+#include <stdint.h>
 
 LOG_MODULE_REGISTER(ninep_union_fs, CONFIG_NINEP_LOG_LEVEL);
 
@@ -155,6 +156,12 @@ static void register_node_owner(struct ninep_union_fs *fs,
 static struct ninep_union_mount *find_node_owner(struct ninep_union_fs *fs,
                                                    struct ninep_fs_node *node)
 {
+	/* Validate node pointer before accessing it */
+	if (!node || (uintptr_t)node < 0x1000 || (uintptr_t)node == 0x091e091e) {
+		LOG_ERR("find_node_owner: invalid node pointer %p", node);
+		return NULL;
+	}
+
 	LOG_DBG("find_node_owner: looking for node=%p name='%s'", node, node->name);
 
 	/* Union root doesn't belong to any backend */
@@ -342,7 +349,7 @@ static int union_read(struct ninep_fs_node *node, uint64_t offset,
 					struct ninep_qid mount_qid = {
 						.type = NINEP_QTDIR,
 						.version = 0,
-						.path = (uint64_t)mount  /* Use mount address as unique path */
+						.path = (uint64_t)(uintptr_t)mount  /* Use mount address as unique path */
 					};
 
 					/* Write stat structure for mount point directory */
@@ -535,7 +542,8 @@ static int union_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 }
 
 static int union_write(struct ninep_fs_node *node, uint64_t offset,
-                        const uint8_t *buf, uint32_t count, void *fs_ctx)
+                        const uint8_t *buf, uint32_t count, const char *uname,
+                        void *fs_ctx)
 {
 	struct ninep_union_fs *fs = (struct ninep_union_fs *)fs_ctx;
 
@@ -553,12 +561,13 @@ static int union_write(struct ninep_fs_node *node, uint64_t offset,
 		return -ENOTSUP;
 	}
 
-	return mount->fs_ops->write(node, offset, buf, count, mount->fs_ctx);
+	return mount->fs_ops->write(node, offset, buf, count, uname, mount->fs_ctx);
 }
 
 static int union_create(struct ninep_fs_node *parent, const char *name,
                          uint16_t name_len, uint32_t perm, uint8_t mode,
-                         struct ninep_fs_node **new_node, void *fs_ctx)
+                         const char *uname, struct ninep_fs_node **new_node,
+                         void *fs_ctx)
 {
 	struct ninep_union_fs *fs = (struct ninep_union_fs *)fs_ctx;
 
@@ -577,7 +586,7 @@ static int union_create(struct ninep_fs_node *parent, const char *name,
 	}
 
 	int ret = mount->fs_ops->create(parent, name, name_len, perm, mode,
-	                                  new_node, mount->fs_ctx);
+	                                  uname, new_node, mount->fs_ctx);
 
 	/* Register the newly created node so subsequent operations can find its owner */
 	if (ret == 0 && new_node && *new_node) {
@@ -621,8 +630,42 @@ static int union_clunk(struct ninep_fs_node *node, void *fs_ctx)
 	struct ninep_union_mount *mount = find_node_owner(fs, node);
 
 	if (!mount) {
-		LOG_WRN("Clunking node with no owner: %p", node);
-		return -EINVAL;
+		LOG_ERR("Clunking node with no owner (possibly freed/corrupted): %p", node);
+		/* Don't return error - just skip the clunk to avoid further issues */
+		return 0;
+	}
+
+	LOG_DBG("union_clunk: mount=%p path='%s' fs_ops=%p root=%p",
+	        mount, mount->path, (void*)mount->fs_ops, (void*)mount->root);
+
+	/* CRITICAL: Don't clunk mount root nodes!
+	 * Check THIS FIRST before dereferencing anything else.
+	 * Mount roots are persistent and referenced by the mount structure. */
+	for (size_t i = 0; i < fs->num_mounts; i++) {
+		if (node == fs->mounts[i].root) {
+			LOG_INF("union_clunk: Skipping clunk for mount root '%s' (node=%p)",
+			        fs->mounts[i].path, node);
+			return 0;
+		}
+	}
+
+	/* Validate fs_ops pointer before dereferencing */
+	if (!mount->fs_ops || (uintptr_t)mount->fs_ops < 0x1000 ||
+	    (uintptr_t)mount->fs_ops == 0x091e091e) {
+		LOG_ERR("union_clunk: CORRUPTED fs_ops pointer %p for mount '%s'!",
+		        (void*)mount->fs_ops, mount->path);
+
+		/* Dump all mounts for debugging */
+		LOG_ERR("All mounts (%zu total):", fs->num_mounts);
+		for (size_t i = 0; i < fs->num_mounts; i++) {
+			LOG_ERR("  [%zu] path='%s' fs_ops=%p root=%p",
+			        i, fs->mounts[i].path,
+			        (void*)fs->mounts[i].fs_ops,
+			        (void*)fs->mounts[i].root);
+		}
+
+		/* Don't try to call clunk - the pointer is corrupted */
+		return 0;
 	}
 
 	/* Only delegate if backend has a clunk handler */
@@ -708,6 +751,8 @@ int ninep_union_fs_mount(struct ninep_union_fs *fs,
 	mount->path = path;
 	mount->fs_ops = fs_ops;
 	mount->fs_ctx = fs_ctx;
+
+	LOG_INF("Mounting: path='%s' fs_ops=%p fs_ctx=%p", path, (void*)fs_ops, fs_ctx);
 
 	/* Get root node from backend */
 	if (!fs_ops->get_root) {
