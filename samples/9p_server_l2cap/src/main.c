@@ -1474,82 +1474,197 @@ int main(void)
 	ret = fs_stat(bbs_marker, &marker_entry);
 
 	if (ret != 0) {
-		/* Create BBS directory structure */
-		LOG_INF("Creating 9bbs directory structure in LittleFS...");
+		/* Create BBS directory structure per 9BBS spec v1.0 */
+		LOG_INF("Creating 9BBS directory structure (per spec v1.0)...");
 
-		/* Create /bbs root */
 		char path[128];
-		/* Note: /lfs_bbs root already exists from automount */
+		struct fs_file_t file;
 
-		/* Create /rooms */
+		/* Create /etc directory for board metadata */
+		snprintf(path, sizeof(path), "%s/etc", LFS_BBS_MOUNT_POINT);
+		ret = fs_mkdir(path);
+		if (ret < 0 && ret != -EEXIST) {
+			LOG_ERR("Failed to create /etc: %d", ret);
+		}
+
+		/* Create /etc/boardname */
+		fs_file_t_init(&file);
+		snprintf(path, sizeof(path), "%s/etc/boardname", LFS_BBS_MOUNT_POINT);
+		ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+		if (ret == 0) {
+			const char *content = "The Aether Node #42";
+			fs_write(&file, content, strlen(content));
+			fs_close(&file);
+			LOG_INF("Created: /etc/boardname");
+		}
+
+		/* Create /etc/sysop */
+		snprintf(path, sizeof(path), "%s/etc/sysop", LFS_BBS_MOUNT_POINT);
+		ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+		if (ret == 0) {
+			const char *content = "SysOp: Alice\nContact: alice@example.com";
+			fs_write(&file, content, strlen(content));
+			fs_close(&file);
+			LOG_INF("Created: /etc/sysop");
+		}
+
+		/* Create /etc/motd */
+		snprintf(path, sizeof(path), "%s/etc/motd", LFS_BBS_MOUNT_POINT);
+		ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+		if (ret == 0) {
+			const char *content =
+				"Welcome to The Aether!\n"
+				"\n"
+				"A local mesh BBS running on Zephyr RTOS.\n"
+				"Accessible via 9P over Bluetooth L2CAP.\n"
+				"\n"
+				"Enjoy your stay!";
+			fs_write(&file, content, strlen(content));
+			fs_close(&file);
+			LOG_INF("Created: /etc/motd");
+		}
+
+		/* Create /etc/location */
+		snprintf(path, sizeof(path), "%s/etc/location", LFS_BBS_MOUNT_POINT);
+		ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+		if (ret == 0) {
+			const char *content = "San Francisco, CA, USA";
+			fs_write(&file, content, strlen(content));
+			fs_close(&file);
+			LOG_INF("Created: /etc/location");
+		}
+
+		/* Create /etc/description */
+		snprintf(path, sizeof(path), "%s/etc/description", LFS_BBS_MOUNT_POINT);
+		ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+		if (ret == 0) {
+			const char *content =
+				"A local mesh BBS serving the SF Bay Area.\n"
+				"Topics: Tech, local events, buy/sell/trade.";
+			fs_write(&file, content, strlen(content));
+			fs_close(&file);
+			LOG_INF("Created: /etc/description");
+		}
+
+		/* Create /etc/version */
+		snprintf(path, sizeof(path), "%s/etc/version", LFS_BBS_MOUNT_POINT);
+		ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+		if (ret == 0) {
+			const char *content = "9BBS/Zephyr 1.0.0";
+			fs_write(&file, content, strlen(content));
+			fs_close(&file);
+			LOG_INF("Created: /etc/version");
+		}
+
+		/* Create /etc/nets directory for network information */
+		snprintf(path, sizeof(path), "%s/etc/nets", LFS_BBS_MOUNT_POINT);
+		ret = fs_mkdir(path);
+		if (ret < 0 && ret != -EEXIST) {
+			LOG_ERR("Failed to create /etc/nets: %d", ret);
+		}
+
+		/* Create /etc/nets/fsxnet */
+		snprintf(path, sizeof(path), "%s/etc/nets/fsxnet", LFS_BBS_MOUNT_POINT);
+		ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+		if (ret == 0) {
+			const char *content = "FSX_GEN\nFSX_BBS\nFSX_HAM\nFSX_RETRO";
+			fs_write(&file, content, strlen(content));
+			fs_close(&file);
+			LOG_INF("Created: /etc/nets/fsxnet");
+		}
+
+		/* Create /etc/nets/aethernet */
+		snprintf(path, sizeof(path), "%s/etc/nets/aethernet", LFS_BBS_MOUNT_POINT);
+		ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
+		if (ret == 0) {
+			const char *content =
+				"mesh: local-sf-bay\n"
+				"coverage: 10km radius\n"
+				"nodes: 23";
+			fs_write(&file, content, strlen(content));
+			fs_close(&file);
+			LOG_INF("Created: /etc/nets/aethernet");
+		}
+
+		/* Create /rooms directory */
 		snprintf(path, sizeof(path), "%s/rooms", LFS_BBS_MOUNT_POINT);
 		ret = fs_mkdir(path);
 		if (ret < 0 && ret != -EEXIST) {
-			LOG_ERR("Failed to create /bbs/rooms: %d", ret);
+			LOG_ERR("Failed to create /rooms: %d", ret);
 		}
 
 		/* Create /rooms/lobby */
 		snprintf(path, sizeof(path), "%s/rooms/lobby", LFS_BBS_MOUNT_POINT);
 		ret = fs_mkdir(path);
 		if (ret == 0 || ret == -EEXIST) {
-			/* Create example message: /bbs/rooms/lobby/1 */
-			struct fs_file_t file;
-			fs_file_t_init(&file);
-			snprintf(path, sizeof(path), "%s/rooms/lobby/1", LFS_BBS_MOUNT_POINT);
+			/* Create sample message 1 - RFC-822 format with proper filename */
+			snprintf(path, sizeof(path), "%s/rooms/lobby/1738005432123-abc123def456ghi7", LFS_BBS_MOUNT_POINT);
 			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
 			if (ret == 0) {
 				const char *msg =
 					"From: alice\n"
-					"To: lobby\n"
-					"Date: Wed, 23 Oct 2024 00:00:00 EST\n"
-					"X-Date-N: 1729648800\n"
+					"Date: 1738005432123\n"
+					"Subject: Welcome to 9BBS!\n"
+					"Room: lobby\n"
+					"Message-ID: <1738005432123-abc123@node1>\n"
+					"Origin: device-uuid-1234\n"
+					"X-Client: TheAether-iOS/1.0\n"
+					"CGA-Address: fe80::a1b2:c3d4:e5f6:7890\n"
+					"Pubkey: SGVsbG8gV29ybGQgUHVibGljS2V5RGF0YQ==\n"
+					"Signature: VGhpc0lzQVNpZ25hdHVyZQ==\n"
+					"Identity-Claim: alice:1738005432:compactsig\n"
 					"\n"
-					"Welcome to 9bbs over Bluetooth L2CAP!\n"
+					"Welcome to 9BBS over Bluetooth L2CAP!\n"
 					"\n"
 					"This is a Plan 9-style bulletin board system accessible\n"
-					"as a filesystem. Read and post messages by navigating to\n"
-					"/bbs/rooms/<room>/<message_number>\n"
+					"as a filesystem over 9P. Messages use RFC-822 format with\n"
+					"cryptographic signatures for authenticity.\n"
 					"\n"
-					"-- alice\n";
+					"Check out the other rooms and feel free to post!\n";
 				fs_write(&file, msg, strlen(msg));
 				fs_close(&file);
-				LOG_INF("Created: /bbs/rooms/lobby/1");
+				LOG_INF("Created: /rooms/lobby/1738005432123-abc123def456ghi7");
 			}
 
-			/* Create message 2 */
-			snprintf(path, sizeof(path), "%s/rooms/lobby/2", LFS_BBS_MOUNT_POINT);
+			/* Create sample message 2 */
+			snprintf(path, sizeof(path), "%s/rooms/lobby/1738005500000-def789ghi012jkl3", LFS_BBS_MOUNT_POINT);
 			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
 			if (ret == 0) {
 				const char *msg =
 					"From: bob\n"
-					"To: lobby\n"
-					"Date: Wed, 23 Oct 2024 00:05:00 EST\n"
-					"X-Date-N: 1729649100\n"
+					"Date: 1738005500000\n"
+					"Subject: Re: Welcome to 9BBS!\n"
+					"Room: lobby\n"
+					"Message-ID: <1738005500000-def789@node2>\n"
+					"Origin: device-uuid-5678\n"
+					"X-Client: TheAether-iOS/1.0\n"
+					"In-Reply-To: <1738005432123-abc123@node1>\n"
 					"\n"
 					"Hi Alice! This is amazing - a BBS accessible via\n"
 					"9P over Bluetooth from my iPhone!\n"
 					"\n"
-					"-- bob\n";
+					"The cryptographic identity system is really cool too.\n";
 				fs_write(&file, msg, strlen(msg));
 				fs_close(&file);
-				LOG_INF("Created: /bbs/rooms/lobby/2");
+				LOG_INF("Created: /rooms/lobby/1738005500000-def789ghi012jkl3");
 			}
 		}
 
-		/* Create /bbs/rooms/tech */
+		/* Create /rooms/tech */
 		snprintf(path, sizeof(path), "%s/rooms/tech", LFS_BBS_MOUNT_POINT);
 		ret = fs_mkdir(path);
 		if (ret == 0 || ret == -EEXIST) {
-			struct fs_file_t file;
-			fs_file_t_init(&file);
-			snprintf(path, sizeof(path), "%s/rooms/tech/1", LFS_BBS_MOUNT_POINT);
+			snprintf(path, sizeof(path), "%s/rooms/tech/1738005600000-mno456pqr789stu0", LFS_BBS_MOUNT_POINT);
 			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
 			if (ret == 0) {
 				const char *msg =
 					"From: alice\n"
-					"To: tech\n"
-					"Date: Wed, 23 Oct 2024 00:10:00 EST\n"
-					"X-Date-N: 1729649400\n"
+					"Date: 1738005600000\n"
+					"Subject: Tech Discussion Room\n"
+					"Room: tech\n"
+					"Message-ID: <1738005600000-mno456@node1>\n"
+					"Origin: device-uuid-1234\n"
+					"X-Client: TheAether-iOS/1.0\n"
 					"\n"
 					"Discuss embedded systems, Zephyr RTOS, and Plan 9 here!\n"
 					"\n"
@@ -1557,152 +1672,50 @@ int main(void)
 					"- Bluetooth L2CAP optimization\n"
 					"- 9P protocol implementation\n"
 					"- nRF52 development\n"
-					"\n"
-					"-- alice\n";
+					"- CGA-based identity systems\n";
 				fs_write(&file, msg, strlen(msg));
 				fs_close(&file);
-				LOG_INF("Created: /bbs/rooms/tech/1");
+				LOG_INF("Created: /rooms/tech/1738005600000-mno456pqr789stu0");
 			}
 		}
 
-		/* Create /bbs/rooms/general */
+		/* Create /rooms/general */
 		snprintf(path, sizeof(path), "%s/rooms/general", LFS_BBS_MOUNT_POINT);
 		ret = fs_mkdir(path);
 		if (ret == 0 || ret == -EEXIST) {
-			struct fs_file_t file;
-			fs_file_t_init(&file);
-			snprintf(path, sizeof(path), "%s/rooms/general/1", LFS_BBS_MOUNT_POINT);
+			snprintf(path, sizeof(path), "%s/rooms/general/1738005700000-vwx123yz456abc78", LFS_BBS_MOUNT_POINT);
 			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
 			if (ret == 0) {
 				const char *msg =
 					"From: bob\n"
-					"To: general\n"
-					"Date: Wed, 23 Oct 2024 00:15:00 EST\n"
-					"X-Date-N: 1729649700\n"
+					"Date: 1738005700000\n"
+					"Subject: General Discussion\n"
+					"Room: general\n"
+					"Message-ID: <1738005700000-vwx123@node2>\n"
+					"Origin: device-uuid-5678\n"
+					"X-Client: TheAether-iOS/1.0\n"
 					"\n"
 					"General discussion room for off-topic chatter.\n"
 					"\n"
-					"Feel free to discuss anything here!\n"
-					"\n"
-					"-- bob\n";
+					"Feel free to discuss anything here!\n";
 				fs_write(&file, msg, strlen(msg));
 				fs_close(&file);
-				LOG_INF("Created: /bbs/rooms/general/1");
+				LOG_INF("Created: /rooms/general/1738005700000-vwx123yz456abc78");
 			}
-		}
-
-		/* Create /etc */
-		snprintf(path, sizeof(path), "%s/etc", LFS_BBS_MOUNT_POINT);
-		ret = fs_mkdir(path);
-		if (ret < 0 && ret != -EEXIST) {
-			LOG_ERR("Failed to create /etc: %d", ret);
-		}
-
-		/* Create /bbs/etc/roomlist */
-		struct fs_file_t file;
-		fs_file_t_init(&file);
-		snprintf(path, sizeof(path), "%s/etc/roomlist", LFS_BBS_MOUNT_POINT);
-		ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
-		if (ret == 0) {
-			const char *roomlist = "lobby\ntech\ngeneral\n";
-			fs_write(&file, roomlist, strlen(roomlist));
-			fs_close(&file);
-			LOG_INF("Created: /bbs/etc/roomlist");
-		}
-
-		/* Create /bbs/etc/users */
-		snprintf(path, sizeof(path), "%s/etc/users", LFS_BBS_MOUNT_POINT);
-		ret = fs_mkdir(path);
-
-		/* Create alice user */
-		snprintf(path, sizeof(path), "%s/etc/users/alice", LFS_BBS_MOUNT_POINT);
-		ret = fs_mkdir(path);
-		if (ret == 0 || ret == -EEXIST) {
-			/* alice/password */
-			snprintf(path, sizeof(path), "%s/etc/users/alice/password", LFS_BBS_MOUNT_POINT);
-			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
-			if (ret == 0) {
-				fs_write(&file, "password123", 11);
-				fs_close(&file);
-			}
-
-			/* alice/room */
-			snprintf(path, sizeof(path), "%s/etc/users/alice/room", LFS_BBS_MOUNT_POINT);
-			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
-			if (ret == 0) {
-				fs_write(&file, "lobby", 5);
-				fs_close(&file);
-			}
-
-			/* alice/rooms (read positions) */
-			snprintf(path, sizeof(path), "%s/etc/users/alice/rooms", LFS_BBS_MOUNT_POINT);
-			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
-			if (ret == 0) {
-				const char *rooms = "lobby/2\ntech/1\ngeneral/0\n";
-				fs_write(&file, rooms, strlen(rooms));
-				fs_close(&file);
-			}
-
-			/* alice/sig */
-			snprintf(path, sizeof(path), "%s/etc/users/alice/sig", LFS_BBS_MOUNT_POINT);
-			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
-			if (ret == 0) {
-				const char *sig = "-- alice\nEmbedded systems enthusiast\n";
-				fs_write(&file, sig, strlen(sig));
-				fs_close(&file);
-			}
-
-			LOG_INF("Created user: alice");
-		}
-
-		/* Create bob user */
-		snprintf(path, sizeof(path), "%s/etc/users/bob", LFS_BBS_MOUNT_POINT);
-		ret = fs_mkdir(path);
-		if (ret == 0 || ret == -EEXIST) {
-			snprintf(path, sizeof(path), "%s/etc/users/bob/password", LFS_BBS_MOUNT_POINT);
-			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
-			if (ret == 0) {
-				fs_write(&file, "password456", 11);
-				fs_close(&file);
-			}
-
-			snprintf(path, sizeof(path), "%s/etc/users/bob/room", LFS_BBS_MOUNT_POINT);
-			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
-			if (ret == 0) {
-				fs_write(&file, "lobby", 5);
-				fs_close(&file);
-			}
-
-			snprintf(path, sizeof(path), "%s/etc/users/bob/rooms", LFS_BBS_MOUNT_POINT);
-			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
-			if (ret == 0) {
-				const char *rooms = "lobby/2\ntech/0\ngeneral/1\n";
-				fs_write(&file, rooms, strlen(rooms));
-				fs_close(&file);
-			}
-
-			snprintf(path, sizeof(path), "%s/etc/users/bob/sig", LFS_BBS_MOUNT_POINT);
-			ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
-			if (ret == 0) {
-				const char *sig = "-- bob\niPhone 9P client tester\n";
-				fs_write(&file, sig, strlen(sig));
-				fs_close(&file);
-			}
-
-			LOG_INF("Created user: bob");
 		}
 
 		/* Create marker file */
 		snprintf(path, sizeof(path), "%s/.initialized", LFS_BBS_MOUNT_POINT);
 		ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
 		if (ret == 0) {
-			fs_write(&file, "1", 1);
+			const char *version = "v1.0";
+			fs_write(&file, version, strlen(version));
 			fs_close(&file);
 		}
 
-		LOG_INF("9bbs LittleFS structure created successfully!");
+		LOG_INF("9BBS v1.0 structure created successfully!");
 	} else {
-		LOG_INF("9bbs structure already exists in LittleFS");
+		LOG_INF("9BBS structure already exists in LittleFS");
 	}
 #endif
 
@@ -1712,36 +1725,52 @@ int main(void)
 		LOG_ERR("Failed to initialize BBS: %d", ret);
 		return 0;
 	}
-	LOG_INF("9bbs initialized");
+	LOG_INF("9BBS v1.0 initialized");
 
-	/* Create demo users */
-	bbs_create_user(&bbs, "alice", "password123");
-	bbs_create_user(&bbs, "bob", "password456");
-	LOG_INF("Created demo users: alice, bob");
+#if USE_LITTLEFS
+	/* Only create demo users and messages if BBS was just initialized (no marker file) */
+	struct fs_dirent check_marker;
+	if (fs_stat(LFS_BBS_MOUNT_POINT "/.initialized", &check_marker) != 0) {
+		LOG_INF("First boot - creating demo users and posting welcome messages");
+#endif
+		/* Create demo users */
+		bbs_create_user(&bbs, "alice", "password123");
+		bbs_create_user(&bbs, "bob", "password456");
+		LOG_INF("Created demo users: alice, bob");
 
-	/* Create additional rooms */
-	bbs_create_room(&bbs, "tech");
-	bbs_create_room(&bbs, "general");
-	LOG_INF("Created rooms: lobby, tech, general");
+		/* Create additional rooms (may already exist from LittleFS scan) */
+		bbs_create_room(&bbs, "tech");
+		bbs_create_room(&bbs, "general");
+		LOG_INF("Created rooms: lobby, tech, general");
 
-	/* Post welcome messages */
-	bbs_post_message(&bbs, "lobby", "alice",
-	                 "Welcome to 9bbs over Bluetooth L2CAP!\n\n"
-	                 "This is a Plan 9-style bulletin board system accessible "
-	                 "as a filesystem. Read and post messages by navigating to "
-	                 "/bbs/rooms/<room>/<message_number>", 0);
-	bbs_post_message(&bbs, "lobby", "bob",
-	                 "Hi Alice! This is amazing - a BBS accessible via "
-	                 "9P over Bluetooth from my iPhone!", 0);
-	bbs_post_message(&bbs, "tech", "alice",
-	                 "Discuss embedded systems, Zephyr RTOS, and Plan 9 here!\n\n"
-	                 "Topics:\n"
-	                 "- Bluetooth L2CAP optimization\n"
-	                 "- 9P protocol implementation\n"
-	                 "- nRF52 development", 0);
-	bbs_post_message(&bbs, "general", "bob",
-	                 "General discussion room for off-topic chatter.", 0);
-	LOG_INF("Posted welcome messages");
+		/* Post welcome messages (9BBS v1.0 RFC-822 format) */
+		/* NOTE: These are in-memory only for non-LittleFS builds. */
+		/* For LittleFS builds, the messages are already in LittleFS files with proper RFC-822 format. */
+		bbs_post_message(&bbs, "lobby", "alice",
+		                 "Welcome to 9BBS v1.0 over Bluetooth L2CAP!\n\n"
+		                 "This is a Plan 9-style bulletin board system with RFC-822 "
+		                 "message format and cryptographic identity support.\n\n"
+		                 "Check out /srv/bbs/etc/ for board info and network details!", 0);
+		bbs_post_message(&bbs, "lobby", "bob",
+		                 "Hi Alice! This is amazing - a BBS accessible via "
+		                 "9P over Bluetooth from my iPhone!\n\n"
+		                 "The CGA-based identity system is really cool too.", 0);
+		bbs_post_message(&bbs, "tech", "alice",
+		                 "Discuss embedded systems, Zephyr RTOS, and Plan 9 here!\n\n"
+		                 "Topics:\n"
+		                 "- Bluetooth L2CAP optimization\n"
+		                 "- 9P protocol implementation\n"
+		                 "- nRF52 development\n"
+		                 "- CGA-based identity systems", 0);
+		bbs_post_message(&bbs, "general", "bob",
+		                 "General discussion room for off-topic chatter.\n\n"
+		                 "Feel free to discuss anything here!", 0);
+		LOG_INF("Posted welcome messages");
+#if USE_LITTLEFS
+	} else {
+		LOG_INF("BBS already initialized - skipping demo setup (messages loaded from LittleFS)");
+	}
+#endif
 
 	/* Post BBS to /srv for dynamic mounting */
 #if USE_LITTLEFS
@@ -1807,17 +1836,21 @@ int main(void)
 	LOG_INF("  /files/*                    -> LittleFS (persistent)");
 #endif
 #ifdef CONFIG_NINEP_9BBS
-	LOG_INF("  /srv/bbs/*                  -> BBS service (client-mountable)");
-	LOG_INF("  /srv/bbs/rooms/*/[1-N]      -> 9bbs (bulletin board)");
-	LOG_INF("  /srv/bbs/etc/roomlist       -> Room listing");
+	LOG_INF("  /srv/bbs/*                  -> BBS service (9BBS v1.0)");
+	LOG_INF("  /srv/bbs/etc/*              -> Board metadata (boardname, motd, etc.)");
+	LOG_INF("  /srv/bbs/etc/nets/*         -> Network info (fsxnet, aethernet)");
+	LOG_INF("  /srv/bbs/rooms/*            -> Message rooms (RFC-822 format)");
 #endif
 	LOG_INF("===================================================");
 #ifdef CONFIG_NINEP_9BBS
 	LOG_INF("");
-	LOG_INF("Client can access BBS via /srv/bbs:");
-	LOG_INF("  cat /srv/bbs/rooms/lobby/1");
-	LOG_INF("  cat /srv/bbs/rooms/tech/1");
-	LOG_INF("  cat /srv/bbs/etc/roomlist");
+	LOG_INF("9BBS v1.0 - Client Usage:");
+	LOG_INF("  cat /srv/bbs/etc/boardname");
+	LOG_INF("  cat /srv/bbs/etc/motd");
+	LOG_INF("  cat /srv/bbs/etc/nets/fsxnet");
+	LOG_INF("  ls /srv/bbs/rooms/lobby");
+	LOG_INF("  cat /srv/bbs/rooms/lobby/<timestamp>-<msgid>");
+	LOG_INF("");
 	LOG_INF("Or mount it locally: mount /srv/bbs /bbs");
 	LOG_INF("");
 #endif

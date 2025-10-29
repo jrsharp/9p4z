@@ -16,6 +16,10 @@
 #include <zephyr/fs/fs.h>
 #endif
 
+#ifdef CONFIG_DATE_TIME
+#include <date_time.h>
+#endif
+
 LOG_MODULE_REGISTER(bbs, CONFIG_NINEP_LOG_LEVEL);
 
 /* LittleFS mount point */
@@ -83,12 +87,12 @@ static int save_message_to_lfs(const char *room_name, const struct bbs_message *
 	return 0;
 }
 
-/* Load a message from LittleFS */
-static int load_message_from_lfs(const char *room_name, uint32_t msg_id,
-                                  struct bbs_message *msg)
+/* Load a message from LittleFS by filename */
+static int load_message_from_lfs_by_filename(const char *room_name, const char *filename,
+                                               struct bbs_message *msg)
 {
 	char path[128];
-	snprintf(path, sizeof(path), "%s/%s/%u", BBS_ROOMS_PATH, room_name, msg_id);
+	snprintf(path, sizeof(path), "%s/%s/%s", BBS_ROOMS_PATH, room_name, filename);
 
 	struct fs_file_t file;
 	fs_file_t_init(&file);
@@ -121,9 +125,27 @@ static int load_message_from_lfs(const char *room_name, uint32_t msg_id,
 	char *line = buf;
 	char *body_start = NULL;
 
-	/* Initialize message */
+	/* Initialize message - extract ID from filename */
 	memset(msg, 0, sizeof(*msg));
-	msg->id = msg_id;
+
+	/* Parse timestamp from filename (format: "timestamp-msgid" or just "number") */
+	char *dash = strchr(filename, '-');
+	if (dash) {
+		/* Extract timestamp portion */
+		size_t ts_len = dash - filename;
+		char ts_str[16];
+		if (ts_len < sizeof(ts_str)) {
+			memcpy(ts_str, filename, ts_len);
+			ts_str[ts_len] = '\0';
+			uint64_t timestamp = strtoull(ts_str, NULL, 10);
+			msg->id = (uint32_t)(timestamp & 0xFFFFFFFF);
+		} else {
+			msg->id = 0;  /* Will be set from Date header */
+		}
+	} else {
+		/* Simple numeric filename */
+		msg->id = strtoul(filename, NULL, 10);
+	}
 
 	while (*line) {
 		char *next_line = strchr(line, '\n');
@@ -219,32 +241,67 @@ static int load_room_from_lfs(struct bbs_instance *bbs, const char *room_name)
 			continue;
 		}
 
-		/* Parse message ID from filename */
-		uint32_t msg_id = strtoul(entry.name, NULL, 10);
-		if (msg_id == 0) {
-			LOG_WRN("Invalid message filename: %s", entry.name);
-			continue;
+		/* Parse message ID from filename
+		 * Supports two formats:
+		 *   1. Timestamp-msgid format: "1738005432123-abc123def456ghi7"
+		 *   2. Simple numeric format: "1", "2", "3" (legacy)
+		 */
+		uint64_t timestamp = 0;
+		char *dash = strchr(entry.name, '-');
+
+		if (dash) {
+			/* Format: timestamp-msgid - extract timestamp portion */
+			size_t ts_len = dash - entry.name;
+			char ts_str[16];
+
+			if (ts_len >= sizeof(ts_str)) {
+				LOG_WRN("Timestamp too long in filename: %s", entry.name);
+				continue;
+			}
+
+			memcpy(ts_str, entry.name, ts_len);
+			ts_str[ts_len] = '\0';
+
+			timestamp = strtoull(ts_str, NULL, 10);
+			if (timestamp == 0) {
+				LOG_WRN("Invalid timestamp in filename: %s", entry.name);
+				continue;
+			}
+
+			LOG_DBG("Parsed timestamp %llu from filename: %s", timestamp, entry.name);
+		} else {
+			/* Legacy format: simple numeric message ID */
+			timestamp = strtoull(entry.name, NULL, 10);
+			if (timestamp == 0) {
+				LOG_WRN("Invalid message filename: %s", entry.name);
+				continue;
+			}
+			LOG_DBG("Parsed legacy message ID %llu from filename: %s", timestamp, entry.name);
 		}
 
 		/* Check if we have space */
 		if (room->message_count >= CONFIG_9BBS_MAX_MESSAGES_PER_ROOM) {
-			LOG_WRN("Room '%s' full, can't load message %u", room_name, msg_id);
+			LOG_WRN("Room '%s' full, can't load message from file: %s",
+			        room_name, entry.name);
 			break;
 		}
 
-		/* Load message into next slot */
+		/* Load message into next slot using the full filename */
 		struct bbs_message *msg = &room->messages[room->message_count];
-		ret = load_message_from_lfs(room_name, msg_id, msg);
+
+		/* Use timestamp as message ID (will be overridden by Date header in file) */
+		ret = load_message_from_lfs_by_filename(room_name, entry.name, msg);
 		if (ret == 0) {
 			room->message_count++;
-			/* Update next_message_id to be one past the highest ID */
+			/* Update next_message_id based on the timestamp */
+			uint32_t msg_id = (uint32_t)(timestamp & 0xFFFFFFFF);
 			if (msg_id >= room->next_message_id) {
 				room->next_message_id = msg_id + 1;
 			}
-			LOG_DBG("Loaded message %u from room '%s'", msg_id, room_name);
+			LOG_DBG("Loaded message from file '%s' in room '%s'", entry.name, room_name);
 		} else {
-			LOG_ERR("Failed to load message %u from room '%s': %d",
-			        msg_id, room_name, ret);
+			LOG_ERR("Failed to load message from file '%s' in room '%s': %d",
+			        entry.name, room_name, ret);
 		}
 	}
 
@@ -478,7 +535,21 @@ int bbs_post_message(struct bbs_instance *bbs, const char *room_name,
 	msg->id = room->next_message_id++;
 	strncpy(msg->from, from, sizeof(msg->from) - 1);
 	strncpy(msg->to, room_name, sizeof(msg->to) - 1);
-	msg->date = k_uptime_get() / 1000;  /* Seconds since boot */
+
+	/* Set timestamp: try date_time library first, fallback to uptime */
+#ifdef CONFIG_DATE_TIME
+	int64_t unix_time_ms;
+	if (date_time_now(&unix_time_ms) == 0) {
+		msg->date = (uint64_t)unix_time_ms;
+		LOG_DBG("Using Unix timestamp: %llu", msg->date);
+	} else {
+		msg->date = k_uptime_get();  /* Milliseconds since boot */
+		LOG_DBG("Using uptime timestamp: %llu", msg->date);
+	}
+#else
+	msg->date = k_uptime_get();  /* Milliseconds since boot */
+#endif
+
 	msg->reply_to = reply_to;
 	msg->deleted = false;
 
@@ -574,6 +645,8 @@ enum bbs_node_type {
 	BBS_NODE_ROOM_DIR,
 	BBS_NODE_MESSAGE_FILE,
 	BBS_NODE_ETC_DIR,
+	BBS_NODE_ETC_FILE,
+	BBS_NODE_ETC_NETS_DIR,
 	BBS_NODE_ROOMLIST_FILE,
 };
 
@@ -596,7 +669,7 @@ static struct ninep_fs_node *bbs_create_node(enum bbs_node_type type,
 	}
 
 	node->data = data;
-	node->type = (type == BBS_NODE_MESSAGE_FILE) ? NINEP_NODE_FILE : NINEP_NODE_DIR;
+	node->type = (type == BBS_NODE_MESSAGE_FILE || type == BBS_NODE_ETC_FILE) ? NINEP_NODE_FILE : NINEP_NODE_DIR;
 	node->mode = (node->type == NINEP_NODE_FILE) ? 0644 : 0755;
 
 	/* Generate QID */
@@ -626,9 +699,19 @@ static struct ninep_fs_node *bbs_walk(struct ninep_fs_node *parent,
 	memcpy(name_str, name, name_len);
 	name_str[name_len] = '\0';
 
-	/* ROOT directory - walk directly to rooms */
 	enum bbs_node_type parent_type = (enum bbs_node_type)((uint64_t)parent->qid.path >> 32);
+
+	/* ROOT directory - walk to "etc" or "rooms" */
 	if (parent_type == BBS_NODE_ROOT) {
+		if (strcmp(name_str, "etc") == 0) {
+			return bbs_create_node(BBS_NODE_ETC_DIR, "etc", fs_ctx);
+		} else if (strcmp(name_str, "rooms") == 0) {
+			return bbs_create_node(BBS_NODE_ROOMS_DIR, "rooms", fs_ctx);
+		}
+	}
+
+	/* ROOMS directory - walk to individual room names */
+	if (parent_type == BBS_NODE_ROOMS_DIR) {
 		k_mutex_lock(&bbs->lock, K_FOREVER);
 		for (uint32_t i = 0; i < bbs->room_count; i++) {
 			if (strncmp(bbs->rooms[i].name, name_str, name_len) == 0 &&
@@ -645,18 +728,55 @@ static struct ninep_fs_node *bbs_walk(struct ninep_fs_node *parent,
 	/* ROOM directory - list messages */
 	if (parent_type == BBS_NODE_ROOM_DIR) {
 		struct bbs_room *room = (struct bbs_room *)parent->data;
-		uint32_t msg_id = atoi(name_str);
+
+		if (!room) {
+			LOG_ERR("Room directory walk: room pointer is NULL!");
+			return NULL;
+		}
+
+		/* Parse message ID (handle both 13-digit timestamps and 10-digit IDs) */
+		uint64_t requested_value = strtoull(name_str, NULL, 10);
+		uint32_t msg_id = (uint32_t)(requested_value & 0xFFFFFFFF);
 
 		k_mutex_lock(&bbs->lock, K_FOREVER);
+		LOG_DBG("Walking to message '%s' (id=%u) in room '%s' (count=%u)",
+		        name_str, msg_id, room->name, room->message_count);
+
 		for (uint32_t i = 0; i < room->message_count; i++) {
 			if (room->messages[i].id == msg_id) {
+				LOG_DBG("Found message %u at index %u", msg_id, i);
 				struct ninep_fs_node *node = bbs_create_node(
 					BBS_NODE_MESSAGE_FILE, name_str, &room->messages[i]);
 				k_mutex_unlock(&bbs->lock);
 				return node;
 			}
 		}
+
+		LOG_WRN("Message '%s' (id=%u) not found in room '%s'", name_str, msg_id, room->name);
 		k_mutex_unlock(&bbs->lock);
+	}
+
+	/* ETC directory - walk to metadata files or nets subdirectory */
+	if (parent_type == BBS_NODE_ETC_DIR) {
+		const char *etc_files[] = {"boardname", "sysop", "motd", "location", "description", "version"};
+		for (size_t i = 0; i < sizeof(etc_files) / sizeof(etc_files[0]); i++) {
+			if (strcmp(name_str, etc_files[i]) == 0) {
+				return bbs_create_node(BBS_NODE_ETC_FILE, name_str, (void *)etc_files[i]);
+			}
+		}
+		if (strcmp(name_str, "nets") == 0) {
+			return bbs_create_node(BBS_NODE_ETC_NETS_DIR, "nets", fs_ctx);
+		}
+	}
+
+	/* ETC/NETS directory - walk to network files */
+	if (parent_type == BBS_NODE_ETC_NETS_DIR) {
+		const char *net_files[] = {"fsxnet", "aethernet"};
+		for (size_t i = 0; i < sizeof(net_files) / sizeof(net_files[0]); i++) {
+			if (strcmp(name_str, net_files[i]) == 0) {
+				return bbs_create_node(BBS_NODE_ETC_FILE, name_str, (void *)net_files[i]);
+			}
+		}
 	}
 
 	return NULL;
@@ -677,6 +797,11 @@ static int bbs_read(struct ninep_fs_node *node, uint64_t offset,
 	if (type == BBS_NODE_MESSAGE_FILE) {
 		/* Read a message */
 		struct bbs_message *msg = (struct bbs_message *)node->data;
+
+		if (!msg) {
+			LOG_ERR("BBS_NODE_MESSAGE_FILE has NULL data pointer!");
+			return -EINVAL;
+		}
 
 		LOG_INF("Reading message %u (from=%s, body_len=%zu)",
 		        msg->id, msg->from, msg->body_len);
@@ -706,8 +831,81 @@ static int bbs_read(struct ninep_fs_node *node, uint64_t offset,
 		memcpy(buf, temp + offset, to_copy);
 		return to_copy;
 
+	} else if (type == BBS_NODE_ETC_FILE) {
+		/* Read /etc/ file from LittleFS */
+#ifdef CONFIG_FILE_SYSTEM_LITTLEFS
+		const char *filename = (const char *)node->data;
+		char path[128];
+
+		/* Check if this is a nets file */
+		if (strcmp(filename, "fsxnet") == 0 || strcmp(filename, "aethernet") == 0) {
+			snprintf(path, sizeof(path), "%s/etc/nets/%s", BBS_LFS_MOUNT_POINT, filename);
+		} else {
+			snprintf(path, sizeof(path), "%s/etc/%s", BBS_LFS_MOUNT_POINT, filename);
+		}
+
+		struct fs_file_t file;
+		fs_file_t_init(&file);
+
+		int ret = fs_open(&file, path, FS_O_READ);
+		if (ret < 0) {
+			LOG_ERR("Failed to open %s: %d", path, ret);
+			return ret;
+		}
+
+		/* Seek to offset */
+		ret = fs_seek(&file, offset, FS_SEEK_SET);
+		if (ret < 0) {
+			fs_close(&file);
+			return ret;
+		}
+
+		/* Read data */
+		ssize_t bytes_read = fs_read(&file, buf, count);
+		fs_close(&file);
+
+		return (bytes_read >= 0) ? bytes_read : -EIO;
+#else
+		return -ENOTSUP;
+#endif
+
 	} else if (type == BBS_NODE_ROOT) {
-		/* Directory listing for root: list all rooms directly */
+		/* Directory listing for root: list "etc" and "rooms" */
+		size_t buf_offset = 0;
+		uint64_t current_offset = 0;
+
+		const char *entries[] = {"etc", "rooms"};
+		const enum bbs_node_type entry_types[] = {BBS_NODE_ETC_DIR, BBS_NODE_ROOMS_DIR};
+
+		for (size_t i = 0; i < 2; i++) {
+			struct ninep_qid entry_qid = {
+				.type = NINEP_QTDIR,
+				.version = 0,
+				.path = ((uint64_t)entry_types[i] << 32) | i
+			};
+			uint32_t mode = 0755 | NINEP_DMDIR;
+			uint16_t name_len = strlen(entries[i]);
+			uint16_t stat_size = 2 + 4 + 13 + 4 + 4 + 4 + 8 +
+			                     (2 + name_len) + (2 + 6) + (2 + 6) + (2 + 6);
+			uint32_t entry_size = 2 + stat_size;
+
+			if (current_offset >= offset) {
+				if (buf_offset + entry_size > count) break;
+				size_t write_offset = 0;
+				int ret = ninep_write_stat(buf + buf_offset, count - buf_offset,
+				                           &write_offset, &entry_qid, mode, 0,
+				                           entries[i], name_len);
+				if (ret < 0) break;
+				buf_offset += write_offset;
+				current_offset += write_offset;
+			} else {
+				current_offset += entry_size;
+			}
+		}
+		return buf_offset;
+
+	} else if (type == BBS_NODE_ROOMS_DIR) {
+		/* Directory listing for /rooms: list all room names */
 		size_t buf_offset = 0;
 		uint64_t current_offset = 0;
 
@@ -722,7 +920,7 @@ static int bbs_read(struct ninep_fs_node *node, uint64_t offset,
 			uint16_t name_len = strlen(bbs->rooms[i].name);
 			uint16_t stat_size = 2 + 4 + 13 + 4 + 4 + 4 + 8 +
 			                     (2 + name_len) + (2 + 6) + (2 + 6) + (2 + 6);
-			uint32_t entry_size = 2 + stat_size;  /* size[2] + stat data */
+			uint32_t entry_size = 2 + stat_size;
 
 			if (current_offset >= offset) {
 				if (buf_offset + entry_size > count) break;
@@ -740,9 +938,84 @@ static int bbs_read(struct ninep_fs_node *node, uint64_t offset,
 		k_mutex_unlock(&bbs->lock);
 		return buf_offset;
 
+	} else if (type == BBS_NODE_ETC_DIR) {
+		/* Directory listing for /etc: list metadata files and nets directory */
+		size_t buf_offset = 0;
+		uint64_t current_offset = 0;
+
+		const char *entries[] = {"boardname", "sysop", "motd", "location", "description", "version", "nets"};
+		const bool is_dir[] = {false, false, false, false, false, false, true};
+
+		for (size_t i = 0; i < 7; i++) {
+			struct ninep_qid entry_qid = {
+				.type = is_dir[i] ? NINEP_QTDIR : NINEP_QTFILE,
+				.version = 0,
+				.path = ((uint64_t)(is_dir[i] ? BBS_NODE_ETC_NETS_DIR : BBS_NODE_ETC_FILE) << 32) | i
+			};
+			uint32_t mode = is_dir[i] ? (0755 | NINEP_DMDIR) : 0644;
+			uint16_t name_len = strlen(entries[i]);
+			uint16_t stat_size = 2 + 4 + 13 + 4 + 4 + 4 + 8 +
+			                     (2 + name_len) + (2 + 6) + (2 + 6) + (2 + 6);
+			uint32_t entry_size = 2 + stat_size;
+
+			if (current_offset >= offset) {
+				if (buf_offset + entry_size > count) break;
+				size_t write_offset = 0;
+				int ret = ninep_write_stat(buf + buf_offset, count - buf_offset,
+				                           &write_offset, &entry_qid, mode, 0,
+				                           entries[i], name_len);
+				if (ret < 0) break;
+				buf_offset += write_offset;
+				current_offset += write_offset;
+			} else {
+				current_offset += entry_size;
+			}
+		}
+		return buf_offset;
+
+	} else if (type == BBS_NODE_ETC_NETS_DIR) {
+		/* Directory listing for /etc/nets: list network files */
+		size_t buf_offset = 0;
+		uint64_t current_offset = 0;
+
+		const char *entries[] = {"fsxnet", "aethernet"};
+
+		for (size_t i = 0; i < 2; i++) {
+			struct ninep_qid entry_qid = {
+				.type = NINEP_QTFILE,
+				.version = 0,
+				.path = ((uint64_t)BBS_NODE_ETC_FILE << 32) | (i + 100)  /* offset to avoid conflicts */
+			};
+			uint32_t mode = 0644;
+			uint16_t name_len = strlen(entries[i]);
+			uint16_t stat_size = 2 + 4 + 13 + 4 + 4 + 4 + 8 +
+			                     (2 + name_len) + (2 + 6) + (2 + 6) + (2 + 6);
+			uint32_t entry_size = 2 + stat_size;
+
+			if (current_offset >= offset) {
+				if (buf_offset + entry_size > count) break;
+				size_t write_offset = 0;
+				int ret = ninep_write_stat(buf + buf_offset, count - buf_offset,
+				                           &write_offset, &entry_qid, mode, 0,
+				                           entries[i], name_len);
+				if (ret < 0) break;
+				buf_offset += write_offset;
+				current_offset += write_offset;
+			} else {
+				current_offset += entry_size;
+			}
+		}
+		return buf_offset;
+
 	} else if (type == BBS_NODE_ROOM_DIR) {
 		/* Directory listing for /rooms/<room>: list message numbers */
 		struct bbs_room *room = (struct bbs_room *)node->data;
+
+		if (!room) {
+			LOG_ERR("BBS_NODE_ROOM_DIR has NULL data pointer!");
+			return -EINVAL;
+		}
+
 		size_t buf_offset = 0;
 		uint64_t current_offset = 0;
 
@@ -764,14 +1037,15 @@ static int bbs_read(struct ninep_fs_node *node, uint64_t offset,
 			uint16_t name_len = strlen(msg_id_str);
 			uint16_t stat_size = 2 + 4 + 13 + 4 + 4 + 4 + 8 +
 			                     (2 + name_len) + (2 + 6) + (2 + 6) + (2 + 6);
-			uint32_t entry_size = 2 + stat_size;  /* size[2] + stat data */
+			uint32_t entry_size = 2 + stat_size;
 
 			if (current_offset >= offset) {
 				if (buf_offset + entry_size > count) break;
 				size_t write_offset = 0;
+				size_t body_len = (room->messages[i].body) ? strlen(room->messages[i].body) : 0;
 				int ret = ninep_write_stat(buf + buf_offset, count - buf_offset,
 				                           &write_offset, &entry_qid, mode,
-				                           strlen(room->messages[i].body),
+				                           body_len,
 				                           msg_id_str, name_len);
 				if (ret < 0) break;
 				buf_offset += write_offset;
@@ -905,21 +1179,93 @@ static int bbs_create(struct ninep_fs_node *parent, const char *name,
 		/* Use uname as the "from" field, or "anonymous" if not provided */
 		const char *from = (uname && uname[0]) ? uname : "anonymous";
 
-		/* Post message with empty body (will be populated via write if needed) */
-		int msg_id = bbs_post_message(bbs, room->name, from, "", 0);
-		if (msg_id < 0) {
-			return msg_id;
+		/* Parse the requested filename to extract timestamp (supports both formats):
+		 *   1. Pure timestamp: "1761708118466" (13 digits)
+		 *   2. Timestamp-msgid: "1761708118466-abc123..."
+		 */
+		uint64_t requested_timestamp = 0;
+		char *dash = strchr(name_str, '-');
+
+		if (dash) {
+			/* Format: timestamp-msgid */
+			size_t ts_len = dash - name_str;
+			char ts_str[16];
+			if (ts_len < sizeof(ts_str)) {
+				memcpy(ts_str, name_str, ts_len);
+				ts_str[ts_len] = '\0';
+				requested_timestamp = strtoull(ts_str, NULL, 10);
+			}
+		} else {
+			/* Pure timestamp */
+			requested_timestamp = strtoull(name_str, NULL, 10);
 		}
 
-		LOG_INF("Created message %d in room %s (client requested name: %.*s)",
+		/* If client provided a valid timestamp, use its lower 32 bits as message ID */
+		uint32_t requested_msg_id = 0;
+		if (requested_timestamp > 0) {
+			requested_msg_id = (uint32_t)(requested_timestamp & 0xFFFFFFFF);
+			LOG_DBG("Client requested filename '%s' -> timestamp %llu -> msg_id %u",
+			        name_str, requested_timestamp, requested_msg_id);
+		}
+
+		/* Post message with empty body (will be populated via write if needed) */
+		int ret_signed = bbs_post_message(bbs, room->name, from, "", 0);
+
+		/* Note: bbs_post_message returns message ID (uint32_t) cast to int
+		 * Error codes are small negative values (-1 to -200)
+		 * Large message IDs (> INT32_MAX) appear as large negative values when cast to int
+		 * We distinguish by checking if the value is a "reasonable" error code
+		 */
+		if (ret_signed < 0 && ret_signed >= -200) {
+			/* This is an actual error code */
+			return ret_signed;
+		}
+
+		/* Otherwise, this is a message ID (possibly > INT32_MAX) */
+		uint32_t msg_id = (uint32_t)ret_signed;
+
+		/* If client requested a specific message ID, override the auto-generated one */
+		if (requested_msg_id > 0 && msg_id > 0 && requested_msg_id != msg_id) {
+			k_mutex_lock(&bbs->lock, K_FOREVER);
+			/* Find the just-created message (last in array) */
+			if (room->message_count > 0) {
+				struct bbs_message *msg = &room->messages[room->message_count - 1];
+				if (msg->id == msg_id) {
+					uint32_t old_id = msg->id;
+					LOG_INF("Overriding auto-generated ID %u with client-requested ID %u",
+					        old_id, requested_msg_id);
+					msg->id = requested_msg_id;
+					msg_id = requested_msg_id;
+
+#ifdef CONFIG_FILE_SYSTEM_LITTLEFS
+					/* Rename the LittleFS file to match the new ID */
+					char old_path[128], new_path[128];
+					snprintf(old_path, sizeof(old_path), "%s/%s/%u",
+					         BBS_ROOMS_PATH, room->name, old_id);
+					snprintf(new_path, sizeof(new_path), "%s/%s/%u",
+					         BBS_ROOMS_PATH, room->name, requested_msg_id);
+
+					int ret = fs_rename(old_path, new_path);
+					if (ret < 0) {
+						LOG_ERR("Failed to rename %s to %s: %d", old_path, new_path, ret);
+					} else {
+						LOG_DBG("Renamed %s -> %s", old_path, new_path);
+					}
+#endif
+				}
+			}
+			k_mutex_unlock(&bbs->lock);
+		}
+
+		LOG_INF("Created message %u in room %s (client requested name: %.*s)",
 		        msg_id, room->name, name_len, name);
 
 		/* Return new message node using the actual message ID */
 		char msg_id_str[16];
-		snprintf(msg_id_str, sizeof(msg_id_str), "%d", msg_id);
+		snprintf(msg_id_str, sizeof(msg_id_str), "%u", msg_id);
 		*new_node = bbs_walk(parent, msg_id_str, strlen(msg_id_str), fs_ctx);
 
-		LOG_INF("Returning node %p for message %d", *new_node, msg_id);
+		LOG_INF("Returning node %p for message %u", *new_node, msg_id);
 
 		return (*new_node != NULL) ? 0 : -EIO;
 	}
