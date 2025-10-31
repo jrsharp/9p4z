@@ -58,7 +58,7 @@ struct l2cap_transport_data {
 /* NCS: Define TX buffer pool for L2CAP SDUs */
 #define TX_BUF_COUNT 4
 #define TX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_MAX_MESSAGE_SIZE)
-NET_BUF_POOL_DEFINE(l2cap_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE, 0, NULL);
+NET_BUF_POOL_DEFINE(l2cap_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE, CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
 #endif
 
 /* Forward declarations */
@@ -263,6 +263,10 @@ static int l2cap_send(struct ninep_transport *transport, const uint8_t *buf,
 		return -ENOMEM;
 	}
 #endif
+
+	/* Clear user_data to avoid "user_data is not empty" warning from Zephyr BT stack.
+	 * The user_data size is typically 4-8 bytes. We clear the maximum possible. */
+	memset(net_buf_user_data(msg_buf), 0, CONFIG_BT_CONN_TX_USER_DATA_SIZE);
 
 	/* Copy message data to net_buf */
 	net_buf_add_mem(msg_buf, buf, len);

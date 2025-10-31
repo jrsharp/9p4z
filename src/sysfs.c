@@ -19,33 +19,117 @@ LOG_MODULE_REGISTER(ninep_sysfs, CONFIG_NINEP_LOG_LEVEL);
 struct sysfs_node_cache {
 	struct ninep_fs_node nodes[SYSFS_NODE_CACHE_SIZE];
 	bool in_use[SYSFS_NODE_CACHE_SIZE];
+	uint32_t last_access[SYSFS_NODE_CACHE_SIZE];  /* For LRU eviction */
+	uint32_t refcount[SYSFS_NODE_CACHE_SIZE];     /* Reference count (open fids) */
 };
 
 static struct sysfs_node_cache node_cache;
+
+/* Helper: Increment node reference count */
+static void incref_node(struct ninep_fs_node *node)
+{
+	for (int i = 0; i < SYSFS_NODE_CACHE_SIZE; i++) {
+		if (node_cache.in_use[i] && &node_cache.nodes[i] == node) {
+			node_cache.refcount[i]++;
+			LOG_DBG("incref: node=%p name='%s' refcount=%u",
+			        node, node->name, node_cache.refcount[i]);
+			return;
+		}
+	}
+}
+
+/* Helper: Decrement node reference count */
+static void decref_node(struct ninep_fs_node *node)
+{
+	for (int i = 0; i < SYSFS_NODE_CACHE_SIZE; i++) {
+		if (node_cache.in_use[i] && &node_cache.nodes[i] == node) {
+			if (node_cache.refcount[i] > 0) {
+				node_cache.refcount[i]--;
+				LOG_DBG("decref: node=%p name='%s' refcount=%u",
+				        node, node->name, node_cache.refcount[i]);
+			}
+			return;
+		}
+	}
+}
+
+/* Helper: Free a node (mark as not in use) */
+static void free_node(struct ninep_fs_node *node)
+{
+	for (int i = 0; i < SYSFS_NODE_CACHE_SIZE; i++) {
+		if (node_cache.in_use[i] && &node_cache.nodes[i] == node) {
+			LOG_DBG("Freeing sysfs node: name='%s' idx=%d", node->name, i);
+			node_cache.in_use[i] = false;
+			node_cache.refcount[i] = 0;
+			node_cache.last_access[i] = 0;
+			return;
+		}
+	}
+}
 
 /* Helper: Allocate a node from cache */
 static struct ninep_fs_node *alloc_node(struct ninep_sysfs *sysfs,
                                          const char *name,
                                          bool is_dir)
 {
+	uint32_t now = k_uptime_get_32();
+	int idx = -1;
+
+	/* First pass: look for free slot */
 	for (int i = 0; i < SYSFS_NODE_CACHE_SIZE; i++) {
 		if (!node_cache.in_use[i]) {
-			struct ninep_fs_node *node = &node_cache.nodes[i];
-
-			memset(node, 0, sizeof(*node));
-			strncpy(node->name, name, sizeof(node->name) - 1);
-			node->type = is_dir ? NINEP_NODE_DIR : NINEP_NODE_FILE;
-			node->mode = is_dir ? (0755 | NINEP_DMDIR) : 0444;
-			node->qid.path = sysfs->next_qid_path++;
-			node->qid.version = 0;
-			node->qid.type = is_dir ? NINEP_QTDIR : NINEP_QTFILE;
-			node_cache.in_use[i] = true;
-
-			return node;
+			idx = i;
+			break;
 		}
 	}
 
-	return NULL;
+	/* If no free slot, evict LRU entry (but only if refcount == 0) */
+	if (idx == -1) {
+		int lru_idx = -1;
+		uint32_t oldest_time = UINT32_MAX;
+
+		for (int i = 0; i < SYSFS_NODE_CACHE_SIZE; i++) {
+			/* Skip nodes with active references */
+			if (node_cache.refcount[i] > 0) {
+				continue;
+			}
+			if (node_cache.last_access[i] < oldest_time) {
+				oldest_time = node_cache.last_access[i];
+				lru_idx = i;
+			}
+		}
+
+		if (lru_idx == -1) {
+			/* All nodes are referenced - can't evict anything! */
+			LOG_ERR("Sysfs node cache full (%d entries) and all nodes are referenced! "
+			        "Cannot allocate node '%s'. Increase SYSFS_NODE_CACHE_SIZE or "
+			        "check for resource leaks.",
+			        SYSFS_NODE_CACHE_SIZE, name);
+			return NULL;
+		}
+
+		/* Evict the LRU entry */
+		LOG_WRN("Sysfs node cache full - evicting LRU node: name='%s' last_access=%u",
+		        node_cache.nodes[lru_idx].name, node_cache.last_access[lru_idx]);
+		idx = lru_idx;
+	}
+
+	/* Allocate the node */
+	struct ninep_fs_node *node = &node_cache.nodes[idx];
+
+	memset(node, 0, sizeof(*node));
+	strncpy(node->name, name, sizeof(node->name) - 1);
+	node->type = is_dir ? NINEP_NODE_DIR : NINEP_NODE_FILE;
+	node->mode = is_dir ? (0755 | NINEP_DMDIR) : 0444;
+	node->qid.path = sysfs->next_qid_path++;
+	node->qid.version = 0;
+	node->qid.type = is_dir ? NINEP_QTDIR : NINEP_QTFILE;
+	node_cache.in_use[idx] = true;
+	node_cache.last_access[idx] = now;
+	node_cache.refcount[idx] = 0;
+
+	LOG_DBG("Allocated sysfs node: name='%s' idx=%d", name, idx);
+	return node;
 }
 
 /* Helper: Find entry by path */
@@ -198,6 +282,8 @@ static int sysfs_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 		if (mode != NINEP_OREAD && mode != NINEP_OEXEC) {
 			return -EACCES;
 		}
+		/* Success - increment refcount */
+		incref_node(node);
 		return 0;
 	}
 
@@ -206,6 +292,8 @@ static int sysfs_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 	uint8_t access_mode = mode & 0x03;  /* Keep only bottom 2 bits */
 
 	if (access_mode == NINEP_OREAD || access_mode == NINEP_OEXEC) {
+		/* Success - increment refcount */
+		incref_node(node);
 		return 0;  /* Read always allowed */
 	}
 
@@ -215,6 +303,8 @@ static int sysfs_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 			        entry, entry ? entry->writable : 0);
 			return -EACCES;  /* Not writable */
 		}
+		/* Success - increment refcount */
+		incref_node(node);
 		return 0;
 	}
 
@@ -314,7 +404,7 @@ static int sysfs_read(struct ninep_fs_node *node, uint64_t offset,
 			size_t write_offset = 0;
 			int ret = ninep_write_stat(buf + buf_offset, count - buf_offset,
 			                           &write_offset, &child_qid,
-			                           is_dir ? (0755 | NINEP_DMDIR) : 0444,
+			                           is_dir ? (0755 | NINEP_DMDIR) : ((child_entry && child_entry->writable) ? 0644 : 0444),
 			                           0,  /* length */
 			                           child_names[i], name_len);
 
@@ -391,6 +481,36 @@ static int sysfs_stat(struct ninep_fs_node *node, uint8_t *buf,
 	return offset;  /* Return number of bytes written */
 }
 
+/* Clunk (release) node */
+static int sysfs_clunk(struct ninep_fs_node *node, void *fs_ctx)
+{
+	ARG_UNUSED(fs_ctx);
+
+	LOG_DBG("sysfs_clunk: node=%p name='%s'", node, node->name);
+
+	/* Don't free the root node */
+	if (strcmp(node->name, "/") == 0) {
+		LOG_DBG("sysfs_clunk: Skipping root node");
+		return 0;
+	}
+
+	/* Decrement refcount */
+	decref_node(node);
+
+	/* Check if we should free the node */
+	for (int i = 0; i < SYSFS_NODE_CACHE_SIZE; i++) {
+		if (node_cache.in_use[i] && &node_cache.nodes[i] == node) {
+			if (node_cache.refcount[i] == 0) {
+				/* No more references - free it */
+				free_node(node);
+			}
+			break;
+		}
+	}
+
+	return 0;
+}
+
 /* Filesystem operations */
 static const struct ninep_fs_ops sysfs_ops = {
 	.get_root = sysfs_get_root,
@@ -399,6 +519,7 @@ static const struct ninep_fs_ops sysfs_ops = {
 	.read = sysfs_read,
 	.write = sysfs_write,
 	.stat = sysfs_stat,
+	.clunk = sysfs_clunk,
 	.create = NULL,
 	.remove = NULL,
 };

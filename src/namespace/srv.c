@@ -255,42 +255,27 @@ int srv_mount(const char *srv_name, const char *mnt_point, uint32_t flags)
 #define SRV_NODE_ROOT 0
 #define SRV_NODE_SERVICE 1
 
-struct srv_fs_node {
-	uint8_t type;
-	struct srv_entry *service;     /* For SERVICE nodes */
-	struct ninep_fs_node *target;  /* Target filesystem node (for delegation) */
-	uint64_t qid_path;
-};
+/* srv only allocates one node: the /srv root directory.
+ * All other nodes are from underlying filesystems (BBS, sysfs, etc.) */
+static struct ninep_fs_node *srv_root_node = NULL;
 
 static uint64_t srv_next_qid = 2;  /* 1 is reserved for root */
 
-/* Allocate a /srv filesystem node */
-static struct srv_fs_node *srv_alloc_node(uint8_t type, struct srv_entry *service)
+/* Create the /srv root directory node (only called once) */
+static struct ninep_fs_node *srv_alloc_root_node(void)
 {
-	struct srv_fs_node *node = k_malloc(sizeof(*node));
+	struct ninep_fs_node *node = k_malloc(sizeof(*node));
 	if (!node) {
 		return NULL;
 	}
 
-	node->type = type;
-	node->service = service;
-	node->target = NULL;
-	node->qid_path = (type == SRV_NODE_ROOT) ? 1 : srv_next_qid++;
-
-	/* For SERVICE nodes with local servers, get the target filesystem root */
-	if (type == SRV_NODE_SERVICE && service &&
-	    service->type == SRV_TYPE_LOCAL && service->local.server) {
-		const struct ninep_fs_ops *ops = service->local.server->config->fs_ops;
-		void *ctx = service->local.server->config->fs_ctx;
-
-		if (ops && ops->get_root) {
-			node->target = ops->get_root(ctx);
-			LOG_INF("Service node for '%s' -> target=%p (delegates to underlying FS)",
-			        service->name, node->target);
-		} else {
-			LOG_WRN("Service '%s' has no get_root operation!", service->name);
-		}
-	}
+	memset(node, 0, sizeof(*node));
+	strncpy(node->name, "", sizeof(node->name) - 1);  /* Empty name for root */
+	node->type = NINEP_NODE_DIR;
+	node->mode = 0555 | NINEP_DMDIR;
+	node->qid.type = NINEP_QTDIR;
+	node->qid.version = 0;
+	node->qid.path = 1;
 
 	return node;
 }
@@ -300,8 +285,11 @@ static struct ninep_fs_node *srv_fs_get_root(void *fs_ctx)
 {
 	ARG_UNUSED(fs_ctx);
 
-	struct srv_fs_node *node = srv_alloc_node(SRV_NODE_ROOT, NULL);
-	return (struct ninep_fs_node *)node;
+	/* Allocate root node on first call */
+	if (!srv_root_node) {
+		srv_root_node = srv_alloc_root_node();
+	}
+	return srv_root_node;
 }
 
 /* Walk to a service or deeper into service filesystem */
@@ -310,11 +298,10 @@ static struct ninep_fs_node *srv_fs_walk(struct ninep_fs_node *dir, const char *
 {
 	ARG_UNUSED(fs_ctx);
 
-	struct srv_fs_node *dir_node = (struct srv_fs_node *)dir;
+	LOG_DBG("srv_fs_walk: name='%.*s'", name_len, name);
 
-	LOG_DBG("srv_fs_walk: type=%d, name='%.*s'", dir_node->type, name_len, name);
-
-	if (dir_node->type == SRV_NODE_ROOT) {
+	/* Check if walking from /srv root */
+	if (dir == srv_root_node) {
 		/* Walking from /srv root to a service */
 		char service_name[256];
 		if (name_len >= sizeof(service_name)) {
@@ -328,51 +315,100 @@ static struct ninep_fs_node *srv_fs_walk(struct ninep_fs_node *dir, const char *
 			return NULL;
 		}
 
-		/* Create service proxy node (srv_alloc_node will set target) */
-		struct srv_fs_node *node = srv_alloc_node(SRV_NODE_SERVICE, entry);
-		LOG_DBG("Created service node for '%s', target=%p", service_name, node ? node->target : NULL);
-		return (struct ninep_fs_node *)node;
+		/* For local services, return the service's root node directly.
+		 * This avoids invalid casts and ensures union_fs tracks the actual
+		 * filesystem nodes that have proper ninep_fs_node structure. */
+		if (entry->type == SRV_TYPE_LOCAL && entry->local.server) {
+			const struct ninep_fs_ops *ops = entry->local.server->config->fs_ops;
+			void *ctx = entry->local.server->config->fs_ctx;
 
-	} else if (dir_node->type == SRV_NODE_SERVICE && dir_node->target) {
-		/* Delegate walk to target filesystem */
-		struct srv_entry *service = dir_node->service;
-		if (service->type == SRV_TYPE_LOCAL && service->local.server) {
-			const struct ninep_fs_ops *ops = service->local.server->config->fs_ops;
-			void *ctx = service->local.server->config->fs_ctx;
-
-			if (ops && ops->walk) {
-				struct ninep_fs_node *child = ops->walk(dir_node->target, name, name_len, ctx);
-				LOG_DBG("Delegated walk in '%s' -> child=%p", service->name, child);
-				return child;
+			if (ops && ops->get_root) {
+				struct ninep_fs_node *target = ops->get_root(ctx);
+				LOG_DBG("Returning service root for '%s': target=%p", service_name, target);
+				return target;
 			}
 		}
+
+		/* For network services (not yet implemented), we'd need different handling */
+		LOG_WRN("Service '%s' has no accessible root", service_name);
+		return NULL;
+
 	}
 
-	/* Otherwise, this might be a raw delegated node (e.g., BBS room node).
-	 * Try to find which service might own it. */
+	/* If dir is not srv_root_node, we need to delegate to the service that owns this node.
+	 * Walk through all services to find which one owns this node. */
 	k_mutex_lock(&global_srv_registry.lock, K_FOREVER);
+
 	struct srv_entry *entry = global_srv_registry.services;
 	while (entry) {
 		if (entry->type == SRV_TYPE_LOCAL && entry->local.server) {
 			const struct ninep_fs_ops *ops = entry->local.server->config->fs_ops;
 			void *ctx = entry->local.server->config->fs_ctx;
 
-			if (ops && ops->walk) {
-				/* Try this service - it will return NULL if it doesn't own this node */
-				struct ninep_fs_node *child = ops->walk(dir, name, name_len, ctx);
-				if (child) {
-					/* This service handled it successfully */
+			/* Check if this service's root matches our dir, or if dir is a descendant.
+			 * For simplicity, we check if the service root matches the dir pointer exactly.
+			 * For deeper nodes, we rely on the fact that BBS (and other services) will
+			 * return nodes that can be checked. */
+			if (ops && ops->get_root) {
+				struct ninep_fs_node *service_root = ops->get_root(ctx);
+				if (service_root == dir) {
+					/* Found the service that owns this node - delegate the walk */
 					k_mutex_unlock(&global_srv_registry.lock);
-					LOG_DBG("Delegated walk to service '%s' via raw node -> child=%p",
-					        entry->name, child);
-					return child;
+					if (ops->walk) {
+						LOG_DBG("Delegating walk to service '%s' filesystem", entry->name);
+						return ops->walk(dir, name, name_len, ctx);
+					}
+					LOG_WRN("Service '%s' has no walk function", entry->name);
+					return NULL;
 				}
 			}
 		}
 		entry = entry->next;
 	}
+
 	k_mutex_unlock(&global_srv_registry.lock);
 
+	/* If we couldn't find a service root match, this might be a deeper node.
+	 * Try delegating to each service - the service will return NULL if it
+	 * doesn't own the node. */
+	LOG_DBG("Node %p (%s) not a service root, trying all services", dir, dir->name);
+
+	/* We need to iterate without holding the lock during the walk call.
+	 * Collect service info first. */
+	struct {
+		const struct ninep_fs_ops *ops;
+		void *ctx;
+		char name[32];
+	} services[32];
+	int num_services = 0;
+
+	k_mutex_lock(&global_srv_registry.lock, K_FOREVER);
+	entry = global_srv_registry.services;
+	while (entry && num_services < 32) {
+		if (entry->type == SRV_TYPE_LOCAL && entry->local.server) {
+			services[num_services].ops = entry->local.server->config->fs_ops;
+			services[num_services].ctx = entry->local.server->config->fs_ctx;
+			strncpy(services[num_services].name, entry->name, sizeof(services[num_services].name) - 1);
+			services[num_services].name[sizeof(services[num_services].name) - 1] = '\0';
+			num_services++;
+		}
+		entry = entry->next;
+	}
+	k_mutex_unlock(&global_srv_registry.lock);
+
+	/* Now try each service */
+	for (int i = 0; i < num_services; i++) {
+		if (services[i].ops && services[i].ops->walk) {
+			LOG_DBG("Trying service '%s' for node %p", services[i].name, dir);
+			struct ninep_fs_node *result = services[i].ops->walk(dir, name, name_len, services[i].ctx);
+			if (result) {
+				LOG_DBG("Service '%s' handled the walk", services[i].name);
+				return result;
+			}
+		}
+	}
+
+	LOG_ERR("srv_fs_walk: No service could handle walk for node %p (%s)", dir, dir->name);
 	return NULL;
 }
 
@@ -382,46 +418,38 @@ static int srv_fs_stat(struct ninep_fs_node *node, uint8_t *buf,
 {
 	ARG_UNUSED(fs_ctx);
 
-	struct srv_fs_node *n = (struct srv_fs_node *)node;
+	/* Check if this is the srv root node */
+	if (node == srv_root_node) {
+		/* Stat the /srv directory itself */
+		size_t offset = 0;
+		int ret = ninep_write_stat(buf, buf_len, &offset, &node->qid,
+		                            node->mode, 0, node->name, strlen(node->name));
+		return (ret < 0) ? ret : offset;
+	}
 
-	/* For SERVICE nodes with targets, delegate to the target filesystem */
-	if (n->type == SRV_NODE_SERVICE && n->target && n->service) {
-		struct srv_entry *service = n->service;
-		if (service->type == SRV_TYPE_LOCAL && service->local.server) {
-			const struct ninep_fs_ops *ops = service->local.server->config->fs_ops;
-			void *ctx = service->local.server->config->fs_ctx;
+	/* Otherwise, delegate to underlying services.
+	 * Since we return target nodes directly from walk, this should normally
+	 * be handled by the service's own stat handler via union_fs delegation. */
+	k_mutex_lock(&global_srv_registry.lock, K_FOREVER);
+	struct srv_entry *entry = global_srv_registry.services;
+	while (entry) {
+		if (entry->type == SRV_TYPE_LOCAL && entry->local.server) {
+			const struct ninep_fs_ops *ops = entry->local.server->config->fs_ops;
+			void *ctx = entry->local.server->config->fs_ctx;
 
 			if (ops && ops->stat) {
-				LOG_INF("Delegating stat to service '%s' target=%p", service->name, n->target);
-				int result = ops->stat(n->target, buf, buf_len, ctx);
-				LOG_INF("Stat delegation returned %d bytes", result);
-				return result;
+				int ret = ops->stat(node, buf, buf_len, ctx);
+				if (ret >= 0 || ret != -EINVAL) {
+					k_mutex_unlock(&global_srv_registry.lock);
+					return ret;
+				}
 			}
 		}
+		entry = entry->next;
 	}
+	k_mutex_unlock(&global_srv_registry.lock);
 
-	/* Default: stat the srv node itself */
-	bool is_dir = (n->type == SRV_NODE_ROOT) ||
-	              (n->type == SRV_NODE_SERVICE && n->target != NULL);
-
-	struct ninep_qid qid = {
-		.path = n->qid_path,
-		.version = 0,
-		.type = is_dir ? NINEP_QTDIR : NINEP_QTFILE
-	};
-
-	uint32_t mode = is_dir ? (0555 | NINEP_DMDIR) : 0444;
-	const char *name = (n->type == SRV_NODE_ROOT) ? "" : n->service->name;
-	uint16_t name_len = strlen(name);
-
-	size_t offset = 0;
-	int ret = ninep_write_stat(buf, buf_len, &offset, &qid, mode, 0,
-	                            name, name_len);
-	if (ret < 0) {
-		return ret;
-	}
-
-	return offset;
+	return -ENOENT;
 }
 
 /* Open a node */
@@ -429,23 +457,33 @@ static int srv_fs_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 {
 	ARG_UNUSED(fs_ctx);
 
-	struct srv_fs_node *n = (struct srv_fs_node *)node;
-
-	/* Delegate to target filesystem if this is a service with a target */
-	if (n->type == SRV_NODE_SERVICE && n->target && n->service) {
-		struct srv_entry *service = n->service;
-		if (service->type == SRV_TYPE_LOCAL && service->local.server) {
-			const struct ninep_fs_ops *ops = service->local.server->config->fs_ops;
-			void *ctx = service->local.server->config->fs_ctx;
-
-			if (ops && ops->open) {
-				LOG_DBG("Delegating open to service '%s'", service->name);
-				return ops->open(n->target, mode, ctx);
-			}
-		}
+	/* Check if this is the srv root node */
+	if (node == srv_root_node) {
+		/* Allow opening /srv directory */
+		return 0;
 	}
 
-	/* Default: just allow opening */
+	/* Delegate to underlying services */
+	k_mutex_lock(&global_srv_registry.lock, K_FOREVER);
+	struct srv_entry *entry = global_srv_registry.services;
+	while (entry) {
+		if (entry->type == SRV_TYPE_LOCAL && entry->local.server) {
+			const struct ninep_fs_ops *ops = entry->local.server->config->fs_ops;
+			void *ctx = entry->local.server->config->fs_ctx;
+
+			if (ops && ops->open) {
+				int ret = ops->open(node, mode, ctx);
+				if (ret == 0 || ret != -EINVAL) {
+					k_mutex_unlock(&global_srv_registry.lock);
+					return ret;
+				}
+			}
+		}
+		entry = entry->next;
+	}
+	k_mutex_unlock(&global_srv_registry.lock);
+
+	/* No service claimed it, but allow opening anyway */
 	return 0;
 }
 
@@ -457,52 +495,8 @@ static int srv_fs_read(struct ninep_fs_node *node, uint64_t offset,
 
 	LOG_DBG("srv_fs_read: node=%p, offset=%llu, count=%u", node, offset, count);
 
-	struct srv_fs_node *n = (struct srv_fs_node *)node;
-
-	/* Delegate to target filesystem if this is a service with a target */
-	if (n->type == SRV_NODE_SERVICE && n->target && n->service) {
-		struct srv_entry *service = n->service;
-		if (service->type == SRV_TYPE_LOCAL && service->local.server) {
-			const struct ninep_fs_ops *ops = service->local.server->config->fs_ops;
-			void *ctx = service->local.server->config->fs_ctx;
-
-			if (ops && ops->read) {
-				LOG_DBG("Delegating read to service '%s' via srv node", service->name);
-				return ops->read(n->target, offset, buf, count, ctx);
-			}
-		}
-	}
-
-	/* Otherwise, this might be a raw delegated node (e.g., BBS room node).
-	 * Try to find which service might own it. */
-	if (n->type != SRV_NODE_ROOT) {
-		k_mutex_lock(&global_srv_registry.lock, K_FOREVER);
-		struct srv_entry *entry = global_srv_registry.services;
-		while (entry) {
-			if (entry->type == SRV_TYPE_LOCAL && entry->local.server) {
-				const struct ninep_fs_ops *ops = entry->local.server->config->fs_ops;
-				void *ctx = entry->local.server->config->fs_ctx;
-
-				if (ops && ops->read) {
-					/* Try this service - it will return -EINVAL if it doesn't own this node */
-					int ret = ops->read(node, offset, buf, count, ctx);
-					if (ret >= 0 || ret != -EINVAL) {
-						/* This service handled it (success or legitimate error) */
-						k_mutex_unlock(&global_srv_registry.lock);
-						if (ret > 0) {
-							LOG_DBG("Delegated read to service '%s' via raw node (%d bytes)",
-							        entry->name, ret);
-						}
-						return ret;
-					}
-				}
-			}
-			entry = entry->next;
-		}
-		k_mutex_unlock(&global_srv_registry.lock);
-	}
-
-	if (n->type == SRV_NODE_ROOT) {
+	/* Check if this is the srv root node */
+	if (node == srv_root_node) {
 		/* Reading directory - list services */
 		uint32_t entry_index = 0;
 		uint32_t buf_offset = 0;
@@ -569,23 +563,29 @@ static int srv_fs_read(struct ninep_fs_node *node, uint64_t offset,
 
 		k_mutex_unlock(&global_srv_registry.lock);
 		return buf_offset;
-	} else {
-		/* Reading service file - return service info */
-		const char *info = "9P service\n";
-		uint32_t info_len = strlen(info);
-
-		if (offset >= info_len) {
-			return 0;
-		}
-
-		uint32_t to_read = info_len - offset;
-		if (to_read > count) {
-			to_read = count;
-		}
-
-		memcpy(buf, info + offset, to_read);
-		return to_read;
 	}
+
+	/* Not the srv root - delegate to underlying services */
+	k_mutex_lock(&global_srv_registry.lock, K_FOREVER);
+	struct srv_entry *entry = global_srv_registry.services;
+	while (entry) {
+		if (entry->type == SRV_TYPE_LOCAL && entry->local.server) {
+			const struct ninep_fs_ops *ops = entry->local.server->config->fs_ops;
+			void *ctx = entry->local.server->config->fs_ctx;
+
+			if (ops && ops->read) {
+				int ret = ops->read(node, offset, buf, count, ctx);
+				if (ret >= 0 || ret != -EINVAL) {
+					k_mutex_unlock(&global_srv_registry.lock);
+					return ret;
+				}
+			}
+		}
+		entry = entry->next;
+	}
+	k_mutex_unlock(&global_srv_registry.lock);
+
+	return -ENOENT;
 }
 
 /* Clunk (close) a node */
@@ -593,20 +593,40 @@ static int srv_fs_clunk(struct ninep_fs_node *node, void *fs_ctx)
 {
 	ARG_UNUSED(fs_ctx);
 
-	struct srv_fs_node *n = (struct srv_fs_node *)node;
+	LOG_DBG("srv_fs_clunk: node=%p name='%s'", node, node->name);
 
-	LOG_DBG("srv_fs_clunk: node=%p", node);
-
-	/* Only free nodes we allocated (ROOT and SERVICE types)
-	 * Don't free nodes from other filesystems (returned by walk to service root)
-	 */
-	if (n->type == SRV_NODE_ROOT || n->type == SRV_NODE_SERVICE) {
-		LOG_DBG("srv_fs_clunk: freeing srv node type=%d", n->type);
-		k_free(node);
-	} else {
-		LOG_DBG("srv_fs_clunk: not freeing - not an srv node");
+	/* Check if this is the srv root - DON'T free it, it's reused */
+	if (node == srv_root_node) {
+		LOG_DBG("srv_fs_clunk: srv root clunked (not freeing, will be reused)");
+		return 0;
 	}
 
+	/* For all other nodes, they belong to underlying services.
+	 * Delegate clunk to the owning service. */
+	k_mutex_lock(&global_srv_registry.lock, K_FOREVER);
+	struct srv_entry *entry = global_srv_registry.services;
+	while (entry) {
+		if (entry->type == SRV_TYPE_LOCAL && entry->local.server) {
+			const struct ninep_fs_ops *ops = entry->local.server->config->fs_ops;
+			void *ctx = entry->local.server->config->fs_ctx;
+
+			if (ops && ops->clunk) {
+				/* Try this service's clunk - it will return error if it doesn't own the node */
+				int ret = ops->clunk(node, ctx);
+				if (ret == 0 || ret != -EINVAL) {
+					/* This service handled it */
+					k_mutex_unlock(&global_srv_registry.lock);
+					LOG_DBG("Delegated clunk to service '%s'", entry->name);
+					return ret;
+				}
+			}
+		}
+		entry = entry->next;
+	}
+	k_mutex_unlock(&global_srv_registry.lock);
+
+	/* No service claimed this node - it might be a node without clunk handler */
+	LOG_DBG("srv_fs_clunk: no service claimed node '%s'", node->name);
 	return 0;
 }
 
@@ -617,24 +637,7 @@ static int srv_fs_write(struct ninep_fs_node *node, uint64_t offset,
 {
 	ARG_UNUSED(fs_ctx);
 
-	struct srv_fs_node *srv_node = (struct srv_fs_node *)node;
-
-	/* If this is an srv service node, delegate through the target */
-	if (srv_node->type == SRV_NODE_SERVICE && srv_node->target && srv_node->service) {
-		struct srv_entry *service = srv_node->service;
-		if (service->type == SRV_TYPE_LOCAL && service->local.server) {
-			const struct ninep_fs_ops *ops = service->local.server->config->fs_ops;
-			void *ctx = service->local.server->config->fs_ctx;
-
-			if (ops && ops->write) {
-				LOG_DBG("Delegating write to service '%s' via srv node", service->name);
-				return ops->write(srv_node->target, offset, buf, count, uname, ctx);
-			}
-		}
-	}
-
-	/* Otherwise, this might be a raw delegated node (e.g., BBS message node).
-	 * Try to find which service might own it. */
+	/* Delegate to underlying services */
 	k_mutex_lock(&global_srv_registry.lock, K_FOREVER);
 	struct srv_entry *entry = global_srv_registry.services;
 	while (entry) {
@@ -643,14 +646,9 @@ static int srv_fs_write(struct ninep_fs_node *node, uint64_t offset,
 			void *ctx = entry->local.server->config->fs_ctx;
 
 			if (ops && ops->write) {
-				/* Try this service - it will return -EINVAL if it doesn't own this node */
 				int ret = ops->write(node, offset, buf, count, uname, ctx);
 				if (ret >= 0 || ret != -EINVAL) {
-					/* This service handled it (success or legitimate error) */
 					k_mutex_unlock(&global_srv_registry.lock);
-					if (ret > 0) {
-						LOG_DBG("Delegated write to service '%s' via raw node", entry->name);
-					}
 					return ret;
 				}
 			}
@@ -662,7 +660,7 @@ static int srv_fs_write(struct ninep_fs_node *node, uint64_t offset,
 	return -EROFS;
 }
 
-/* Other operations not supported */
+/* Create operation - delegate to underlying service */
 static int srv_fs_create(struct ninep_fs_node *dir, const char *name,
                          uint16_t name_len, uint32_t perm, uint8_t mode,
                          const char *uname, struct ninep_fs_node **child,
@@ -670,25 +668,7 @@ static int srv_fs_create(struct ninep_fs_node *dir, const char *name,
 {
 	ARG_UNUSED(fs_ctx);
 
-	struct srv_fs_node *dir_node = (struct srv_fs_node *)dir;
-
-	/* If this is an srv service node, delegate through the target */
-	if (dir_node->type == SRV_NODE_SERVICE && dir_node->target && dir_node->service) {
-		struct srv_entry *service = dir_node->service;
-		if (service->type == SRV_TYPE_LOCAL && service->local.server) {
-			const struct ninep_fs_ops *ops = service->local.server->config->fs_ops;
-			void *ctx = service->local.server->config->fs_ctx;
-
-			if (ops && ops->create) {
-				LOG_DBG("Delegating create to service '%s' via srv node", service->name);
-				return ops->create(dir_node->target, name, name_len, perm,
-				                   mode, uname, child, ctx);
-			}
-		}
-	}
-
-	/* Otherwise, this might be a raw delegated node (e.g., BBS node inside /srv/bbs).
-	 * Try to find which service might own it by checking all services. */
+	/* Delegate to underlying services */
 	k_mutex_lock(&global_srv_registry.lock, K_FOREVER);
 	struct srv_entry *entry = global_srv_registry.services;
 	while (entry) {
@@ -697,15 +677,10 @@ static int srv_fs_create(struct ninep_fs_node *dir, const char *name,
 			void *ctx = entry->local.server->config->fs_ctx;
 
 			if (ops && ops->create) {
-				/* Try this service - it will return -EINVAL if it doesn't own this node */
 				int ret = ops->create(dir, name, name_len, perm,
 				                      mode, uname, child, ctx);
 				if (ret != -EINVAL) {
-					/* This service handled it (success or legitimate error) */
 					k_mutex_unlock(&global_srv_registry.lock);
-					if (ret == 0) {
-						LOG_DBG("Delegated create to service '%s' via raw node", entry->name);
-					}
 					return ret;
 				}
 			}

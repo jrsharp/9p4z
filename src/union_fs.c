@@ -128,15 +128,53 @@ static void unregister_node_owner(struct ninep_union_fs *fs,
 	}
 }
 
+static void incref_node(struct ninep_union_fs *fs, struct ninep_fs_node *node)
+{
+	/* Find the node in tracking table and increment refcount */
+	for (size_t i = 0; i < fs->num_node_owners; i++) {
+		if (fs->node_owners[i].node == node) {
+			fs->node_owners[i].refcount++;
+			LOG_DBG("incref: node=%p name='%s' refcount=%u",
+			        node, node->name, fs->node_owners[i].refcount);
+			return;
+		}
+	}
+	LOG_DBG("incref: node=%p name='%s' not in tracking table (mount root or union root)",
+	        node, node->name);
+}
+
+static void decref_node(struct ninep_union_fs *fs, struct ninep_fs_node *node)
+{
+	/* Find the node in tracking table and decrement refcount */
+	for (size_t i = 0; i < fs->num_node_owners; i++) {
+		if (fs->node_owners[i].node == node) {
+			if (fs->node_owners[i].refcount > 0) {
+				fs->node_owners[i].refcount--;
+				LOG_DBG("decref: node=%p name='%s' refcount=%u",
+				        node, node->name, fs->node_owners[i].refcount);
+			} else {
+				LOG_WRN("decref: node=%p name='%s' already has refcount=0!",
+				        node, node->name);
+			}
+			return;
+		}
+	}
+	LOG_DBG("decref: node=%p name='%s' not in tracking table (mount root or union root)",
+	        node, node->name);
+}
+
 static void register_node_owner(struct ninep_union_fs *fs,
                                  struct ninep_fs_node *node,
                                  struct ninep_union_mount *mount)
 {
+	uint32_t now = k_uptime_get_32();
+
 	/* Check if already registered */
 	for (size_t i = 0; i < fs->num_node_owners; i++) {
 		if (fs->node_owners[i].node == node) {
-			/* Already registered, update mount */
+			/* Already registered, update mount and timestamp */
 			fs->node_owners[i].mount = mount;
+			fs->node_owners[i].last_access = now;
 			return;
 		}
 	}
@@ -145,12 +183,48 @@ static void register_node_owner(struct ninep_union_fs *fs,
 	if (fs->num_node_owners < ARRAY_SIZE(fs->node_owners)) {
 		fs->node_owners[fs->num_node_owners].node = node;
 		fs->node_owners[fs->num_node_owners].mount = mount;
+		fs->node_owners[fs->num_node_owners].last_access = now;
+		fs->node_owners[fs->num_node_owners].refcount = 0;
 		fs->num_node_owners++;
 		LOG_DBG("Registered node=%p name='%s' -> mount '%s' (total=%zu)",
 		        node, node->name, mount->path, fs->num_node_owners);
-	} else {
-		LOG_WRN("Node ownership table full! Cannot track node=%p", node);
+		return;
 	}
+
+	/* Table is full - evict LRU entry (but only if refcount == 0) */
+	size_t lru_idx = SIZE_MAX;
+	uint32_t oldest_time = UINT32_MAX;
+
+	for (size_t i = 0; i < fs->num_node_owners; i++) {
+		/* Skip nodes with active references */
+		if (fs->node_owners[i].refcount > 0) {
+			continue;
+		}
+
+		if (fs->node_owners[i].last_access < oldest_time) {
+			oldest_time = fs->node_owners[i].last_access;
+			lru_idx = i;
+		}
+	}
+
+	if (lru_idx == SIZE_MAX) {
+		/* All nodes are referenced - can't evict anything! */
+		LOG_ERR("Node table full (%zu entries) and all nodes are referenced! Cannot register node=%p name='%s'",
+		        fs->num_node_owners, node, node->name);
+		return;
+	}
+
+	LOG_INF("Node table full (%zu entries) - evicting LRU entry: node=%p name='%s' (age=%u ms, refcount=0)",
+	        fs->num_node_owners,
+	        fs->node_owners[lru_idx].node,
+	        fs->node_owners[lru_idx].node->name,
+	        now - oldest_time);
+
+	/* Replace LRU entry with new node */
+	fs->node_owners[lru_idx].node = node;
+	fs->node_owners[lru_idx].mount = mount;
+	fs->node_owners[lru_idx].last_access = now;
+	fs->node_owners[lru_idx].refcount = 0;
 }
 
 static struct ninep_union_mount *find_node_owner(struct ninep_union_fs *fs,
@@ -173,6 +247,8 @@ static struct ninep_union_mount *find_node_owner(struct ninep_union_fs *fs,
 	/* First check the ownership tracking table */
 	for (size_t i = 0; i < fs->num_node_owners; i++) {
 		if (fs->node_owners[i].node == node) {
+			/* Update access timestamp (LRU touch) */
+			fs->node_owners[i].last_access = k_uptime_get_32();
 			LOG_DBG("  Found in tracking table -> mount '%s'",
 			        fs->node_owners[i].mount->path);
 			return fs->node_owners[i].mount;
@@ -538,7 +614,14 @@ static int union_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 		return -ENOTSUP;
 	}
 
-	return mount->fs_ops->open(node, mode, mount->fs_ctx);
+	int ret = mount->fs_ops->open(node, mode, mount->fs_ctx);
+
+	/* If open succeeded, increment refcount */
+	if (ret == 0) {
+		incref_node(fs, node);
+	}
+
+	return ret;
 }
 
 static int union_write(struct ninep_fs_node *node, uint64_t offset,
@@ -668,10 +751,27 @@ static int union_clunk(struct ninep_fs_node *node, void *fs_ctx)
 		return 0;
 	}
 
+	/* Decrement refcount first */
+	decref_node(fs, node);
+
 	/* Only delegate if backend has a clunk handler */
 	if (mount->fs_ops->clunk) {
-		/* Unregister from tracking BEFORE delegating (backend will free the node) */
-		unregister_node_owner(fs, node);
+		/* Check if refcount is now 0 - if so, we can unregister and free */
+		bool should_unregister = false;
+		for (size_t i = 0; i < fs->num_node_owners; i++) {
+			if (fs->node_owners[i].node == node) {
+				if (fs->node_owners[i].refcount == 0) {
+					should_unregister = true;
+				}
+				break;
+			}
+		}
+
+		/* Only unregister if refcount reached 0 (no more fids reference it) */
+		if (should_unregister) {
+			unregister_node_owner(fs, node);
+		}
+
 		return mount->fs_ops->clunk(node, mount->fs_ctx);
 	}
 

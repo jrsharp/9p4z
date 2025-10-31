@@ -87,6 +87,7 @@ struct bbs_message {
 	uint32_t id;                                     /* Message number */
 	char from[CONFIG_9BBS_MAX_USERNAME_LEN];         /* Author */
 	char to[CONFIG_9BBS_MAX_ROOMNAME_LEN];           /* Room name */
+	char subject[128];                               /* Subject line */
 	uint64_t date;                                   /* Unix timestamp */
 	uint32_t reply_to;                               /* Reply to message # (0 = none) */
 	char *body;                                      /* Message body (dynamically allocated) */

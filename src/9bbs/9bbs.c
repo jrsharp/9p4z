@@ -50,10 +50,10 @@ static int save_message_to_lfs(const char *room_name, const struct bbs_message *
 	}
 
 	/* Write message headers */
-	char header[256];
+	char header[384];
 	int len = snprintf(header, sizeof(header),
-	                   "From: %s\nTo: %s\nDate: %llu\nReply-To: %u\n\n",
-	                   msg->from, msg->to, msg->date, msg->reply_to);
+	                   "From: %s\nTo: %s\nSubject: %s\nDate: %llu\nReply-To: %u\n\n",
+	                   msg->from, msg->to, msg->subject, msg->date, msg->reply_to);
 
 	ret = fs_write(&file, header, len);
 	if (ret < 0) {
@@ -165,6 +165,8 @@ static int load_message_from_lfs_by_filename(const char *room_name, const char *
 			strncpy(msg->from, line + 6, sizeof(msg->from) - 1);
 		} else if (strncmp(line, "To: ", 4) == 0) {
 			strncpy(msg->to, line + 4, sizeof(msg->to) - 1);
+		} else if (strncmp(line, "Subject: ", 9) == 0) {
+			strncpy(msg->subject, line + 9, sizeof(msg->subject) - 1);
 		} else if (strncmp(line, "Date: ", 6) == 0) {
 			msg->date = strtoull(line + 6, NULL, 10);
 		} else if (strncmp(line, "Reply-To: ", 10) == 0) {
@@ -535,6 +537,7 @@ int bbs_post_message(struct bbs_instance *bbs, const char *room_name,
 	msg->id = room->next_message_id++;
 	strncpy(msg->from, from, sizeof(msg->from) - 1);
 	strncpy(msg->to, room_name, sizeof(msg->to) - 1);
+	msg->subject[0] = '\0';  /* No subject for messages created via post */
 
 	/* Set timestamp: try date_time library first, fallback to uptime */
 #ifdef CONFIG_DATE_TIME
@@ -650,6 +653,9 @@ enum bbs_node_type {
 	BBS_NODE_ROOMLIST_FILE,
 };
 
+/* Cached root node - allocated once, reused forever (like srv.c does) */
+static struct ninep_fs_node *bbs_root_node = NULL;
+
 /**
  * @brief Create filesystem node for BBS
  */
@@ -682,7 +688,16 @@ static struct ninep_fs_node *bbs_create_node(enum bbs_node_type type,
 
 static struct ninep_fs_node *bbs_get_root(void *fs_ctx)
 {
-	return bbs_create_node(BBS_NODE_ROOT, "/", fs_ctx);
+	/* Allocate root node on first call, then reuse it forever */
+	if (!bbs_root_node) {
+		bbs_root_node = bbs_create_node(BBS_NODE_ROOT, "/", fs_ctx);
+		if (bbs_root_node) {
+			LOG_DBG("Allocated BBS root node: %p", bbs_root_node);
+		} else {
+			LOG_ERR("Failed to allocate BBS root node");
+		}
+	}
+	return bbs_root_node;
 }
 
 static struct ninep_fs_node *bbs_walk(struct ninep_fs_node *parent,
@@ -811,13 +826,14 @@ static int bbs_read(struct ninep_fs_node *node, uint64_t offset,
 		int len = snprintf(temp, sizeof(temp),
 		                   "From: %s\n"
 		                   "To: %s\n"
+		                   "Subject: %s\n"
 		                   "Date: %llu\n"
 		                   "X-Date-N: %llu\n"
 		                   "\n"
 		                   "%s\n"
 		                   "\n"
 		                   "%s\n",
-		                   msg->from, msg->to,
+		                   msg->from, msg->to, msg->subject,
 		                   (unsigned long long)msg->date,
 		                   (unsigned long long)msg->date,
 		                   msg->body ? msg->body : "",
@@ -1110,6 +1126,65 @@ static int bbs_write(struct ninep_fs_node *node, uint64_t offset,
 	LOG_INF("Wrote %zu bytes to message %u (offset=%llu): '%.*s'",
 	        to_write, msg->id, offset, (int)to_write, buf);
 
+	/* Parse headers from the message body (RFC-822 style) */
+	char *body_start = msg->body;
+	char *line = body_start;
+	char *body_content = body_start;  /* Will point to actual body after headers */
+
+	while (line && *line) {
+		char *next_line = strchr(line, '\n');
+		size_t line_len = next_line ? (next_line - line) : strlen(line);
+
+		/* Empty line marks end of headers */
+		if (line_len == 0 || (line_len == 1 && line[0] == '\r')) {
+			body_content = next_line ? (next_line + 1) : (line + line_len);
+			break;
+		}
+
+		/* Parse header: "Header: value" */
+		char *colon = memchr(line, ':', line_len);
+		if (colon && colon > line) {
+			size_t header_name_len = colon - line;
+			char *value = colon + 1;
+
+			/* Skip leading whitespace in value */
+			while (value < line + line_len && (*value == ' ' || *value == '\t')) {
+				value++;
+			}
+
+			size_t value_len = (line + line_len) - value;
+			/* Remove trailing \r if present */
+			if (value_len > 0 && value[value_len - 1] == '\r') {
+				value_len--;
+			}
+
+			/* Extract Subject header */
+			if (header_name_len == 7 && strncmp(line, "Subject", 7) == 0) {
+				size_t copy_len = (value_len < sizeof(msg->subject) - 1) ?
+				                  value_len : sizeof(msg->subject) - 1;
+				memcpy(msg->subject, value, copy_len);
+				msg->subject[copy_len] = '\0';
+				LOG_DBG("Parsed Subject: '%s'", msg->subject);
+			}
+		}
+
+		line = next_line ? (next_line + 1) : NULL;
+	}
+
+	/* If we parsed headers, adjust body_len to exclude them */
+	if (body_content > body_start) {
+		size_t header_size = body_content - body_start;
+		if (msg->body_len > header_size) {
+			/* Move body content to start of buffer */
+			size_t actual_body_len = msg->body_len - header_size;
+			memmove(body_start, body_content, actual_body_len);
+			body_start[actual_body_len] = '\0';
+			msg->body_len = actual_body_len;
+			LOG_DBG("Extracted headers (%zu bytes), body now %zu bytes",
+			        header_size, actual_body_len);
+		}
+	}
+
 #ifdef CONFIG_FILE_SYSTEM_LITTLEFS
 	/* Persist updated message to LittleFS */
 	int ret = save_message_to_lfs(msg->to, msg);
@@ -1282,7 +1357,15 @@ static int bbs_remove(struct ninep_fs_node *node, void *fs_ctx)
 
 static int bbs_clunk(struct ninep_fs_node *node, void *fs_ctx)
 {
-	/* Free the node */
+	ARG_UNUSED(fs_ctx);
+
+	/* DON'T free the root node - it's cached and reused */
+	if (node == bbs_root_node) {
+		LOG_DBG("bbs_clunk: Root node clunked (not freeing, will be reused)");
+		return 0;
+	}
+
+	/* Free all other nodes */
 	k_free(node);
 	return 0;
 }

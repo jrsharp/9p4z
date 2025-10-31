@@ -37,6 +37,8 @@ struct ninep_union_mount {
 struct ninep_node_owner {
 	struct ninep_fs_node *node;
 	struct ninep_union_mount *mount;
+	uint32_t last_access;  /* For LRU eviction */
+	uint32_t refcount;     /* Reference count (open fids) */
 };
 
 /**
@@ -58,8 +60,8 @@ struct ninep_union_fs {
 	struct ninep_fs_node *root;         /* Synthetic root directory */
 	uint64_t next_qid_path;             /* Next QID for synthetic nodes */
 
-	/* Node ownership tracking (for non-root nodes) */
-	struct ninep_node_owner node_owners[128];  /* Track up to 128 nodes */
+	/* Node ownership tracking (for non-root nodes) - LRU cache */
+	struct ninep_node_owner node_owners[128];  /* LRU cache of 128 nodes */
 	size_t num_node_owners;
 };
 
