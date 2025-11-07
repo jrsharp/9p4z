@@ -75,5 +75,8 @@ endif() # CONFIG_NAMESPACE
 
 # 9bbs - Plan 9-style BBS
 if(CONFIG_NINEP_9BBS)
-  zephyr_library_sources(src/9bbs/9bbs.c)
+  zephyr_library_sources(
+    src/9bbs/9bbs.c
+    src/9bbs/chat.c
+  )
 endif() # CONFIG_NINEP_9BBS

@@ -8,6 +8,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/9p/server.h>
+#include <zephyr/9bbs/chat.h>
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -126,6 +127,7 @@ struct bbs_user {
 	struct bbs_user_room rooms[CONFIG_9BBS_MAX_ROOMS];
 	uint32_t room_count;
 	bool active;
+	bool is_admin;  /* True if user is sysop/admin */
 };
 
 /**
@@ -137,6 +139,21 @@ struct bbs_instance {
 
 	struct bbs_user users[CONFIG_9BBS_MAX_USERS];
 	uint32_t user_count;
+
+	bool allow_registration;  /* True if open registration enabled (no users yet) */
+
+	/* Metadata (writable by admin via /etc/ files) */
+	char boardname[64];
+	char sysop[64];
+	char motd[256];
+	char location[128];
+	char description[256];
+
+	/* Current authenticated user (for permission checks) */
+	char authenticated_user[CONFIG_9BBS_MAX_USERNAME_LEN];
+
+	/* Chat subsystem */
+	struct chat_instance chat;
 
 	struct k_mutex lock;  /* Protects the entire BBS state */
 };

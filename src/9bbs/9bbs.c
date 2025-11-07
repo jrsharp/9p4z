@@ -22,10 +22,42 @@
 
 LOG_MODULE_REGISTER(bbs, CONFIG_NINEP_LOG_LEVEL);
 
+/* TODO Phase 2: Cryptographic Signature Verification
+ *
+ * Future enhancement to support cryptographic signatures on messages, allowing
+ * users to post with verified identities from any client:
+ *
+ * 1. Public Key Storage:
+ *    - Add /etc/pubkeys/ directory for storing user public keys
+ *    - Keys stored as PEM or DER format (Ed25519, ECDSA P-256)
+ *    - One file per user: /etc/pubkeys/<username>
+ *
+ * 2. Signature Verification:
+ *    - Extract PGP-style signature blocks from message bodies
+ *    - Verify using PSA Crypto API (psa_verify_message)
+ *    - Support Ed25519 and ECDSA P-256 signatures
+ *
+ * 3. Authentication Flow:
+ *    - First post from user: Submit public key + signed challenge
+ *    - Server stores public key in /etc/pubkeys/<username>
+ *    - Subsequent posts: Include signature in message body
+ *    - Server verifies signature against stored public key
+ *
+ * 4. Integration Points:
+ *    - bbs_post_message(): Verify signature before accepting message
+ *    - bbs_create_user(): Accept public key during registration
+ *    - Add 'verified' flag to struct bbs_message
+ *
+ * References:
+ *    - Zephyr PSA Crypto: https://docs.zephyrproject.org/latest/services/crypto/index.html
+ *    - Nordic PSA driver: nrf_security library in NCS
+ */
+
 /* LittleFS mount point */
 #ifdef CONFIG_FILE_SYSTEM_LITTLEFS
 #define BBS_LFS_MOUNT_POINT "/lfs_bbs"
 #define BBS_ROOMS_PATH BBS_LFS_MOUNT_POINT "/rooms"
+#define BBS_ETC_PATH BBS_LFS_MOUNT_POINT "/etc"
 #endif
 
 /* ========================================================================
@@ -312,6 +344,92 @@ static int load_room_from_lfs(struct bbs_instance *bbs, const char *room_name)
 	return 0;
 }
 
+/* Save metadata to LittleFS */
+static int save_metadata_to_lfs(struct bbs_instance *bbs)
+{
+	int ret;
+
+	/* Ensure /etc directory exists */
+	ret = fs_mkdir(BBS_ETC_PATH);
+	if (ret < 0 && ret != -EEXIST) {
+		LOG_ERR("Failed to create %s: %d", BBS_ETC_PATH, ret);
+		return ret;
+	}
+
+	/* Save each metadata field to a separate file */
+	const char *filenames[] = {"boardname", "sysop", "motd", "location", "description"};
+	const char *values[] = {bbs->boardname, bbs->sysop, bbs->motd,
+	                        bbs->location, bbs->description};
+
+	for (size_t i = 0; i < 5; i++) {
+		char path[128];
+		snprintf(path, sizeof(path), "%s/%s", BBS_ETC_PATH, filenames[i]);
+
+		struct fs_file_t file;
+		fs_file_t_init(&file);
+
+		ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
+		if (ret < 0) {
+			LOG_ERR("Failed to open %s: %d", path, ret);
+			continue;  /* Try to save other fields */
+		}
+
+		size_t len = strlen(values[i]);
+		if (len > 0) {
+			ret = fs_write(&file, values[i], len);
+			if (ret < 0) {
+				LOG_ERR("Failed to write %s: %d", path, ret);
+			}
+		}
+
+		fs_close(&file);
+	}
+
+	LOG_DBG("Saved metadata to LittleFS");
+	return 0;
+}
+
+/* Load metadata from LittleFS */
+static int load_metadata_from_lfs(struct bbs_instance *bbs)
+{
+	struct fs_file_t file;
+	char buf[256];
+	int ret;
+
+	const char *filenames[] = {"boardname", "sysop", "motd", "location", "description"};
+	char *targets[] = {bbs->boardname, bbs->sysop, bbs->motd,
+	                   bbs->location, bbs->description};
+	size_t target_sizes[] = {sizeof(bbs->boardname), sizeof(bbs->sysop),
+	                          sizeof(bbs->motd), sizeof(bbs->location),
+	                          sizeof(bbs->description)};
+
+	for (size_t i = 0; i < 5; i++) {
+		char path[128];
+		snprintf(path, sizeof(path), "%s/%s", BBS_ETC_PATH, filenames[i]);
+
+		fs_file_t_init(&file);
+		ret = fs_open(&file, path, FS_O_READ);
+		if (ret < 0) {
+			continue;  /* File doesn't exist, use default */
+		}
+
+		/* Read file content */
+		ret = fs_read(&file, buf, sizeof(buf) - 1);
+		fs_close(&file);
+
+		if (ret > 0) {
+			buf[ret] = '\0';  /* Null terminate */
+			/* Copy to target, respecting size */
+			size_t copy_len = (ret < target_sizes[i] - 1) ? ret : target_sizes[i] - 1;
+			memcpy(targets[i], buf, copy_len);
+			targets[i][copy_len] = '\0';
+			LOG_DBG("Loaded %s: '%s'", filenames[i], targets[i]);
+		}
+	}
+
+	return 0;
+}
+
 #endif /* CONFIG_FILE_SYSTEM_LITTLEFS */
 
 /* ========================================================================
@@ -380,6 +498,9 @@ int bbs_init(struct bbs_instance *bbs)
 		} else {
 			LOG_WRN("Failed to open rooms directory: %d", ret);
 		}
+
+		/* Load metadata from LittleFS */
+		load_metadata_from_lfs(bbs);
 	} else {
 		LOG_WRN("LittleFS not available at %s (ret=%d), running in RAM-only mode",
 		        BBS_LFS_MOUNT_POINT, ret);
@@ -392,6 +513,45 @@ int bbs_init(struct bbs_instance *bbs)
 	if (ret < 0 && ret != -EEXIST) {
 		LOG_ERR("Failed to create lobby: %d", ret);
 		return ret;
+	}
+
+	/* Enable registration if no users exist */
+	if (bbs->user_count == 0) {
+		bbs->allow_registration = true;
+		LOG_WRN("BBS has no users - first user will become SysOp");
+	} else {
+		bbs->allow_registration = false;
+		LOG_INF("BBS has %u user(s) - registration disabled", bbs->user_count);
+	}
+
+	/* Initialize authenticated user (empty = no auth yet) */
+	bbs->authenticated_user[0] = '\0';
+
+	/* Initialize chat subsystem */
+	ret = chat_init(&bbs->chat);
+	if (ret < 0) {
+		LOG_ERR("Failed to initialize chat: %d", ret);
+		return ret;
+	}
+	LOG_INF("Chat subsystem initialized");
+
+	/* Initialize metadata with defaults if not set */
+	if (bbs->boardname[0] == '\0') {
+		strncpy(bbs->boardname, "9BBS", sizeof(bbs->boardname) - 1);
+	}
+	if (bbs->sysop[0] == '\0') {
+		strncpy(bbs->sysop, "sysop", sizeof(bbs->sysop) - 1);
+	}
+	if (bbs->motd[0] == '\0') {
+		strncpy(bbs->motd, "Welcome to 9BBS - A Plan 9 style BBS for Zephyr",
+		        sizeof(bbs->motd) - 1);
+	}
+	if (bbs->location[0] == '\0') {
+		strncpy(bbs->location, "Cyberspace", sizeof(bbs->location) - 1);
+	}
+	if (bbs->description[0] == '\0') {
+		strncpy(bbs->description, "A 9P bulletin board system",
+		        sizeof(bbs->description) - 1);
 	}
 
 	LOG_INF("BBS initialized with %u rooms", bbs->room_count);
@@ -488,6 +648,15 @@ int bbs_create_user(struct bbs_instance *bbs, const char *username,
 	user->room_count = 0;
 	user->active = true;
 
+	/* First user becomes sysop */
+	if (bbs->user_count == 0) {
+		user->is_admin = true;
+		bbs->allow_registration = false;  /* Disable registration after first user */
+		LOG_INF("First user '%s' registered as SysOp", username);
+	} else {
+		user->is_admin = false;
+	}
+
 	/* Initialize read positions for all rooms */
 	for (uint32_t i = 0; i < bbs->room_count; i++) {
 		strncpy(user->rooms[i].room, bbs->rooms[i].name,
@@ -500,8 +669,34 @@ int bbs_create_user(struct bbs_instance *bbs, const char *username,
 
 	k_mutex_unlock(&bbs->lock);
 
-	LOG_INF("Created user: %s", username);
+	LOG_INF("Created user: %s (admin=%d)", username, user->is_admin);
 	return 0;
+}
+
+/**
+ * @brief Check if a user is an administrator
+ *
+ * Helper function to look up a user by name and check their admin status.
+ * Used for permission checking on administrative operations.
+ *
+ * @param bbs BBS instance
+ * @param username Username to check
+ * @return true if user exists and is admin, false otherwise
+ */
+static bool bbs_is_user_admin(struct bbs_instance *bbs, const char *username)
+{
+	if (!bbs || !username) {
+		return false;
+	}
+
+	for (uint32_t i = 0; i < bbs->user_count; i++) {
+		if (bbs->users[i].active &&
+		    strcmp(bbs->users[i].username, username) == 0) {
+			return bbs->users[i].is_admin;
+		}
+	}
+
+	return false;  /* User not found or not admin */
 }
 
 int bbs_post_message(struct bbs_instance *bbs, const char *room_name,
@@ -538,6 +733,14 @@ int bbs_post_message(struct bbs_instance *bbs, const char *room_name,
 	strncpy(msg->from, from, sizeof(msg->from) - 1);
 	strncpy(msg->to, room_name, sizeof(msg->to) - 1);
 	msg->subject[0] = '\0';  /* No subject for messages created via post */
+
+	/* TODO Phase 2: Verify cryptographic signature on message body
+	 * - Extract signature from message body (e.g., PGP signature block)
+	 * - Verify signature matches claimed 'from' user's public key
+	 * - Use PSA Crypto API for signature verification (ECDSA, Ed25519)
+	 * - Reject messages with invalid or missing signatures
+	 * - Store verified identity flag in message metadata
+	 */
 
 	/* Set timestamp: try date_time library first, fallback to uptime */
 #ifdef CONFIG_DATE_TIME
@@ -651,6 +854,10 @@ enum bbs_node_type {
 	BBS_NODE_ETC_FILE,
 	BBS_NODE_ETC_NETS_DIR,
 	BBS_NODE_ROOMLIST_FILE,
+	BBS_NODE_CHAT_DIR,        /* /chat directory */
+	BBS_NODE_CHAT_ROOM,       /* /chat/lobby (blocking read stream) */
+	BBS_NODE_CHAT_POST,       /* /chat/post (write-only) */
+	BBS_NODE_CHAT_USERS,      /* /chat/users (list active users) */
 };
 
 /* Cached root node - allocated once, reused forever (like srv.c does) */
@@ -716,12 +923,14 @@ static struct ninep_fs_node *bbs_walk(struct ninep_fs_node *parent,
 
 	enum bbs_node_type parent_type = (enum bbs_node_type)((uint64_t)parent->qid.path >> 32);
 
-	/* ROOT directory - walk to "etc" or "rooms" */
+	/* ROOT directory - walk to "etc", "rooms", or "chat" */
 	if (parent_type == BBS_NODE_ROOT) {
 		if (strcmp(name_str, "etc") == 0) {
 			return bbs_create_node(BBS_NODE_ETC_DIR, "etc", fs_ctx);
 		} else if (strcmp(name_str, "rooms") == 0) {
 			return bbs_create_node(BBS_NODE_ROOMS_DIR, "rooms", fs_ctx);
+		} else if (strcmp(name_str, "chat") == 0) {
+			return bbs_create_node(BBS_NODE_CHAT_DIR, "chat", fs_ctx);
 		}
 	}
 
@@ -773,7 +982,7 @@ static struct ninep_fs_node *bbs_walk(struct ninep_fs_node *parent,
 
 	/* ETC directory - walk to metadata files or nets subdirectory */
 	if (parent_type == BBS_NODE_ETC_DIR) {
-		const char *etc_files[] = {"boardname", "sysop", "motd", "location", "description", "version"};
+		const char *etc_files[] = {"boardname", "sysop", "motd", "location", "description", "version", "registration"};
 		for (size_t i = 0; i < sizeof(etc_files) / sizeof(etc_files[0]); i++) {
 			if (strcmp(name_str, etc_files[i]) == 0) {
 				return bbs_create_node(BBS_NODE_ETC_FILE, name_str, (void *)etc_files[i]);
@@ -791,6 +1000,28 @@ static struct ninep_fs_node *bbs_walk(struct ninep_fs_node *parent,
 			if (strcmp(name_str, net_files[i]) == 0) {
 				return bbs_create_node(BBS_NODE_ETC_FILE, name_str, (void *)net_files[i]);
 			}
+		}
+	}
+
+	/* CHAT directory - walk to post, users, or chat rooms */
+	if (parent_type == BBS_NODE_CHAT_DIR) {
+		if (strcmp(name_str, "post") == 0) {
+			return bbs_create_node(BBS_NODE_CHAT_POST, "post", fs_ctx);
+		} else if (strcmp(name_str, "users") == 0) {
+			return bbs_create_node(BBS_NODE_CHAT_USERS, "users", fs_ctx);
+		} else {
+			/* Try to find chat room by name */
+			k_mutex_lock(&bbs->lock, K_FOREVER);
+			for (uint32_t i = 0; i < bbs->chat.room_count; i++) {
+				struct chat_room *room = &bbs->chat.rooms[i];
+				if (strcmp(room->name, name_str) == 0 && room->active) {
+					struct ninep_fs_node *node = bbs_create_node(
+						BBS_NODE_CHAT_ROOM, room->name, room);
+					k_mutex_unlock(&bbs->lock);
+					return node;
+				}
+			}
+			k_mutex_unlock(&bbs->lock);
 		}
 	}
 
@@ -848,52 +1079,61 @@ static int bbs_read(struct ninep_fs_node *node, uint64_t offset,
 		return to_copy;
 
 	} else if (type == BBS_NODE_ETC_FILE) {
-		/* Read /etc/ file from LittleFS */
-#ifdef CONFIG_FILE_SYSTEM_LITTLEFS
+		/* Read /etc/ metadata files from memory */
 		const char *filename = (const char *)node->data;
-		char path[128];
+		const char *content = NULL;
+		char version_buf[32];
 
-		/* Check if this is a nets file */
-		if (strcmp(filename, "fsxnet") == 0 || strcmp(filename, "aethernet") == 0) {
-			snprintf(path, sizeof(path), "%s/etc/nets/%s", BBS_LFS_MOUNT_POINT, filename);
+		/* Map filename to metadata field */
+		if (strcmp(filename, "boardname") == 0) {
+			content = bbs->boardname;
+		} else if (strcmp(filename, "sysop") == 0) {
+			content = bbs->sysop;
+		} else if (strcmp(filename, "motd") == 0) {
+			content = bbs->motd;
+		} else if (strcmp(filename, "location") == 0) {
+			content = bbs->location;
+		} else if (strcmp(filename, "description") == 0) {
+			content = bbs->description;
+		} else if (strcmp(filename, "version") == 0) {
+			snprintf(version_buf, sizeof(version_buf), "9BBS v0.1.0\n");
+			content = version_buf;
+		} else if (strcmp(filename, "registration") == 0) {
+			content = bbs->allow_registration ? "enabled\n" : "disabled\n";
 		} else {
-			snprintf(path, sizeof(path), "%s/etc/%s", BBS_LFS_MOUNT_POINT, filename);
+			/* Unknown /etc/ file */
+			LOG_WRN("Unknown /etc/ file: %s", filename);
+			return -ENOENT;
 		}
 
-		struct fs_file_t file;
-		fs_file_t_init(&file);
-
-		int ret = fs_open(&file, path, FS_O_READ);
-		if (ret < 0) {
-			LOG_ERR("Failed to open %s: %d", path, ret);
-			return ret;
+		/* Add newline if not already present (except registration which has it) */
+		char temp[512];
+		size_t len;
+		if (strcmp(filename, "registration") == 0 || strcmp(filename, "version") == 0) {
+			len = strlen(content);
+			if (len >= sizeof(temp)) len = sizeof(temp) - 1;
+			memcpy(temp, content, len);
+		} else {
+			len = snprintf(temp, sizeof(temp), "%s\n", content);
 		}
 
-		/* Seek to offset */
-		ret = fs_seek(&file, offset, FS_SEEK_SET);
-		if (ret < 0) {
-			fs_close(&file);
-			return ret;
+		if (offset >= len) {
+			return 0;  /* EOF */
 		}
 
-		/* Read data */
-		ssize_t bytes_read = fs_read(&file, buf, count);
-		fs_close(&file);
-
-		return (bytes_read >= 0) ? bytes_read : -EIO;
-#else
-		return -ENOTSUP;
-#endif
+		size_t to_copy = (offset + count > len) ? (len - offset) : count;
+		memcpy(buf, temp + offset, to_copy);
+		return to_copy;
 
 	} else if (type == BBS_NODE_ROOT) {
-		/* Directory listing for root: list "etc" and "rooms" */
+		/* Directory listing for root: list "etc", "rooms", and "chat" */
 		size_t buf_offset = 0;
 		uint64_t current_offset = 0;
 
-		const char *entries[] = {"etc", "rooms"};
-		const enum bbs_node_type entry_types[] = {BBS_NODE_ETC_DIR, BBS_NODE_ROOMS_DIR};
+		const char *entries[] = {"etc", "rooms", "chat"};
+		const enum bbs_node_type entry_types[] = {BBS_NODE_ETC_DIR, BBS_NODE_ROOMS_DIR, BBS_NODE_CHAT_DIR};
 
-		for (size_t i = 0; i < 2; i++) {
+		for (size_t i = 0; i < 3; i++) {
 			struct ninep_qid entry_qid = {
 				.type = NINEP_QTDIR,
 				.version = 0,
@@ -959,16 +1199,28 @@ static int bbs_read(struct ninep_fs_node *node, uint64_t offset,
 		size_t buf_offset = 0;
 		uint64_t current_offset = 0;
 
-		const char *entries[] = {"boardname", "sysop", "motd", "location", "description", "version", "nets"};
-		const bool is_dir[] = {false, false, false, false, false, false, true};
+		/* Check if authenticated user is admin for permission bits */
+		bool is_admin = bbs_is_user_admin(bbs, bbs->authenticated_user);
 
-		for (size_t i = 0; i < 7; i++) {
+		const char *entries[] = {"boardname", "sysop", "motd", "location", "description", "version", "registration", "nets"};
+		const bool is_dir[] = {false, false, false, false, false, false, false, true};
+		const bool is_writable[] = {true, true, true, true, true, false, false, false};  /* version & registration are read-only */
+
+		for (size_t i = 0; i < 8; i++) {
 			struct ninep_qid entry_qid = {
 				.type = is_dir[i] ? NINEP_QTDIR : NINEP_QTFILE,
 				.version = 0,
 				.path = ((uint64_t)(is_dir[i] ? BBS_NODE_ETC_NETS_DIR : BBS_NODE_ETC_FILE) << 32) | i
 			};
-			uint32_t mode = is_dir[i] ? (0755 | NINEP_DMDIR) : 0644;
+			/* Dynamic permissions: writable (0644) for admin, read-only (0444) for others */
+			uint32_t mode;
+			if (is_dir[i]) {
+				mode = 0755 | NINEP_DMDIR;  /* Directories always 0755 */
+			} else if (is_writable[i] && is_admin) {
+				mode = 0644;  /* Writable for admin */
+			} else {
+				mode = 0444;  /* Read-only for everyone else */
+			}
 			uint16_t name_len = strlen(entries[i]);
 			uint16_t stat_size = 2 + 4 + 13 + 4 + 4 + 4 + 8 +
 			                     (2 + name_len) + (2 + 6) + (2 + 6) + (2 + 6);
@@ -1023,6 +1275,74 @@ static int bbs_read(struct ninep_fs_node *node, uint64_t offset,
 		}
 		return buf_offset;
 
+	} else if (type == BBS_NODE_CHAT_DIR) {
+		/* Directory listing for /chat: list post, users, and all chat rooms */
+		size_t buf_offset = 0;
+		uint64_t current_offset = 0;
+
+		/* Static files: post (write-only), users (read-only) */
+		const char *static_entries[] = {"post", "users"};
+		const enum bbs_node_type static_types[] = {BBS_NODE_CHAT_POST, BBS_NODE_CHAT_USERS};
+		const uint32_t static_modes[] = {0200, 0444};  /* post is write-only, users is read-only */
+
+		for (size_t i = 0; i < 2; i++) {
+			struct ninep_qid entry_qid = {
+				.type = NINEP_QTFILE,
+				.version = 0,
+				.path = ((uint64_t)static_types[i] << 32) | i
+			};
+			uint16_t name_len = strlen(static_entries[i]);
+			uint16_t stat_size = 2 + 4 + 13 + 4 + 4 + 4 + 8 +
+			                     (2 + name_len) + (2 + 6) + (2 + 6) + (2 + 6);
+			uint32_t entry_size = 2 + stat_size;
+
+			if (current_offset >= offset) {
+				if (buf_offset + entry_size > count) break;
+				size_t write_offset = 0;
+				int ret = ninep_write_stat(buf + buf_offset, count - buf_offset,
+				                           &write_offset, &entry_qid, static_modes[i], 0,
+				                           static_entries[i], name_len);
+				if (ret < 0) break;
+				buf_offset += write_offset;
+				current_offset += write_offset;
+			} else {
+				current_offset += entry_size;
+			}
+		}
+
+		/* List all chat rooms */
+		k_mutex_lock(&bbs->lock, K_FOREVER);
+		for (uint32_t i = 0; i < bbs->chat.room_count; i++) {
+			struct chat_room *room = &bbs->chat.rooms[i];
+			if (!room->active) continue;
+
+			struct ninep_qid entry_qid = {
+				.type = NINEP_QTFILE,
+				.version = 0,
+				.path = ((uint64_t)BBS_NODE_CHAT_ROOM << 32) | (uint64_t)(uintptr_t)room
+			};
+			uint32_t mode = 0444;  /* Read-only (blocking read) */
+			uint16_t name_len = strlen(room->name);
+			uint16_t stat_size = 2 + 4 + 13 + 4 + 4 + 4 + 8 +
+			                     (2 + name_len) + (2 + 6) + (2 + 6) + (2 + 6);
+			uint32_t entry_size = 2 + stat_size;
+
+			if (current_offset >= offset) {
+				if (buf_offset + entry_size > count) break;
+				size_t write_offset = 0;
+				int ret = ninep_write_stat(buf + buf_offset, count - buf_offset,
+				                           &write_offset, &entry_qid, mode, 0,
+				                           room->name, name_len);
+				if (ret < 0) break;
+				buf_offset += write_offset;
+				current_offset += write_offset;
+			} else {
+				current_offset += entry_size;
+			}
+		}
+		k_mutex_unlock(&bbs->lock);
+		return buf_offset;
+
 	} else if (type == BBS_NODE_ROOM_DIR) {
 		/* Directory listing for /rooms/<room>: list message numbers */
 		struct bbs_room *room = (struct bbs_room *)node->data;
@@ -1073,6 +1393,27 @@ static int bbs_read(struct ninep_fs_node *node, uint64_t offset,
 		k_mutex_unlock(&bbs->lock);
 		return buf_offset;
 
+	} else if (type == BBS_NODE_CHAT_ROOM) {
+		/* Reading from a chat room - blocking read for new messages */
+		struct chat_room *room = (struct chat_room *)node->data;
+		if (!room) {
+			LOG_ERR("BBS_NODE_CHAT_ROOM has NULL data pointer!");
+			return -EINVAL;
+		}
+
+		const char *username = (bbs->authenticated_user[0] != '\0') ?
+		                       bbs->authenticated_user : "guest";
+
+		/* Blocking read with timeout */
+		int32_t timeout_ms = CONFIG_9BBS_CHAT_READ_TIMEOUT_SEC * 1000;
+		int ret = chat_read_messages(&bbs->chat, room->name, username,
+		                              (char *)buf, count, timeout_ms);
+		return ret;
+
+	} else if (type == BBS_NODE_CHAT_USERS) {
+		/* List of active chat users */
+		int ret = chat_get_users(&bbs->chat, (char *)buf, count);
+		return ret;
 	}
 
 	return -EINVAL;
@@ -1085,9 +1426,143 @@ static int bbs_write(struct ninep_fs_node *node, uint64_t offset,
 	struct bbs_instance *bbs = (struct bbs_instance *)fs_ctx;
 	enum bbs_node_type type = (enum bbs_node_type)((uint64_t)node->qid.path >> 32);
 
-	ARG_UNUSED(uname);
+	/* Update authenticated user whenever we see a write (has uname) */
+	if (uname && uname[0] != '\0') {
+		strncpy(bbs->authenticated_user, uname, sizeof(bbs->authenticated_user) - 1);
+		bbs->authenticated_user[sizeof(bbs->authenticated_user) - 1] = '\0';
+	}
 
-	/* Only message files can be written to */
+	/* Handle writes to /etc/ metadata files (admin only) */
+	if (type == BBS_NODE_ETC_FILE) {
+		/* Check if user is admin */
+		if (!bbs_is_user_admin(bbs, uname)) {
+			LOG_WRN("User '%s' attempted to write /etc/ file without admin privileges",
+			        uname ? uname : "(null)");
+			return -EPERM;
+		}
+
+		/* Get the filename from node data */
+		const char *filename = (const char *)node->data;
+		if (!filename) {
+			return -EINVAL;
+		}
+
+		/* Read-only files */
+		if (strcmp(filename, "version") == 0 || strcmp(filename, "registration") == 0) {
+			LOG_WRN("Attempted write to read-only file: /etc/%s", filename);
+			return -EPERM;
+		}
+
+		k_mutex_lock(&bbs->lock, K_FOREVER);
+
+		/* Determine which metadata field to update */
+		char *target = NULL;
+		size_t target_size = 0;
+
+		if (strcmp(filename, "boardname") == 0) {
+			target = bbs->boardname;
+			target_size = sizeof(bbs->boardname);
+		} else if (strcmp(filename, "sysop") == 0) {
+			target = bbs->sysop;
+			target_size = sizeof(bbs->sysop);
+		} else if (strcmp(filename, "motd") == 0) {
+			target = bbs->motd;
+			target_size = sizeof(bbs->motd);
+		} else if (strcmp(filename, "location") == 0) {
+			target = bbs->location;
+			target_size = sizeof(bbs->location);
+		} else if (strcmp(filename, "description") == 0) {
+			target = bbs->description;
+			target_size = sizeof(bbs->description);
+		} else {
+			k_mutex_unlock(&bbs->lock);
+			LOG_WRN("Unknown /etc/ file: %s", filename);
+			return -ENOENT;
+		}
+
+		/* Handle write at offset 0 as replacement */
+		if (offset == 0) {
+			/* Clear the field first */
+			memset(target, 0, target_size);
+		}
+
+		/* Calculate how much we can write */
+		if (offset >= target_size - 1) {
+			k_mutex_unlock(&bbs->lock);
+			return 0;  /* Beyond end of field */
+		}
+
+		size_t available = target_size - 1 - offset;  /* -1 for null terminator */
+		size_t to_write = (count > available) ? available : count;
+
+		/* Write the data */
+		memcpy(target + offset, buf, to_write);
+
+		/* Ensure null termination */
+		target[offset + to_write] = '\0';
+
+		/* Strip trailing newline if present (common from echo commands) */
+		size_t len = strlen(target);
+		if (len > 0 && target[len - 1] == '\n') {
+			target[len - 1] = '\0';
+		}
+
+		LOG_INF("Admin '%s' updated /etc/%s: '%s'", uname, filename, target);
+
+#ifdef CONFIG_FILE_SYSTEM_LITTLEFS
+		/* Persist metadata changes to LittleFS */
+		int persist_ret = save_metadata_to_lfs(bbs);
+		if (persist_ret < 0) {
+			LOG_WRN("Failed to persist metadata to LittleFS: %d", persist_ret);
+			/* Don't fail the write - metadata is updated in RAM */
+		}
+#endif
+
+		k_mutex_unlock(&bbs->lock);
+		return to_write;
+	}
+
+	/* Handle writes to /chat/post */
+	if (type == BBS_NODE_CHAT_POST) {
+		/* Parse message: "room:text" or just "text" (defaults to lobby) */
+		char room_name[32] = "lobby";
+		const char *msg_text = (const char *)buf;
+		size_t msg_len = count;
+
+		/* Look for room prefix */
+		for (size_t i = 0; i < count && i < 32; i++) {
+			if (buf[i] == ':') {
+				memcpy(room_name, buf, i);
+				room_name[i] = '\0';
+				msg_text = (const char *)&buf[i + 1];
+				msg_len = count - i - 1;
+				break;
+			}
+		}
+
+		/* Null-terminate message */
+		char msg_buf[CONFIG_9BBS_CHAT_MAX_MESSAGE_LEN];
+		size_t copy_len = (msg_len < sizeof(msg_buf) - 1) ? msg_len : sizeof(msg_buf) - 1;
+		memcpy(msg_buf, msg_text, copy_len);
+		msg_buf[copy_len] = '\0';
+
+		/* Strip trailing newline */
+		if (copy_len > 0 && msg_buf[copy_len - 1] == '\n') {
+			msg_buf[copy_len - 1] = '\0';
+		}
+
+		const char *username = uname ? uname : "guest";
+		int ret = chat_post_message(&bbs->chat, room_name, username, msg_buf);
+		if (ret < 0) {
+			LOG_WRN("Failed to post chat message: %d", ret);
+			return ret;
+		}
+
+		LOG_DBG("Chat message posted to '%s' by '%s': '%s'", room_name, username, msg_buf);
+		return count;
+	}
+
+	/* Only message files can be written to (below this point) */
 	if (type != BBS_NODE_MESSAGE_FILE) {
 		return -EISDIR;
 	}

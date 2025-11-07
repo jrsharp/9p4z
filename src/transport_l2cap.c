@@ -264,10 +264,6 @@ static int l2cap_send(struct ninep_transport *transport, const uint8_t *buf,
 	}
 #endif
 
-	/* Clear user_data to avoid "user_data is not empty" warning from Zephyr BT stack.
-	 * The user_data size is typically 4-8 bytes. We clear the maximum possible. */
-	memset(net_buf_user_data(msg_buf), 0, CONFIG_BT_CONN_TX_USER_DATA_SIZE);
-
 	/* Copy message data to net_buf */
 	net_buf_add_mem(msg_buf, buf, len);
 

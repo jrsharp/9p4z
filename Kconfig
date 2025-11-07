@@ -333,6 +333,47 @@ config 9BBS_MAX_ROOMNAME_LEN
 	help
 	  Maximum length of a room name.
 
+menuconfig 9BBS_CHAT
+	bool "Enable 9BBS chat subsystem"
+	default y
+	help
+	  Enable real-time chat functionality in 9BBS.
+	  Provides blocking reads, ring buffers, and multi-user support.
+
+if 9BBS_CHAT
+
+config 9BBS_CHAT_MAX_ROOMS
+	int "Maximum number of chat rooms"
+	default 4
+	help
+	  Maximum number of concurrent chat rooms.
+
+config 9BBS_CHAT_MAX_MESSAGES
+	int "Maximum messages per room (ring buffer size)"
+	default 50
+	help
+	  Number of messages to keep in ring buffer per room.
+
+config 9BBS_CHAT_MAX_MESSAGE_LEN
+	int "Maximum message length"
+	default 256
+	help
+	  Maximum length of a single chat message.
+
+config 9BBS_CHAT_MAX_USERS
+	int "Maximum concurrent chat users"
+	default 8
+	help
+	  Maximum number of users that can be tracked for chat.
+
+config 9BBS_CHAT_READ_TIMEOUT_SEC
+	int "Chat read timeout in seconds"
+	default 30
+	help
+	  Timeout for blocking reads on chat rooms.
+
+endif # 9BBS_CHAT
+
 endif # NINEP_9BBS
 
 endif # NINEP
