@@ -33,4 +33,4 @@ __pycache__/
 
 # Temporary files
 *.log
-*.tmp
+*.tmpbuild_*/

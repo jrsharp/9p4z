@@ -1,0 +1,24 @@
+cmake:
+  board:
+    name: 'nrf7002dk'
+    path:
+     - '/opt/nordic/ncs/v3.1.1/zephyr/boards/nordic/nrf7002dk'
+    qualifiers: 'nrf5340/cpuapp'
+    revision: ''
+  images:
+   - name: '9p_server_l2cap'
+     source-dir: '/Users/jrsharp/src/9p4z/samples/9p_server_l2cap'
+     type: 'MAIN'
+   - name: 'hci_ipc'
+     source-dir: ''
+  kconfig:
+    files:
+     - '/Users/jrsharp/src/9p4z/samples/9p_server_l2cap/build_1/_sysbuild/empty.conf'
+     - '/Users/jrsharp/src/9p4z/samples/9p_server_l2cap/sysbuild.conf'
+    user-files:
+     - '/Users/jrsharp/src/9p4z/samples/9p_server_l2cap/sysbuild.conf'
+version: '0.1.0'
+west:
+  command: '/opt/nordic/ncs/toolchains/5c0d382932/bin/west build --build-dir /Users/jrsharp/src/9p4z/samples/9p_server_l2cap/build_1 /Users/jrsharp/src/9p4z/samples/9p_server_l2cap --pristine --board nrf7002dk/nrf5340/cpuapp --sysbuild'
+  topdir: '/opt/nordic/ncs/v3.1.1'
+  version: '1.4.0'

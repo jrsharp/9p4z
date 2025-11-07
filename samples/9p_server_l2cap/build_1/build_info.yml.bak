@@ -1,0 +1,6 @@
+west:
+  command: /opt/nordic/ncs/toolchains/5c0d382932/bin/west build --build-dir /Users/jrsharp/src/9p4z/samples/9p_server_l2cap/build_1
+    /Users/jrsharp/src/9p4z/samples/9p_server_l2cap --pristine --board nrf7002dk/nrf5340/cpuapp
+    --sysbuild
+  topdir: /opt/nordic/ncs/v3.1.1
+  version: 1.4.0
