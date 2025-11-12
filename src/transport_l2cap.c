@@ -30,6 +30,9 @@ enum l2cap_rx_state {
 	RX_WAIT_MSG     /* Waiting for message body */
 };
 
+/* Maximum concurrent L2CAP channels per PSM */
+#define MAX_L2CAP_CHANNELS 4
+
 /* L2CAP channel structure */
 struct l2cap_9p_chan {
 	struct bt_l2cap_le_chan le;
@@ -39,15 +42,16 @@ struct l2cap_9p_chan {
 	size_t rx_len;
 	uint32_t rx_expected;
 	enum l2cap_rx_state rx_state;
+	bool in_use;  /* Track if this channel slot is allocated */
 };
 
 /* Transport private data */
 struct l2cap_transport_data {
 	struct bt_l2cap_server server;
-	struct l2cap_9p_chan channel;
-	uint8_t *rx_buf;
-	size_t rx_buf_size;
-	bool connected;
+	struct l2cap_9p_chan channels[MAX_L2CAP_CHANNELS];  /* Support multiple channels */
+	uint8_t *rx_buf_pool;  /* RX buffer pool (divided among channels) */
+	size_t rx_buf_size_per_channel;
+	uint8_t active_channels;  /* Count of active connections */
 	struct ninep_transport *transport;  /* Backpointer to parent transport */
 #if NINEP_NCS_BUILD
 	struct net_buf_pool tx_pool;  /* TX buffer pool for NCS */
@@ -75,7 +79,6 @@ static void l2cap_connected(struct bt_l2cap_chan *chan)
 	/* Mainline: Direct CONTAINER_OF */
 	struct l2cap_9p_chan *ch = CONTAINER_OF(chan, struct l2cap_9p_chan, le.chan);
 #endif
-	struct l2cap_transport_data *data = CONTAINER_OF(ch, struct l2cap_transport_data, channel);
 
 	LOG_INF("L2CAP channel connected (MTU: RX=%u, TX=%u)",
 	        ch->le.rx.mtu, ch->le.tx.mtu);
@@ -84,7 +87,7 @@ static void l2cap_connected(struct bt_l2cap_chan *chan)
 	ch->rx_len = 0;
 	ch->rx_expected = 0;
 	ch->rx_state = RX_WAIT_SIZE;
-	data->connected = true;
+	ch->in_use = true;
 }
 
 static void l2cap_disconnected(struct bt_l2cap_chan *chan)
@@ -95,7 +98,6 @@ static void l2cap_disconnected(struct bt_l2cap_chan *chan)
 #else
 	struct l2cap_9p_chan *ch = CONTAINER_OF(chan, struct l2cap_9p_chan, le.chan);
 #endif
-	struct l2cap_transport_data *data = CONTAINER_OF(ch, struct l2cap_transport_data, channel);
 
 	LOG_INF("L2CAP channel disconnected");
 
@@ -103,7 +105,7 @@ static void l2cap_disconnected(struct bt_l2cap_chan *chan)
 	ch->rx_len = 0;
 	ch->rx_expected = 0;
 	ch->rx_state = RX_WAIT_SIZE;
-	data->connected = false;
+	ch->in_use = false;
 }
 
 static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
@@ -215,23 +217,35 @@ static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
 
 	LOG_INF("L2CAP connection accepted");
 
-	/* Only support one connection at a time */
-	if (data->connected) {
-		LOG_WRN("Already connected, rejecting new connection");
+	/* Find a free channel slot */
+	struct l2cap_9p_chan *free_chan = NULL;
+	for (int i = 0; i < MAX_L2CAP_CHANNELS; i++) {
+		if (!data->channels[i].in_use) {
+			free_chan = &data->channels[i];
+			break;
+		}
+	}
+
+	if (!free_chan) {
+		LOG_WRN("All channel slots in use (%d/%d), rejecting connection",
+		        MAX_L2CAP_CHANNELS, MAX_L2CAP_CHANNELS);
 		return -ENOMEM;
 	}
 
 	/* Initialize channel */
-	memset(&data->channel, 0, sizeof(data->channel));
-	data->channel.le.chan.ops = &l2cap_chan_ops;
-	data->channel.transport = data->transport;
-	data->channel.rx_buf = data->rx_buf;
-	data->channel.rx_buf_size = data->rx_buf_size;
-	data->channel.rx_len = 0;
-	data->channel.rx_expected = 0;
-	data->channel.rx_state = RX_WAIT_SIZE;
+	memset(free_chan, 0, sizeof(*free_chan));
+	free_chan->le.chan.ops = &l2cap_chan_ops;
+	free_chan->transport = data->transport;
+	free_chan->rx_buf = data->rx_buf_pool + (free_chan - data->channels) * data->rx_buf_size_per_channel;
+	free_chan->rx_buf_size = data->rx_buf_size_per_channel;
+	free_chan->rx_len = 0;
+	free_chan->rx_expected = 0;
+	free_chan->rx_state = RX_WAIT_SIZE;
+	free_chan->in_use = true;
 
-	*chan = &data->channel.le.chan;
+	LOG_INF("Assigned channel slot %d/%d", (int)(free_chan - data->channels), MAX_L2CAP_CHANNELS);
+
+	*chan = &free_chan->le.chan;
 	return 0;
 }
 
@@ -242,7 +256,20 @@ static int l2cap_send(struct ninep_transport *transport, const uint8_t *buf,
 	struct net_buf *msg_buf;
 	int ret;
 
-	if (!data || !data->connected) {
+	if (!data) {
+		return -ENOTCONN;
+	}
+
+	/* Find first active channel to send on */
+	struct l2cap_9p_chan *active_chan = NULL;
+	for (int i = 0; i < MAX_L2CAP_CHANNELS; i++) {
+		if (data->channels[i].in_use) {
+			active_chan = &data->channels[i];
+			break;
+		}
+	}
+
+	if (!active_chan) {
 		return -ENOTCONN;
 	}
 
@@ -257,7 +284,7 @@ static int l2cap_send(struct ninep_transport *transport, const uint8_t *buf,
 	net_buf_reserve(msg_buf, BT_L2CAP_SDU_CHAN_SEND_RESERVE);
 #else
 	/* Mainline: Allocate from channel's built-in buffer pool */
-	msg_buf = net_buf_alloc(&data->channel.le.tx.seg.pool, K_FOREVER);
+	msg_buf = net_buf_alloc(&active_chan->le.tx.seg.pool, K_FOREVER);
 	if (!msg_buf) {
 		LOG_ERR("Failed to allocate net_buf");
 		return -ENOMEM;
@@ -268,7 +295,7 @@ static int l2cap_send(struct ninep_transport *transport, const uint8_t *buf,
 	net_buf_add_mem(msg_buf, buf, len);
 
 	/* Send via L2CAP channel */
-	ret = bt_l2cap_chan_send(&data->channel.le.chan, msg_buf);
+	ret = bt_l2cap_chan_send(&active_chan->le.chan, msg_buf);
 	if (ret < 0) {
 		LOG_ERR("bt_l2cap_chan_send failed: %d", ret);
 		net_buf_unref(msg_buf);
@@ -308,11 +335,13 @@ static int l2cap_stop(struct ninep_transport *transport)
 		return -EINVAL;
 	}
 
-	/* Disconnect channel if connected */
-	if (data->connected) {
-		ret = bt_l2cap_chan_disconnect(&data->channel.le.chan);
-		if (ret < 0) {
-			LOG_WRN("Failed to disconnect L2CAP channel: %d", ret);
+	/* Disconnect all active channels */
+	for (int i = 0; i < MAX_L2CAP_CHANNELS; i++) {
+		if (data->channels[i].in_use) {
+			ret = bt_l2cap_chan_disconnect(&data->channels[i].le.chan);
+			if (ret < 0) {
+				LOG_WRN("Failed to disconnect L2CAP channel %d: %d", i, ret);
+			}
 		}
 	}
 
@@ -331,9 +360,11 @@ static int l2cap_get_mtu(struct ninep_transport *transport)
 		return -EINVAL;
 	}
 
-	/* Return TX MTU if connected, otherwise return configured MTU */
-	if (data->connected) {
-		return data->channel.le.tx.mtu;
+	/* Return TX MTU of first active channel, otherwise return configured MTU */
+	for (int i = 0; i < MAX_L2CAP_CHANNELS; i++) {
+		if (data->channels[i].in_use) {
+			return data->channels[i].le.tx.mtu;
+		}
 	}
 
 	/* Not connected yet - return configured MTU from prj.conf */
@@ -365,10 +396,15 @@ int ninep_transport_l2cap_init(struct ninep_transport *transport,
 	}
 
 	memset(data, 0, sizeof(*data));
-	data->rx_buf = config->rx_buf;
-	data->rx_buf_size = config->rx_buf_size;
-	data->connected = false;
+	data->rx_buf_pool = config->rx_buf;
+	data->rx_buf_size_per_channel = config->rx_buf_size / MAX_L2CAP_CHANNELS;
+	data->active_channels = 0;
 	data->transport = transport;
+
+	/* Initialize all channel slots as unused */
+	for (int i = 0; i < MAX_L2CAP_CHANNELS; i++) {
+		data->channels[i].in_use = false;
+	}
 
 	/* Initialize L2CAP server */
 	data->server.psm = config->psm;
@@ -381,8 +417,8 @@ int ninep_transport_l2cap_init(struct ninep_transport *transport,
 	transport->user_data = user_data;
 	transport->priv_data = data;
 
-	LOG_INF("L2CAP transport initialized (PSM: 0x%04x, RX buf: %zu bytes)",
-	        config->psm, config->rx_buf_size);
+	LOG_INF("L2CAP transport initialized (PSM: 0x%04x, RX buf: %zu bytes, %d channels)",
+	        config->psm, config->rx_buf_size, MAX_L2CAP_CHANNELS);
 
 	return 0;
 }
