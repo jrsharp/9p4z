@@ -52,6 +52,7 @@ struct l2cap_transport_data {
 	uint8_t *rx_buf_pool;  /* RX buffer pool (divided among channels) */
 	size_t rx_buf_size_per_channel;
 	uint8_t active_channels;  /* Count of active connections */
+	struct l2cap_9p_chan *current_rx_chan;  /* Channel currently processing a request */
 	struct ninep_transport *transport;  /* Backpointer to parent transport */
 #if NINEP_NCS_BUILD
 	struct net_buf_pool tx_pool;  /* TX buffer pool for NCS */
@@ -117,8 +118,12 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 	struct l2cap_9p_chan *ch = CONTAINER_OF(chan, struct l2cap_9p_chan, le.chan);
 #endif
 	struct ninep_transport *transport = ch->transport;
+	struct l2cap_transport_data *data = transport->priv_data;
 
 	LOG_DBG("L2CAP recv: %u bytes", buf->len);
+
+	/* Track which channel is currently processing a request for response routing */
+	data->current_rx_chan = ch;
 
 	/* Process all data in the buffer */
 	while (buf->len > 0) {
@@ -260,16 +265,11 @@ static int l2cap_send(struct ninep_transport *transport, const uint8_t *buf,
 		return -ENOTCONN;
 	}
 
-	/* Find first active channel to send on */
-	struct l2cap_9p_chan *active_chan = NULL;
-	for (int i = 0; i < MAX_L2CAP_CHANNELS; i++) {
-		if (data->channels[i].in_use) {
-			active_chan = &data->channels[i];
-			break;
-		}
-	}
+	/* Use the channel that's currently processing a request (set by l2cap_recv) */
+	struct l2cap_9p_chan *active_chan = data->current_rx_chan;
 
-	if (!active_chan) {
+	if (!active_chan || !active_chan->in_use) {
+		LOG_ERR("No active receive channel for response");
 		return -ENOTCONN;
 	}
 
@@ -399,6 +399,7 @@ int ninep_transport_l2cap_init(struct ninep_transport *transport,
 	data->rx_buf_pool = config->rx_buf;
 	data->rx_buf_size_per_channel = config->rx_buf_size / MAX_L2CAP_CHANNELS;
 	data->active_channels = 0;
+	data->current_rx_chan = NULL;
 	data->transport = transport;
 
 	/* Initialize all channel slots as unused */
