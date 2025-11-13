@@ -24,23 +24,6 @@
 
 LOG_MODULE_REGISTER(ninep_session_pool_l2cap, CONFIG_NINEP_LOG_LEVEL);
 
-/* RX state machine states */
-enum l2cap_rx_state {
-	RX_WAIT_SIZE,   /* Waiting for 4-byte size field */
-	RX_WAIT_MSG     /* Waiting for message body */
-};
-
-/* L2CAP channel for a single session */
-struct l2cap_session_chan {
-	struct bt_l2cap_le_chan le;
-	struct ninep_session *session;  /* Back-pointer to owning session */
-	uint8_t *rx_buf;
-	size_t rx_buf_size;
-	size_t rx_len;
-	uint32_t rx_expected;
-	enum l2cap_rx_state rx_state;
-};
-
 #if NINEP_NCS_BUILD
 /* NCS: Define TX buffer pool for L2CAP SDUs */
 #define TX_BUF_COUNT 4
@@ -48,15 +31,6 @@ struct l2cap_session_chan {
 NET_BUF_POOL_DEFINE(l2cap_session_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
                     CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
 #endif
-
-/* L2CAP session pool private data */
-struct ninep_session_pool_l2cap {
-	struct bt_l2cap_server server;
-	struct ninep_session_pool *pool;  /* Generic session pool */
-	struct ninep_session_pool_l2cap_config config;
-	uint8_t *rx_buf_pool;  /* Large buffer divided among sessions */
-	struct l2cap_session_chan *channels;  /* One channel struct per session */
-};
 
 /* Forward declarations */
 static int l2cap_session_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
@@ -168,7 +142,7 @@ static int l2cap_session_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 				}
 
 				/* Transition to message body state */
-				ch->rx_state = RX_WAIT_MSG;
+				ch->rx_state = RX_WAIT_DATA;
 			}
 		} else {
 			/* Reading message body */
@@ -327,6 +301,91 @@ static int l2cap_session_get_mtu(struct ninep_transport *transport)
 	return chan->le.tx.mtu;
 }
 
+/* Common initialization for both static and dynamic pools */
+static int ninep_session_pool_l2cap_init_common(
+	struct ninep_session_pool_l2cap *l2cap_pool,
+	const struct ninep_session_pool_l2cap_config *config)
+{
+	int ret;
+
+	/* Initialize generic session pool */
+	struct ninep_session_pool_config pool_config = {
+		.max_sessions = config->max_sessions,
+		.fs_ops = config->fs_ops,
+		.fs_context = config->fs_context,
+	};
+
+	ret = ninep_session_pool_init(l2cap_pool->pool, &pool_config);
+	if (ret < 0) {
+		LOG_ERR("Failed to initialize session pool: %d", ret);
+		return ret;
+	}
+
+	/* Initialize L2CAP server */
+	l2cap_pool->server.psm = config->psm;
+	l2cap_pool->server.accept = l2cap_session_accept;
+	l2cap_pool->server.sec_level = BT_SECURITY_L1; /* No encryption required */
+
+	LOG_INF("L2CAP session pool initialized: PSM 0x%04x, %d sessions, %zu bytes RX per session",
+	        config->psm, config->max_sessions, config->rx_buf_size_per_session);
+
+	return 0;
+}
+
+int ninep_session_pool_l2cap_init(struct ninep_session_pool_l2cap *l2cap_pool,
+                                   const struct ninep_session_pool_l2cap_config *config)
+{
+	struct ninep_session_pool *pool;
+	int ret;
+
+	if (!l2cap_pool || !config || !config->fs_ops || config->max_sessions <= 0 ||
+	    config->rx_buf_size_per_session == 0) {
+		LOG_ERR("Invalid arguments");
+		return -EINVAL;
+	}
+
+	/* Verify pre-allocated storage is set */
+	if (!l2cap_pool->pool || !l2cap_pool->rx_buf_pool || !l2cap_pool->channels) {
+		LOG_ERR("Session pool storage not allocated (use NINEP_SESSION_POOL_L2CAP_DEFINE)");
+		return -EINVAL;
+	}
+
+	/* Store configuration */
+	memcpy(&l2cap_pool->config, config, sizeof(*config));
+
+	pool = l2cap_pool->pool;
+
+	/* Manually initialize pool fields (skip memset to avoid size mismatch) */
+	pool->max_sessions = config->max_sessions;
+	pool->fs_ops = config->fs_ops;
+	pool->fs_context = config->fs_context;
+
+	ret = k_mutex_init(&pool->lock);
+	if (ret < 0) {
+		LOG_ERR("Failed to initialize pool mutex: %d", ret);
+		return ret;
+	}
+
+	/* Initialize all sessions as free and zero them out */
+	for (int i = 0; i < pool->max_sessions; i++) {
+		memset(&pool->sessions[i], 0, sizeof(struct ninep_session));
+		pool->sessions[i].state = NINEP_SESSION_FREE;
+		pool->sessions[i].session_id = i;
+	}
+
+	LOG_INF("Session pool initialized: %d sessions", pool->max_sessions);
+
+	/* Initialize L2CAP server */
+	l2cap_pool->server.psm = config->psm;
+	l2cap_pool->server.accept = l2cap_session_accept;
+	l2cap_pool->server.sec_level = BT_SECURITY_L1;
+
+	LOG_INF("L2CAP session pool initialized: PSM 0x%04x, %d sessions, %zu bytes RX per session",
+	        config->psm, config->max_sessions, config->rx_buf_size_per_session);
+
+	return 0;
+}
+
 struct ninep_session_pool_l2cap *ninep_session_pool_l2cap_create(
 	const struct ninep_session_pool_l2cap_config *config)
 {
@@ -348,28 +407,12 @@ struct ninep_session_pool_l2cap *ninep_session_pool_l2cap_create(
 	}
 
 	memset(l2cap_pool, 0, sizeof(*l2cap_pool));
-	memcpy(&l2cap_pool->config, config, sizeof(*config));
 
 	/* Allocate generic session pool */
 	size_t pool_size = ninep_session_pool_size(config->max_sessions);
 	pool = k_malloc(pool_size);
 	if (!pool) {
 		LOG_ERR("Failed to allocate session pool");
-		k_free(l2cap_pool);
-		return NULL;
-	}
-
-	/* Initialize generic session pool */
-	struct ninep_session_pool_config pool_config = {
-		.max_sessions = config->max_sessions,
-		.fs_ops = config->fs_ops,
-		.fs_context = config->fs_context,
-	};
-
-	ret = ninep_session_pool_init(pool, &pool_config);
-	if (ret < 0) {
-		LOG_ERR("Failed to initialize session pool: %d", ret);
-		k_free(pool);
 		k_free(l2cap_pool);
 		return NULL;
 	}
@@ -396,13 +439,16 @@ struct ninep_session_pool_l2cap *ninep_session_pool_l2cap_create(
 		return NULL;
 	}
 
-	/* Initialize L2CAP server */
-	l2cap_pool->server.psm = config->psm;
-	l2cap_pool->server.accept = l2cap_session_accept;
-	l2cap_pool->server.sec_level = BT_SECURITY_L1; /* No encryption required */
-
-	LOG_INF("L2CAP session pool created: PSM 0x%04x, %d sessions, %zu bytes RX per session",
-	        config->psm, config->max_sessions, config->rx_buf_size_per_session);
+	/* Store configuration and initialize common parts */
+	memcpy(&l2cap_pool->config, config, sizeof(*config));
+	ret = ninep_session_pool_l2cap_init_common(l2cap_pool, config);
+	if (ret < 0) {
+		k_free(l2cap_pool->channels);
+		k_free(l2cap_pool->rx_buf_pool);
+		k_free(pool);
+		k_free(l2cap_pool);
+		return NULL;
+	}
 
 	return l2cap_pool;
 }
