@@ -252,10 +252,10 @@ static int l2cap_session_accept(struct bt_conn *conn, struct bt_l2cap_server *se
 	/* Initialize 9P server for this session */
 	struct ninep_server_config server_config = {
 		.fs_ops = l2cap_pool->pool->fs_ops,
-		.fs_context = l2cap_pool->pool->fs_context,
+		.fs_ctx = l2cap_pool->pool->fs_context,
 	};
 
-	int ret = ninep_server_init(&session->server, &session->transport, &server_config);
+	int ret = ninep_server_init(&session->server, &server_config, &session->transport);
 	if (ret < 0) {
 		LOG_ERR("Failed to initialize 9P server for session %d: %d",
 		        session->session_id, ret);
