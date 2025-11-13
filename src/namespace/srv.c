@@ -408,7 +408,7 @@ static struct ninep_fs_node *srv_fs_walk(struct ninep_fs_node *dir, const char *
 		}
 	}
 
-	LOG_ERR("srv_fs_walk: No service could handle walk for node %p (%s)", dir, dir->name);
+	/* Walk failed - normal "file not found" case, no logging needed */
 	return NULL;
 }
 
