@@ -122,14 +122,7 @@ static void handle_tattach(struct ninep_server *server, uint16_t tag,
 	}
 	LOG_DBG("server=%p", server);
 
-	if (!server->config) {
-		LOG_ERR("server->config is NULL!");
-		send_error(server, tag, "server not configured");
-		return;
-	}
-	LOG_DBG("config=%p", server->config);
-
-	const struct ninep_fs_ops *ops = server->config->fs_ops;
+	const struct ninep_fs_ops *ops = server->config.fs_ops;
 	if (!ops) {
 		LOG_ERR("fs_ops is NULL!");
 		send_error(server, tag, "filesystem not configured");
@@ -173,7 +166,7 @@ static void handle_tattach(struct ninep_server *server, uint16_t tag,
 	LOG_INF("Tattach: fid=%u, uname='%s'", fid, sfid->uname);
 
 	/* Get root node */
-	sfid->node = server->config->fs_ops->get_root(server->config->fs_ctx);
+	sfid->node = server->config.fs_ops->get_root(server->config.fs_ctx);
 	if (!sfid->node) {
 		free_fid(server, fid);
 		send_error(server, tag, "cannot get root");
@@ -239,8 +232,8 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 		offset += 2 + name_len;
 
 		/* Walk to child */
-		node = server->config->fs_ops->walk(node, name, name_len,
-		                                     server->config->fs_ctx);
+		node = server->config.fs_ops->walk(node, name, name_len,
+		                                     server->config.fs_ctx);
 		if (!node) {
 			send_error(server, tag, "file not found");
 			return;
@@ -286,8 +279,8 @@ static void handle_topen(struct ninep_server *server, uint16_t tag,
 	}
 
 	/* Open node */
-	int ret = server->config->fs_ops->open(sfid->node, mode,
-	                                        server->config->fs_ctx);
+	int ret = server->config.fs_ops->open(sfid->node, mode,
+	                                        server->config.fs_ctx);
 	if (ret < 0) {
 		send_error(server, tag, "open failed");
 		return;
@@ -332,9 +325,9 @@ static void handle_tread(struct ninep_server *server, uint16_t tag,
 	}
 
 	/* Read data */
-	int bytes = server->config->fs_ops->read(sfid->node, offset,
+	int bytes = server->config.fs_ops->read(sfid->node, offset,
 	                                          &server->tx_buf[11], count,
-	                                          server->config->fs_ctx);
+	                                          server->config.fs_ctx);
 	if (bytes < 0) {
 		send_error(server, tag, "read failed");
 		return;
@@ -375,9 +368,9 @@ static void handle_tstat(struct ninep_server *server, uint16_t tag,
 
 	/* Get stat from filesystem (use space after header + nstat field) */
 	uint8_t stat_buf[256];
-	int stat_len = server->config->fs_ops->stat(sfid->node, stat_buf,
+	int stat_len = server->config.fs_ops->stat(sfid->node, stat_buf,
 	                                             sizeof(stat_buf),
-	                                             server->config->fs_ctx);
+	                                             server->config.fs_ctx);
 	if (stat_len < 0) {
 		send_error(server, tag, "stat failed");
 		return;
@@ -438,15 +431,15 @@ static void handle_tcreate(struct ninep_server *server, uint16_t tag,
 	}
 
 	/* Check if filesystem supports create */
-	if (!server->config->fs_ops->create) {
+	if (!server->config.fs_ops->create) {
 		send_error(server, tag, "create not supported");
 		return;
 	}
 
 	/* Create new file/directory */
 	struct ninep_fs_node *new_node = NULL;
-	int ret = server->config->fs_ops->create(
-		sfid->node, name, name_len, perm, mode, sfid->uname, &new_node, server->config->fs_ctx);
+	int ret = server->config.fs_ops->create(
+		sfid->node, name, name_len, perm, mode, sfid->uname, &new_node, server->config.fs_ctx);
 
 	if (ret < 0 || !new_node) {
 		send_error(server, tag, "create failed");
@@ -488,14 +481,14 @@ static void handle_twrite(struct ninep_server *server, uint16_t tag,
 	}
 
 	/* Check if filesystem supports write */
-	if (!server->config->fs_ops->write) {
+	if (!server->config.fs_ops->write) {
 		send_error(server, tag, "write not supported");
 		return;
 	}
 
 	/* Write data */
-	int bytes = server->config->fs_ops->write(sfid->node, offset, data, count,
-	                                           sfid->uname, server->config->fs_ctx);
+	int bytes = server->config.fs_ops->write(sfid->node, offset, data, count,
+	                                           sfid->uname, server->config.fs_ctx);
 	if (bytes < 0) {
 		send_error(server, tag, "write failed");
 		return;
@@ -526,13 +519,13 @@ static void handle_tremove(struct ninep_server *server, uint16_t tag,
 	}
 
 	/* Check if filesystem supports remove */
-	if (!server->config->fs_ops->remove) {
+	if (!server->config.fs_ops->remove) {
 		send_error(server, tag, "remove not supported");
 		return;
 	}
 
 	/* Remove file/directory */
-	int ret = server->config->fs_ops->remove(sfid->node, server->config->fs_ctx);
+	int ret = server->config.fs_ops->remove(sfid->node, server->config.fs_ctx);
 	if (ret < 0) {
 		send_error(server, tag, "remove failed");
 		return;
@@ -582,8 +575,8 @@ static void handle_tclunk(struct ninep_server *server, uint16_t tag,
 	}
 
 	/* Call filesystem clunk handler if available */
-	if (server->config->fs_ops->clunk && sfid->node) {
-		int clunk_ret = server->config->fs_ops->clunk(sfid->node, server->config->fs_ctx);
+	if (server->config.fs_ops->clunk && sfid->node) {
+		int clunk_ret = server->config.fs_ops->clunk(sfid->node, server->config.fs_ctx);
 		if (clunk_ret < 0) {
 			LOG_WRN("Filesystem clunk failed: %d", clunk_ret);
 			/* Continue anyway - client expects Rclunk */
@@ -684,7 +677,8 @@ int ninep_server_init(struct ninep_server *server,
 	}
 
 	memset(server, 0, sizeof(*server));
-	server->config = config;
+	/* Copy config by value instead of storing pointer */
+	memcpy(&server->config, config, sizeof(server->config));
 	server->transport = transport;
 
 	/* Set transport callback (only for network servers) */

@@ -319,8 +319,8 @@ static struct ninep_fs_node *srv_fs_walk(struct ninep_fs_node *dir, const char *
 		 * This avoids invalid casts and ensures union_fs tracks the actual
 		 * filesystem nodes that have proper ninep_fs_node structure. */
 		if (entry->type == SRV_TYPE_LOCAL && entry->local.server) {
-			const struct ninep_fs_ops *ops = entry->local.server->config->fs_ops;
-			void *ctx = entry->local.server->config->fs_ctx;
+			const struct ninep_fs_ops *ops = entry->local.server->config.fs_ops;
+			void *ctx = entry->local.server->config.fs_ctx;
 
 			if (ops && ops->get_root) {
 				struct ninep_fs_node *target = ops->get_root(ctx);
@@ -342,8 +342,8 @@ static struct ninep_fs_node *srv_fs_walk(struct ninep_fs_node *dir, const char *
 	struct srv_entry *entry = global_srv_registry.services;
 	while (entry) {
 		if (entry->type == SRV_TYPE_LOCAL && entry->local.server) {
-			const struct ninep_fs_ops *ops = entry->local.server->config->fs_ops;
-			void *ctx = entry->local.server->config->fs_ctx;
+			const struct ninep_fs_ops *ops = entry->local.server->config.fs_ops;
+			void *ctx = entry->local.server->config.fs_ctx;
 
 			/* Check if this service's root matches our dir, or if dir is a descendant.
 			 * For simplicity, we check if the service root matches the dir pointer exactly.
@@ -386,8 +386,8 @@ static struct ninep_fs_node *srv_fs_walk(struct ninep_fs_node *dir, const char *
 	entry = global_srv_registry.services;
 	while (entry && num_services < 32) {
 		if (entry->type == SRV_TYPE_LOCAL && entry->local.server) {
-			services[num_services].ops = entry->local.server->config->fs_ops;
-			services[num_services].ctx = entry->local.server->config->fs_ctx;
+			services[num_services].ops = entry->local.server->config.fs_ops;
+			services[num_services].ctx = entry->local.server->config.fs_ctx;
 			strncpy(services[num_services].name, entry->name, sizeof(services[num_services].name) - 1);
 			services[num_services].name[sizeof(services[num_services].name) - 1] = '\0';
 			num_services++;
@@ -434,8 +434,8 @@ static int srv_fs_stat(struct ninep_fs_node *node, uint8_t *buf,
 	struct srv_entry *entry = global_srv_registry.services;
 	while (entry) {
 		if (entry->type == SRV_TYPE_LOCAL && entry->local.server) {
-			const struct ninep_fs_ops *ops = entry->local.server->config->fs_ops;
-			void *ctx = entry->local.server->config->fs_ctx;
+			const struct ninep_fs_ops *ops = entry->local.server->config.fs_ops;
+			void *ctx = entry->local.server->config.fs_ctx;
 
 			if (ops && ops->stat) {
 				int ret = ops->stat(node, buf, buf_len, ctx);
@@ -468,8 +468,8 @@ static int srv_fs_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 	struct srv_entry *entry = global_srv_registry.services;
 	while (entry) {
 		if (entry->type == SRV_TYPE_LOCAL && entry->local.server) {
-			const struct ninep_fs_ops *ops = entry->local.server->config->fs_ops;
-			void *ctx = entry->local.server->config->fs_ctx;
+			const struct ninep_fs_ops *ops = entry->local.server->config.fs_ops;
+			void *ctx = entry->local.server->config.fs_ctx;
 
 			if (ops && ops->open) {
 				int ret = ops->open(node, mode, ctx);
@@ -570,8 +570,8 @@ static int srv_fs_read(struct ninep_fs_node *node, uint64_t offset,
 	struct srv_entry *entry = global_srv_registry.services;
 	while (entry) {
 		if (entry->type == SRV_TYPE_LOCAL && entry->local.server) {
-			const struct ninep_fs_ops *ops = entry->local.server->config->fs_ops;
-			void *ctx = entry->local.server->config->fs_ctx;
+			const struct ninep_fs_ops *ops = entry->local.server->config.fs_ops;
+			void *ctx = entry->local.server->config.fs_ctx;
 
 			if (ops && ops->read) {
 				int ret = ops->read(node, offset, buf, count, ctx);
@@ -607,8 +607,8 @@ static int srv_fs_clunk(struct ninep_fs_node *node, void *fs_ctx)
 	struct srv_entry *entry = global_srv_registry.services;
 	while (entry) {
 		if (entry->type == SRV_TYPE_LOCAL && entry->local.server) {
-			const struct ninep_fs_ops *ops = entry->local.server->config->fs_ops;
-			void *ctx = entry->local.server->config->fs_ctx;
+			const struct ninep_fs_ops *ops = entry->local.server->config.fs_ops;
+			void *ctx = entry->local.server->config.fs_ctx;
 
 			if (ops && ops->clunk) {
 				/* Try this service's clunk - it will return error if it doesn't own the node */
@@ -642,8 +642,8 @@ static int srv_fs_write(struct ninep_fs_node *node, uint64_t offset,
 	struct srv_entry *entry = global_srv_registry.services;
 	while (entry) {
 		if (entry->type == SRV_TYPE_LOCAL && entry->local.server) {
-			const struct ninep_fs_ops *ops = entry->local.server->config->fs_ops;
-			void *ctx = entry->local.server->config->fs_ctx;
+			const struct ninep_fs_ops *ops = entry->local.server->config.fs_ops;
+			void *ctx = entry->local.server->config.fs_ctx;
 
 			if (ops && ops->write) {
 				int ret = ops->write(node, offset, buf, count, uname, ctx);
@@ -673,8 +673,8 @@ static int srv_fs_create(struct ninep_fs_node *dir, const char *name,
 	struct srv_entry *entry = global_srv_registry.services;
 	while (entry) {
 		if (entry->type == SRV_TYPE_LOCAL && entry->local.server) {
-			const struct ninep_fs_ops *ops = entry->local.server->config->fs_ops;
-			void *ctx = entry->local.server->config->fs_ctx;
+			const struct ninep_fs_ops *ops = entry->local.server->config.fs_ops;
+			void *ctx = entry->local.server->config.fs_ctx;
 
 			if (ops && ops->create) {
 				int ret = ops->create(dir, name, name_len, perm,

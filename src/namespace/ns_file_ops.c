@@ -191,12 +191,12 @@ static int resolve_to_vfs_path(const char *ns_path, struct ns_entry **out_entry,
 static struct ninep_fs_node *server_walk_path(struct ninep_server *server,
                                                const char *path)
 {
-	if (!server || !server->config || !server->config->fs_ops) {
+	if (!server || !server->config.fs_ops) {
 		return NULL;
 	}
 
-	const struct ninep_fs_ops *ops = server->config->fs_ops;
-	void *fs_ctx = server->config->fs_ctx;
+	const struct ninep_fs_ops *ops = server->config.fs_ops;
+	void *fs_ctx = server->config.fs_ctx;
 
 	/* Get root node */
 	struct ninep_fs_node *node = ops->get_root(fs_ctx);
@@ -293,7 +293,7 @@ int ns_open(const char *path, fs_mode_t flags)
 		}
 
 		/* Call server's open operation */
-		const struct ninep_fs_ops *ops = server->config->fs_ops;
+		const struct ninep_fs_ops *ops = server->config.fs_ops;
 
 		/* Map Zephyr VFS flags to 9P mode flags
 		 * FS_O_READ (0x01)  -> NINEP_OREAD
@@ -312,7 +312,7 @@ int ns_open(const char *path, fs_mode_t flags)
 			mode = NINEP_OREAD;
 		}
 
-		ret = ops->open(node, mode, server->config->fs_ctx);
+		ret = ops->open(node, mode, server->config.fs_ctx);
 		if (ret < 0) {
 			LOG_ERR("Server open failed: %d", ret);
 			free_fd(fd);
@@ -361,10 +361,10 @@ ssize_t ns_read(int fd, void *buf, size_t count)
 	} else if (entry->ns_entry->type == NS_ENTRY_SERVER) {
 		/* Read from in-process server */
 		struct ninep_server *server = entry->ns_entry->server;
-		const struct ninep_fs_ops *ops = server->config->fs_ops;
+		const struct ninep_fs_ops *ops = server->config.fs_ops;
 
 		ret = ops->read(entry->server_node, entry->server_offset,
-		                buf, count, server->config->fs_ctx);
+		                buf, count, server->config.fs_ctx);
 		if (ret < 0) {
 			LOG_ERR("Server read failed: %d", (int)ret);
 			return ret;
@@ -411,11 +411,11 @@ ssize_t ns_write(int fd, const void *buf, size_t count)
 	} else if (entry->ns_entry->type == NS_ENTRY_SERVER) {
 		/* Write to in-process server */
 		struct ninep_server *server = entry->ns_entry->server;
-		const struct ninep_fs_ops *ops = server->config->fs_ops;
+		const struct ninep_fs_ops *ops = server->config.fs_ops;
 
 		/* Use "local" as uname for namespace operations (not remote 9P) */
 		ret = ops->write(entry->server_node, entry->server_offset,
-		                 buf, count, "local", server->config->fs_ctx);
+		                 buf, count, "local", server->config.fs_ctx);
 		if (ret < 0) {
 			LOG_ERR("Server write failed: %d", (int)ret);
 			return ret;
@@ -457,10 +457,10 @@ int ns_close(int fd)
 	} else if (entry->ns_entry->type == NS_ENTRY_SERVER) {
 		/* Clunk on in-process server */
 		struct ninep_server *server = entry->ns_entry->server;
-		const struct ninep_fs_ops *ops = server->config->fs_ops;
+		const struct ninep_fs_ops *ops = server->config.fs_ops;
 
 		if (ops->clunk) {
-			ret = ops->clunk(entry->server_node, server->config->fs_ctx);
+			ret = ops->clunk(entry->server_node, server->config.fs_ctx);
 			if (ret < 0) {
 				LOG_ERR("Server clunk failed: %d", ret);
 			}

@@ -194,7 +194,7 @@ struct ninep_server_fid {
  * @brief 9P server instance
  */
 struct ninep_server {
-	const struct ninep_server_config *config;
+	struct ninep_server_config config;  /* Store by value, not pointer */
 	struct ninep_transport *transport;
 
 	/* FID table */
