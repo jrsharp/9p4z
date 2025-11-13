@@ -20,6 +20,7 @@ if(CONFIG_NINEP_SERVER)
     src/ramfs.c
     src/sysfs.c
     src/union_fs.c
+    src/session_pool.c
   )
 
   if(CONFIG_NINEP_FS_PASSTHROUGH)
@@ -41,6 +42,11 @@ endif()
 
 if(CONFIG_NINEP_TRANSPORT_L2CAP)
   zephyr_library_sources(src/transport_l2cap.c)
+
+  # L2CAP session pool for multi-client servers
+  if(CONFIG_NINEP_SERVER)
+    zephyr_library_sources(src/session_pool_l2cap.c)
+  endif()
 endif()
 
 if(CONFIG_NINEP_TRANSPORT_COAP)
