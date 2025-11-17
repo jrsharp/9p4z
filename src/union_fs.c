@@ -163,7 +163,7 @@ static void decref_node(struct ninep_union_fs *fs, struct ninep_fs_node *node)
 	        node, node->name);
 }
 
-static void register_node_owner(struct ninep_union_fs *fs,
+static bool register_node_owner(struct ninep_union_fs *fs,
                                  struct ninep_fs_node *node,
                                  struct ninep_union_mount *mount)
 {
@@ -172,10 +172,13 @@ static void register_node_owner(struct ninep_union_fs *fs,
 	/* Check if already registered */
 	for (size_t i = 0; i < fs->num_node_owners; i++) {
 		if (fs->node_owners[i].node == node) {
-			/* Already registered, update mount and timestamp */
+			/* Already registered - increment refcount since walk created a new fid reference */
 			fs->node_owners[i].mount = mount;
 			fs->node_owners[i].last_access = now;
-			return;
+			fs->node_owners[i].refcount++;
+			LOG_DBG("Re-registered node=%p name='%s', refcount now %u",
+			        node, node->name, fs->node_owners[i].refcount);
+			return true;
 		}
 	}
 
@@ -184,11 +187,11 @@ static void register_node_owner(struct ninep_union_fs *fs,
 		fs->node_owners[fs->num_node_owners].node = node;
 		fs->node_owners[fs->num_node_owners].mount = mount;
 		fs->node_owners[fs->num_node_owners].last_access = now;
-		fs->node_owners[fs->num_node_owners].refcount = 0;
+		fs->node_owners[fs->num_node_owners].refcount = 1;  /* Start at 1 since walk created a fid */
 		fs->num_node_owners++;
-		LOG_DBG("Registered node=%p name='%s' -> mount '%s' (total=%zu)",
+		LOG_DBG("Registered node=%p name='%s' -> mount '%s' (total=%zu, refcount=1)",
 		        node, node->name, mount->path, fs->num_node_owners);
-		return;
+		return true;
 	}
 
 	/* Table is full - evict LRU entry (but only if refcount == 0) */
@@ -211,7 +214,20 @@ static void register_node_owner(struct ninep_union_fs *fs,
 		/* All nodes are referenced - can't evict anything! */
 		LOG_ERR("Node table full (%zu entries) and all nodes are referenced! Cannot register node=%p name='%s'",
 		        fs->num_node_owners, node, node->name);
-		return;
+
+		/* Dump first 10 entries to diagnose the leak */
+		LOG_ERR("Node table dump (first 10 entries):");
+		for (size_t i = 0; i < 10 && i < fs->num_node_owners; i++) {
+			LOG_ERR("  [%zu] node=%p name='%s' mount='%s' refcount=%u age=%u ms",
+			        i,
+			        fs->node_owners[i].node,
+			        fs->node_owners[i].node->name,
+			        fs->node_owners[i].mount->path,
+			        fs->node_owners[i].refcount,
+			        now - fs->node_owners[i].last_access);
+		}
+
+		return false;
 	}
 
 	LOG_INF("Node table full (%zu entries) - evicting LRU entry: node=%p name='%s' (age=%u ms, refcount=0)",
@@ -224,7 +240,8 @@ static void register_node_owner(struct ninep_union_fs *fs,
 	fs->node_owners[lru_idx].node = node;
 	fs->node_owners[lru_idx].mount = mount;
 	fs->node_owners[lru_idx].last_access = now;
-	fs->node_owners[lru_idx].refcount = 0;
+	fs->node_owners[lru_idx].refcount = 1;  /* Start at 1 since walk created a fid */
+	return true;
 }
 
 static struct ninep_union_mount *find_node_owner(struct ninep_union_fs *fs,
@@ -313,7 +330,14 @@ static struct ninep_fs_node *union_walk(struct ninep_fs_node *parent,
 			struct ninep_fs_node *node = mount->fs_ops->walk(mount->root, name, name_len,
 			                                                   mount->fs_ctx);
 			if (node) {
-				register_node_owner(fs, node, mount);
+				if (!register_node_owner(fs, node, mount)) {
+					LOG_ERR("Failed to register node - node table full");
+					/* Backend may need to clunk the node we just walked */
+					if (mount->fs_ops->clunk) {
+						mount->fs_ops->clunk(node, mount->fs_ctx);
+					}
+					return NULL;
+				}
 			}
 			return node;
 		}
@@ -333,7 +357,14 @@ static struct ninep_fs_node *union_walk(struct ninep_fs_node *parent,
 		struct ninep_fs_node *node = mount->fs_ops->walk(mount->root, backend_path,
 		                                                   backend_path_len, mount->fs_ctx);
 		if (node) {
-			register_node_owner(fs, node, mount);
+			if (!register_node_owner(fs, node, mount)) {
+				LOG_ERR("Failed to register node - node table full");
+				/* Backend may need to clunk the node we just walked */
+				if (mount->fs_ops->clunk) {
+					mount->fs_ops->clunk(node, mount->fs_ctx);
+				}
+				return NULL;
+			}
 		}
 		return node;
 	} else {
@@ -354,7 +385,14 @@ static struct ninep_fs_node *union_walk(struct ninep_fs_node *parent,
 		struct ninep_fs_node *node = mount->fs_ops->walk(parent, name, name_len,
 		                                                   mount->fs_ctx);
 		if (node) {
-			register_node_owner(fs, node, mount);
+			if (!register_node_owner(fs, node, mount)) {
+				LOG_ERR("Failed to register node - node table full");
+				/* Backend may need to clunk the node we just walked */
+				if (mount->fs_ops->clunk) {
+					mount->fs_ops->clunk(node, mount->fs_ctx);
+				}
+				return NULL;
+			}
 		}
 		return node;
 	}
@@ -614,12 +652,9 @@ static int union_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 		return -ENOTSUP;
 	}
 
+	/* Note: refcount is managed by walk/clunk, not open/close.
+	 * Open just marks the fid as open for I/O, but doesn't create a new reference. */
 	int ret = mount->fs_ops->open(node, mode, mount->fs_ctx);
-
-	/* If open succeeded, increment refcount */
-	if (ret == 0) {
-		incref_node(fs, node);
-	}
 
 	return ret;
 }
@@ -673,7 +708,15 @@ static int union_create(struct ninep_fs_node *parent, const char *name,
 
 	/* Register the newly created node so subsequent operations can find its owner */
 	if (ret == 0 && new_node && *new_node) {
-		register_node_owner(fs, *new_node, mount);
+		if (!register_node_owner(fs, *new_node, mount)) {
+			LOG_ERR("Failed to register newly created node - node table full");
+			/* Clean up the created node since we can't track it */
+			if (mount->fs_ops->clunk) {
+				mount->fs_ops->clunk(*new_node, mount->fs_ctx);
+			}
+			*new_node = NULL;
+			return -ENOMEM;
+		}
 	}
 
 	return ret;
@@ -704,8 +747,9 @@ static int union_clunk(struct ninep_fs_node *node, void *fs_ctx)
 {
 	struct ninep_union_fs *fs = (struct ninep_union_fs *)fs_ctx;
 
-	/* Don't clunk the union root itself */
+	/* For union root, just decrement refcount but don't delegate or unregister */
 	if (node == fs->root) {
+		decref_node(fs, node);
 		return 0;
 	}
 
@@ -721,13 +765,13 @@ static int union_clunk(struct ninep_fs_node *node, void *fs_ctx)
 	LOG_DBG("union_clunk: mount=%p path='%s' fs_ops=%p root=%p",
 	        mount, mount->path, (void*)mount->fs_ops, (void*)mount->root);
 
-	/* CRITICAL: Don't clunk mount root nodes!
-	 * Check THIS FIRST before dereferencing anything else.
+	/* For mount root nodes, decrement refcount but don't delegate or unregister.
 	 * Mount roots are persistent and referenced by the mount structure. */
 	for (size_t i = 0; i < fs->num_mounts; i++) {
 		if (node == fs->mounts[i].root) {
-			LOG_INF("union_clunk: Skipping clunk for mount root '%s' (node=%p)",
+			LOG_DBG("union_clunk: Decrementing refcount for mount root '%s' (node=%p)",
 			        fs->mounts[i].path, node);
+			decref_node(fs, node);
 			return 0;
 		}
 	}

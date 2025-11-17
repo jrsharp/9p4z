@@ -61,7 +61,7 @@ struct ninep_union_fs {
 	uint64_t next_qid_path;             /* Next QID for synthetic nodes */
 
 	/* Node ownership tracking (for non-root nodes) - LRU cache */
-	struct ninep_node_owner node_owners[128];  /* LRU cache of 128 nodes */
+	struct ninep_node_owner node_owners[256];  /* LRU cache for multi-client usage (4 clients × ~64 fids) */
 	size_t num_node_owners;
 };
 
