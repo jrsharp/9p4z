@@ -251,7 +251,8 @@ static int ramfs_stat(struct ninep_fs_node *node, uint8_t *buf,
 
 	int ret = ninep_write_stat(buf, buf_len, &offset, &node->qid,
 	                            node->mode, node->length,
-	                            node->name, name_len);
+	                            node->name, name_len,
+	                            NULL, NULL, NULL);  /* uid/gid/muid default to "zephyr" */
 	if (ret < 0) {
 		return ret;
 	}

@@ -154,19 +154,22 @@ int ninep_write_qid(uint8_t *buf, size_t len, size_t *offset,
 
 int ninep_write_stat(uint8_t *buf, size_t len, size_t *offset,
                      const struct ninep_qid *qid, uint32_t mode,
-                     uint64_t length, const char *name, uint16_t name_len)
+                     uint64_t length, const char *name, uint16_t name_len,
+                     const char *uid, const char *gid, const char *muid)
 {
 	if (!buf || !offset || !qid || !name) {
 		return -EINVAL;
 	}
 
+	/* Use provided uid/gid/muid or default to "zephyr" */
+	if (!uid) uid = "zephyr";
+	if (!gid) gid = "zephyr";
+	if (!muid) muid = "zephyr";
+
 	/* Calculate stat size (excluding size field itself):
 	 * type[2] + dev[4] + qid[13] + mode[4] + atime[4] + mtime[4] +
-	 * length[8] + name[2+len] + uid[2+6] + gid[2+6] + muid[2+6]
+	 * length[8] + name[2+len] + uid[2+len] + gid[2+len] + muid[2+len]
 	 */
-	const char *uid = "zephyr";
-	const char *gid = "zephyr";
-	const char *muid = "zephyr";
 	uint16_t uid_len = strlen(uid);
 	uint16_t gid_len = strlen(gid);
 	uint16_t muid_len = strlen(muid);

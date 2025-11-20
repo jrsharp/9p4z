@@ -254,7 +254,8 @@ static int passthrough_read(struct ninep_fs_node *node, uint64_t offset,
 				size_t write_offset = 0;
 				int write_ret = ninep_write_stat(buf + buf_offset, count - buf_offset,
 				                                  &write_offset, &entry_qid, mode,
-				                                  entry.size, entry.name, name_len);
+				                                  entry.size, entry.name, name_len,
+				                                  NULL, NULL, NULL);  /* uid/gid/muid default to "zephyr" */
 
 				if (write_ret < 0) {
 					LOG_ERR("ninep_write_stat failed: %d", write_ret);
@@ -379,7 +380,8 @@ static int passthrough_stat(struct ninep_fs_node *node, uint8_t *buf,
 
 	int ret = ninep_write_stat(buf, buf_len, &offset, &node->qid,
 	                            node->mode, node->length,
-	                            node->name, name_len);
+	                            node->name, name_len,
+	                            NULL, NULL, NULL);  /* uid/gid/muid default to "zephyr" */
 	if (ret < 0) {
 		return ret;
 	}

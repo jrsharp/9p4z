@@ -406,7 +406,8 @@ static int sysfs_read(struct ninep_fs_node *node, uint64_t offset,
 			                           &write_offset, &child_qid,
 			                           is_dir ? (0755 | NINEP_DMDIR) : ((child_entry && child_entry->writable) ? 0644 : 0444),
 			                           0,  /* length */
-			                           child_names[i], name_len);
+			                           child_names[i], name_len,
+			                           NULL, NULL, NULL);  /* uid/gid/muid default to "zephyr" */
 
 			if (ret < 0) {
 				/* Error writing stat */
@@ -471,7 +472,8 @@ static int sysfs_stat(struct ninep_fs_node *node, uint8_t *buf,
 
 	int ret = ninep_write_stat(buf, buf_len, &offset, &node->qid,
 	                           node->mode, node->length,
-	                           node->name, name_len);
+	                           node->name, name_len,
+	                           NULL, NULL, NULL);  /* uid/gid/muid default to "zephyr" */
 	if (ret < 0) {
 		LOG_ERR("ninep_write_stat failed: %d", ret);
 		return ret;

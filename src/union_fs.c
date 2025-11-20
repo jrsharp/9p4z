@@ -472,7 +472,8 @@ static int union_read(struct ninep_fs_node *node, uint64_t offset,
 					                                  &write_offset, &mount_qid,
 					                                  0755 | NINEP_DMDIR,  /* Directory mode */
 					                                  0,  /* length */
-					                                  name, name_len);
+					                                  name, name_len,
+					                                  NULL, NULL, NULL);  /* uid/gid/muid default to "zephyr" */
 
 					if (write_ret < 0) {
 						/* No more space - return what we have */

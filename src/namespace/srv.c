@@ -423,7 +423,8 @@ static int srv_fs_stat(struct ninep_fs_node *node, uint8_t *buf,
 		/* Stat the /srv directory itself */
 		size_t offset = 0;
 		int ret = ninep_write_stat(buf, buf_len, &offset, &node->qid,
-		                            node->mode, 0, node->name, strlen(node->name));
+		                            node->mode, 0, node->name, strlen(node->name),
+		                            NULL, NULL, NULL);  /* uid/gid/muid default to "zephyr" */
 		return (ret < 0) ? ret : offset;
 	}
 
@@ -547,7 +548,8 @@ static int srv_fs_read(struct ninep_fs_node *node, uint64_t offset,
 
 				uint32_t mode = is_dir ? (0555 | NINEP_DMDIR) : 0444;
 				int ret = ninep_write_stat(buf, count, &stat_offset, &qid, mode, 0,
-				                            entry->name, name_len);
+				                            entry->name, name_len,
+				                            NULL, NULL, NULL);  /* uid/gid/muid default to "zephyr" */
 				if (ret < 0) {
 					k_mutex_unlock(&global_srv_registry.lock);
 					return ret;
