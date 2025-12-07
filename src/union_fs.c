@@ -172,12 +172,28 @@ static bool register_node_owner(struct ninep_union_fs *fs,
 	/* Check if already registered */
 	for (size_t i = 0; i < fs->num_node_owners; i++) {
 		if (fs->node_owners[i].node == node) {
-			/* Already registered - increment refcount since walk created a new fid reference */
+			/* Already registered - update last_access for LRU.
+			 *
+			 * For intermediate nodes in multi-element walks (like /games/lobby/board),
+			 * we don't want to increment refcount since only the final element's fid
+			 * gets clunked. Intermediate nodes would accumulate refcounts without
+			 * ever being decremented.
+			 *
+			 * However, if refcount == 0, this node was previously clunked and is now
+			 * being walked to again (as a final target). In this case, we MUST
+			 * re-activate it with refcount = 1, otherwise the next clunk will warn
+			 * about decrementing refcount that's already 0. */
 			fs->node_owners[i].mount = mount;
 			fs->node_owners[i].last_access = now;
-			fs->node_owners[i].refcount++;
-			LOG_DBG("Re-registered node=%p name='%s', refcount now %u",
-			        node, node->name, fs->node_owners[i].refcount);
+			if (fs->node_owners[i].refcount == 0) {
+				/* Node was clunked, now being walked to again - reactivate */
+				fs->node_owners[i].refcount = 1;
+				LOG_DBG("Re-activated node=%p name='%s', refcount=1",
+				        node, node->name);
+			} else {
+				LOG_DBG("Re-registered node=%p name='%s', refcount=%u (unchanged)",
+				        node, node->name, fs->node_owners[i].refcount);
+			}
 			return true;
 		}
 	}
@@ -194,25 +210,46 @@ static bool register_node_owner(struct ninep_union_fs *fs,
 		return true;
 	}
 
-	/* Table is full - evict LRU entry (but only if refcount == 0) */
+	/* Table is full - evict LRU entry
+	 * First pass: prefer nodes with refcount == 0
+	 * Second pass: if all have refcount > 0, evict stale nodes (> 30s old)
+	 *              as a safety valve against leaked intermediate nodes */
 	size_t lru_idx = SIZE_MAX;
 	uint32_t oldest_time = UINT32_MAX;
+	size_t stale_idx = SIZE_MAX;
+	uint32_t stalest_time = UINT32_MAX;
+	const uint32_t STALE_THRESHOLD_MS = 30000;  /* 30 seconds */
 
 	for (size_t i = 0; i < fs->num_node_owners; i++) {
-		/* Skip nodes with active references */
-		if (fs->node_owners[i].refcount > 0) {
-			continue;
+		uint32_t age = now - fs->node_owners[i].last_access;
+
+		/* Track LRU among refcount==0 nodes (ideal eviction candidates) */
+		if (fs->node_owners[i].refcount == 0) {
+			if (fs->node_owners[i].last_access < oldest_time) {
+				oldest_time = fs->node_owners[i].last_access;
+				lru_idx = i;
+			}
 		}
 
-		if (fs->node_owners[i].last_access < oldest_time) {
-			oldest_time = fs->node_owners[i].last_access;
-			lru_idx = i;
+		/* Also track oldest node regardless of refcount, for fallback eviction
+		 * of stale leaked nodes (intermediate walk nodes that never got clunked) */
+		if (age > STALE_THRESHOLD_MS && fs->node_owners[i].last_access < stalest_time) {
+			stalest_time = fs->node_owners[i].last_access;
+			stale_idx = i;
 		}
 	}
 
+	/* Prefer refcount==0 eviction, fall back to stale node eviction */
+	if (lru_idx == SIZE_MAX && stale_idx != SIZE_MAX) {
+		LOG_WRN("No refcount=0 nodes to evict, using stale node fallback (age=%u ms, refcount=%u)",
+		        now - stalest_time, fs->node_owners[stale_idx].refcount);
+		lru_idx = stale_idx;
+		oldest_time = stalest_time;
+	}
+
 	if (lru_idx == SIZE_MAX) {
-		/* All nodes are referenced - can't evict anything! */
-		LOG_ERR("Node table full (%zu entries) and all nodes are referenced! Cannot register node=%p name='%s'",
+		/* All nodes are both referenced AND recently accessed - can't evict! */
+		LOG_ERR("Node table full (%zu entries) and no evictable nodes! Cannot register node=%p name='%s'",
 		        fs->num_node_owners, node, node->name);
 
 		/* Dump first 10 entries to diagnose the leak */
@@ -230,11 +267,12 @@ static bool register_node_owner(struct ninep_union_fs *fs,
 		return false;
 	}
 
-	LOG_INF("Node table full (%zu entries) - evicting LRU entry: node=%p name='%s' (age=%u ms, refcount=0)",
+	LOG_INF("Node table full (%zu entries) - evicting LRU entry: node=%p name='%s' (age=%u ms, refcount=%u)",
 	        fs->num_node_owners,
 	        fs->node_owners[lru_idx].node,
 	        fs->node_owners[lru_idx].node->name,
-	        now - oldest_time);
+	        now - oldest_time,
+	        fs->node_owners[lru_idx].refcount);
 
 	/* Replace LRU entry with new node */
 	fs->node_owners[lru_idx].node = node;
@@ -801,23 +839,30 @@ static int union_clunk(struct ninep_fs_node *node, void *fs_ctx)
 
 	/* Only delegate if backend has a clunk handler */
 	if (mount->fs_ops->clunk) {
-		/* Check if refcount is now 0 - if so, we can unregister and free */
-		bool should_unregister = false;
-		for (size_t i = 0; i < fs->num_node_owners; i++) {
-			if (fs->node_owners[i].node == node) {
-				if (fs->node_owners[i].refcount == 0) {
-					should_unregister = true;
+		/* Call backend clunk first - it may keep the node alive (e.g., cached nodes) */
+		int ret = mount->fs_ops->clunk(node, mount->fs_ctx);
+
+		/* Only unregister if:
+		 * 1. Backend returned 0 (success, node freed)
+		 * 2. Refcount is now 0 (no more fids reference it)
+		 * If backend returns positive (e.g., 1), it means "I kept the node" */
+		if (ret == 0) {
+			bool should_unregister = false;
+			for (size_t i = 0; i < fs->num_node_owners; i++) {
+				if (fs->node_owners[i].node == node) {
+					if (fs->node_owners[i].refcount == 0) {
+						should_unregister = true;
+					}
+					break;
 				}
-				break;
+			}
+
+			if (should_unregister) {
+				unregister_node_owner(fs, node);
 			}
 		}
 
-		/* Only unregister if refcount reached 0 (no more fids reference it) */
-		if (should_unregister) {
-			unregister_node_owner(fs, node);
-		}
-
-		return mount->fs_ops->clunk(node, mount->fs_ctx);
+		return ret;
 	}
 
 	/* Backend doesn't have clunk handler - it manages nodes itself (e.g., sysfs cache)
