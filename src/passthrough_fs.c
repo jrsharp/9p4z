@@ -167,7 +167,8 @@ static int passthrough_open(struct ninep_fs_node *node, uint8_t mode, void *fs_c
 
 /* Read from file or directory */
 static int passthrough_read(struct ninep_fs_node *node, uint64_t offset,
-                             uint8_t *buf, uint32_t count, void *fs_ctx)
+                             uint8_t *buf, uint32_t count, const char *uname,
+                             void *fs_ctx)
 {
 	struct ninep_passthrough_fs *fs = fs_ctx;
 	const char *node_path = get_node_path(node);

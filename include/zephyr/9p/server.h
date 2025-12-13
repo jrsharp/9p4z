@@ -125,9 +125,14 @@ struct ninep_fs_ops {
 
 	/**
 	 * @brief Read from node
+	 *
+	 * @param uname User name from session (for per-user responses, e.g., directory
+	 *              listings with user-specific permissions). May be NULL if not
+	 *              needed. Implementations can ignore this parameter if they don't
+	 *              need per-user behavior.
 	 */
 	int (*read)(struct ninep_fs_node *node, uint64_t offset,
-	            uint8_t *buf, uint32_t count, void *fs_ctx);
+	            uint8_t *buf, uint32_t count, const char *uname, void *fs_ctx);
 
 	/**
 	 * @brief Write to node

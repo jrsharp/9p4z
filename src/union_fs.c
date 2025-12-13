@@ -437,7 +437,8 @@ static struct ninep_fs_node *union_walk(struct ninep_fs_node *parent,
 }
 
 static int union_read(struct ninep_fs_node *node, uint64_t offset,
-                       uint8_t *buf, uint32_t count, void *fs_ctx)
+                       uint8_t *buf, uint32_t count, const char *uname,
+                       void *fs_ctx)
 {
 	struct ninep_union_fs *fs = (struct ninep_union_fs *)fs_ctx;
 
@@ -465,14 +466,14 @@ static int union_read(struct ninep_fs_node *node, uint64_t offset,
 		/* If there's a root mount AND no other mounts, just delegate */
 		if (root_mount && num_other_mounts == 0 && root_mount->fs_ops->read) {
 			return root_mount->fs_ops->read(root_mount->root, offset,
-			                                 buf, count, root_mount->fs_ctx);
+			                                 buf, count, uname, root_mount->fs_ctx);
 		}
 
 		/* If there's a root mount AND other mounts, we need to merge listings */
 		if (root_mount && num_other_mounts > 0) {
 			/* First, get the "/" mount's entries */
 			int ret = root_mount->fs_ops->read(root_mount->root, offset,
-			                                    buf, count, root_mount->fs_ctx);
+			                                    buf, count, uname, root_mount->fs_ctx);
 
 			if (ret < 0) {
 				return ret;
@@ -583,7 +584,7 @@ static int union_read(struct ninep_fs_node *node, uint64_t offset,
 
 	LOG_DBG("Delegating read to mount '%s' for node '%s'",
 	        mount->path, node->name);
-	return mount->fs_ops->read(node, offset, buf, count, mount->fs_ctx);
+	return mount->fs_ops->read(node, offset, buf, count, uname, mount->fs_ctx);
 }
 
 static int union_stat(struct ninep_fs_node *node, uint8_t *buf,

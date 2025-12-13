@@ -313,7 +313,8 @@ static int sysfs_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 
 /* Read from file */
 static int sysfs_read(struct ninep_fs_node *node, uint64_t offset,
-                      uint8_t *buf, uint32_t count, void *fs_ctx)
+                      uint8_t *buf, uint32_t count, const char *uname,
+                      void *fs_ctx)
 {
 	struct ninep_sysfs *sysfs = fs_ctx;
 
@@ -486,7 +487,7 @@ static int sysfs_stat(struct ninep_fs_node *node, uint8_t *buf,
 /* Clunk (release) node */
 static int sysfs_clunk(struct ninep_fs_node *node, void *fs_ctx)
 {
-	ARG_UNUSED(fs_ctx);
+	struct ninep_sysfs *sysfs = fs_ctx;
 
 	LOG_DBG("sysfs_clunk: node=%p name='%s'", node, node->name);
 
@@ -499,10 +500,20 @@ static int sysfs_clunk(struct ninep_fs_node *node, void *fs_ctx)
 	/* Decrement refcount */
 	decref_node(node);
 
-	/* Check if we should free the node */
+	/* Check refcount and potentially call clunk callback */
 	for (int i = 0; i < SYSFS_NODE_CACHE_SIZE; i++) {
 		if (node_cache.in_use[i] && &node_cache.nodes[i] == node) {
 			if (node_cache.refcount[i] == 0) {
+				/* Call user-provided clunk callback if present */
+				struct ninep_sysfs_entry *entry = find_entry(sysfs, node->name);
+				if (entry && entry->clunk) {
+					LOG_DBG("sysfs_clunk: calling user clunk for '%s'", node->name);
+					int ret = entry->clunk(entry->ctx);
+					if (ret < 0) {
+						LOG_ERR("sysfs_clunk: user callback failed: %d", ret);
+					}
+				}
+
 				/* No more references - free it */
 				free_node(node);
 			}
@@ -572,6 +583,7 @@ int ninep_sysfs_register_file(struct ninep_sysfs *sysfs,
 	entry->path = path;
 	entry->generator = generator;
 	entry->writer = NULL;
+	entry->clunk = NULL;
 	entry->ctx = ctx;
 	entry->is_dir = false;
 	entry->writable = false;
@@ -588,6 +600,16 @@ int ninep_sysfs_register_writable_file(struct ninep_sysfs *sysfs,
                                         ninep_sysfs_writer_t writer,
                                         void *ctx)
 {
+	return ninep_sysfs_register_writable_file_ex(sysfs, path, generator, writer, NULL, ctx);
+}
+
+int ninep_sysfs_register_writable_file_ex(struct ninep_sysfs *sysfs,
+                                           const char *path,
+                                           ninep_sysfs_generator_t generator,
+                                           ninep_sysfs_writer_t writer,
+                                           ninep_sysfs_clunk_t clunk,
+                                           void *ctx)
+{
 	if (!sysfs || !path) {
 		return -EINVAL;
 	}
@@ -601,13 +623,14 @@ int ninep_sysfs_register_writable_file(struct ninep_sysfs *sysfs,
 	entry->path = path;
 	entry->generator = generator;
 	entry->writer = writer;
+	entry->clunk = clunk;
 	entry->ctx = ctx;
 	entry->is_dir = false;
 	entry->writable = (writer != NULL);
 
 	sysfs->num_entries++;
 
-	LOG_DBG("Registered writable file: %s", path);
+	LOG_DBG("Registered writable file: %s (clunk=%s)", path, clunk ? "yes" : "no");
 	return 0;
 }
 
@@ -626,6 +649,7 @@ int ninep_sysfs_register_dir(struct ninep_sysfs *sysfs, const char *path)
 	entry->path = path;
 	entry->generator = NULL;
 	entry->writer = NULL;
+	entry->clunk = NULL;
 	entry->ctx = NULL;
 	entry->is_dir = true;
 	entry->writable = false;

@@ -84,7 +84,8 @@ static int ramfs_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 
 /* Read from file */
 static int ramfs_read(struct ninep_fs_node *node, uint64_t offset,
-                      uint8_t *buf, uint32_t count, void *fs_ctx)
+                      uint8_t *buf, uint32_t count, const char *uname,
+                      void *fs_ctx)
 {
 	if (node->type == NINEP_NODE_DIR) {
 		/* Read directory entries */

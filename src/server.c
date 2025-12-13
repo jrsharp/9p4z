@@ -327,7 +327,7 @@ static void handle_tread(struct ninep_server *server, uint16_t tag,
 	/* Read data */
 	int bytes = server->config.fs_ops->read(sfid->node, offset,
 	                                          &server->tx_buf[11], count,
-	                                          server->config.fs_ctx);
+	                                          sfid->uname, server->config.fs_ctx);
 	if (bytes < 0) {
 		send_error(server, tag, "read failed");
 		return;

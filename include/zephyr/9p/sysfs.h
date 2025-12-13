@@ -48,13 +48,25 @@ typedef int (*ninep_sysfs_writer_t)(const uint8_t *buf, uint32_t count,
                                      uint64_t offset, void *ctx);
 
 /**
+ * @brief Clunk (close) callback
+ *
+ * Called when a sysfs file is closed (clunked). Useful for finalizing
+ * operations like DFU writes that need to know when the file is closed.
+ *
+ * @param ctx Optional context pointer passed during registration
+ * @return 0 on success, negative error code on failure
+ */
+typedef int (*ninep_sysfs_clunk_t)(void *ctx);
+
+/**
  * @brief Sysfs file entry
  */
 struct ninep_sysfs_entry {
 	const char *path;                  /* Full path (e.g., "/sys/uptime") */
 	ninep_sysfs_generator_t generator; /* Content generator callback */
 	ninep_sysfs_writer_t writer;       /* Content writer callback (NULL for read-only) */
-	void *ctx;                         /* Optional context for generator/writer */
+	ninep_sysfs_clunk_t clunk;         /* Clunk (close) callback (NULL if not needed) */
+	void *ctx;                         /* Optional context for callbacks */
 	bool is_dir;                       /* True for directories */
 	bool writable;                     /* True if file is writable */
 };
@@ -111,6 +123,28 @@ int ninep_sysfs_register_writable_file(struct ninep_sysfs *sysfs,
                                         ninep_sysfs_generator_t generator,
                                         ninep_sysfs_writer_t writer,
                                         void *ctx);
+
+/**
+ * @brief Register a writable sysfs file with clunk callback
+ *
+ * Like ninep_sysfs_register_writable_file() but with an additional clunk
+ * callback that is called when the file is closed. Useful for operations
+ * that need to finalize when writing is complete (e.g., DFU).
+ *
+ * @param sysfs Sysfs instance
+ * @param path Full path to the file (e.g., "/dev/firmware")
+ * @param generator Content generator callback (for reads)
+ * @param writer Content writer callback (for writes)
+ * @param clunk Clunk callback (called when file is closed)
+ * @param ctx Optional context pointer passed to all callbacks
+ * @return 0 on success, negative error code on failure
+ */
+int ninep_sysfs_register_writable_file_ex(struct ninep_sysfs *sysfs,
+                                           const char *path,
+                                           ninep_sysfs_generator_t generator,
+                                           ninep_sysfs_writer_t writer,
+                                           ninep_sysfs_clunk_t clunk,
+                                           void *ctx);
 
 /**
  * @brief Register a sysfs directory
