@@ -175,6 +175,61 @@ struct ninep_fs_ops {
 };
 
 /**
+ * @brief Authentication configuration
+ *
+ * Optional public-key authentication using 9P Tauth/Rauth protocol.
+ * If provided, server will handle Tauth by generating a challenge.
+ * The application callback verifies the identity claim and signature.
+ */
+struct ninep_auth_config {
+	/**
+	 * @brief Verify authentication response
+	 *
+	 * Called when client writes signature+pubkey to auth fid.
+	 * Application is responsible for ALL verification:
+	 * - Verify identity matches pubkey (e.g., CGA = SHA256(pubkey)[:20])
+	 * - Verify signature over challenge
+	 * - Check if identity is authorized (not banned, etc.)
+	 *
+	 * @param identity The claimed identity string from Tauth uname
+	 * @param pubkey Public key bytes from auth response
+	 * @param pubkey_len Length of public key
+	 * @param signature Signature bytes from auth response
+	 * @param sig_len Length of signature
+	 * @param challenge The challenge that was signed
+	 * @param challenge_len Length of challenge
+	 * @param auth_ctx Application-provided auth context
+	 * @return 0 on success (verified and authorized), negative error code on failure
+	 */
+	int (*verify_auth)(const char *identity,
+	                   const uint8_t *pubkey, size_t pubkey_len,
+	                   const uint8_t *signature, size_t sig_len,
+	                   const uint8_t *challenge, size_t challenge_len,
+	                   void *auth_ctx);
+
+	/**
+	 * @brief Check if identity has permission for operation
+	 *
+	 * Called by filesystem operations to check authorization.
+	 * Not used by 9p4z directly - provided for application use.
+	 *
+	 * @param identity The authenticated identity (or NULL for anonymous)
+	 * @param path Path being accessed
+	 * @param mode Access mode (NINEP_OREAD, NINEP_OWRITE, etc.)
+	 * @param auth_ctx Application-provided auth context
+	 * @return 0 if permitted, -EPERM if denied
+	 */
+	int (*check_perm)(const char *identity, const char *path,
+	                  uint8_t mode, void *auth_ctx);
+
+	/** Application-provided context passed to callbacks */
+	void *auth_ctx;
+
+	/** If true, require auth for all connections. If false, anonymous allowed. */
+	bool required;
+};
+
+/**
  * @brief 9P server configuration
  */
 struct ninep_server_config {
@@ -182,6 +237,26 @@ struct ninep_server_config {
 	void *fs_ctx;
 	uint32_t max_message_size;
 	const char *version;
+
+	/** Optional authentication config. NULL = no auth required */
+	const struct ninep_auth_config *auth_config;
+};
+
+/** Challenge size for auth (32 bytes) */
+#define NINEP_AUTH_CHALLENGE_SIZE 32
+
+/** Maximum identity string length (e.g., CGA = 40 hex + null = 41) */
+#define NINEP_AUTH_IDENTITY_MAX 64
+
+/**
+ * @brief Auth FID state (for authentication in progress)
+ */
+struct ninep_auth_state {
+	uint8_t challenge[NINEP_AUTH_CHALLENGE_SIZE];  /**< Random challenge */
+	char claimed_identity[NINEP_AUTH_IDENTITY_MAX]; /**< Identity from Tauth uname */
+	uint64_t challenge_time;                        /**< Timestamp for expiry */
+	bool challenge_issued;                          /**< Challenge has been read */
+	bool authenticated;                             /**< Auth completed successfully */
 };
 
 /**
@@ -192,7 +267,11 @@ struct ninep_server_fid {
 	struct ninep_fs_node *node;
 	bool in_use;
 	uint32_t iounit;
-	char uname[64];  /**< User name from Tattach (client-provided identifier) */
+	char uname[64];  /**< User name from Tattach (CGA or anonymous) */
+
+	/** Auth state (only used for auth fids) */
+	struct ninep_auth_state auth;
+	bool is_auth_fid;  /**< True if this is an auth fid from Tauth */
 };
 
 /**

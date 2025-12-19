@@ -57,6 +57,7 @@ struct ninep_session_pool {
 	struct k_mutex lock;                /* Protects session allocation */
 	struct ninep_fs_ops *fs_ops;       /* Shared filesystem operations */
 	void *fs_context;                   /* Shared filesystem context */
+	const struct ninep_auth_config *auth_config;  /* Shared auth config (optional) */
 	struct ninep_session sessions[];    /* Variable-length array of sessions */
 };
 
@@ -67,6 +68,7 @@ struct ninep_session_pool_config {
 	int max_sessions;                   /* Maximum concurrent sessions */
 	struct ninep_fs_ops *fs_ops;       /* Filesystem operations (shared) */
 	void *fs_context;                   /* Filesystem context (shared) */
+	const struct ninep_auth_config *auth_config;  /* Optional auth config (shared) */
 };
 
 /**

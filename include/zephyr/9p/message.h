@@ -80,6 +80,18 @@ int ninep_build_rattach(uint8_t *buf, size_t buf_len, uint16_t tag,
                         const struct ninep_qid *qid);
 
 /**
+ * @brief Build an Rauth message
+ *
+ * @param buf Output buffer
+ * @param buf_len Buffer length
+ * @param tag Message tag
+ * @param qid Qid of the auth file
+ * @return Number of bytes written, or negative error code
+ */
+int ninep_build_rauth(uint8_t *buf, size_t buf_len, uint16_t tag,
+                      const struct ninep_qid *qid);
+
+/**
  * @brief Build a Twalk message
  *
  * @param buf Output buffer

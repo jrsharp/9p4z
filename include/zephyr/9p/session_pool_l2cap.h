@@ -33,6 +33,7 @@ struct ninep_session_pool_l2cap_config {
 	size_t rx_buf_size_per_session;    /* RX buffer size per session */
 	struct ninep_fs_ops *fs_ops;       /* Filesystem operations (shared) */
 	void *fs_context;                   /* Filesystem context (shared) */
+	const struct ninep_auth_config *auth_config;  /* Optional auth config (shared) */
 };
 
 /**

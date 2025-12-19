@@ -227,6 +227,7 @@ static int l2cap_session_accept(struct bt_conn *conn, struct bt_l2cap_server *se
 	struct ninep_server_config server_config = {
 		.fs_ops = l2cap_pool->pool->fs_ops,
 		.fs_ctx = l2cap_pool->pool->fs_context,
+		.auth_config = l2cap_pool->pool->auth_config,
 	};
 
 	int ret = ninep_server_init(&session->server, &server_config, &session->transport);
@@ -313,6 +314,7 @@ static int ninep_session_pool_l2cap_init_common(
 		.max_sessions = config->max_sessions,
 		.fs_ops = config->fs_ops,
 		.fs_context = config->fs_context,
+		.auth_config = config->auth_config,
 	};
 
 	ret = ninep_session_pool_init(l2cap_pool->pool, &pool_config);
@@ -359,6 +361,7 @@ int ninep_session_pool_l2cap_init(struct ninep_session_pool_l2cap *l2cap_pool,
 	pool->max_sessions = config->max_sessions;
 	pool->fs_ops = config->fs_ops;
 	pool->fs_context = config->fs_context;
+	pool->auth_config = config->auth_config;
 
 	ret = k_mutex_init(&pool->lock);
 	if (ret < 0) {

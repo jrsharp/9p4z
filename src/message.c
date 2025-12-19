@@ -178,6 +178,36 @@ int ninep_build_rattach(uint8_t *buf, size_t buf_len, uint16_t tag,
 	return offset;
 }
 
+int ninep_build_rauth(uint8_t *buf, size_t buf_len, uint16_t tag,
+                      const struct ninep_qid *qid)
+{
+	if (!buf || !qid || buf_len < 20) {
+		return -EINVAL;
+	}
+
+	uint32_t msg_size = 7 + 13;
+
+	size_t offset = 0;
+	struct ninep_msg_header hdr = {
+		.size = msg_size,
+		.type = NINEP_RAUTH,
+		.tag = tag,
+	};
+
+	int ret = ninep_write_header(buf, buf_len, &hdr);
+	if (ret < 0) {
+		return ret;
+	}
+	offset = 7;
+
+	ret = ninep_write_qid(buf, buf_len, &offset, qid);
+	if (ret < 0) {
+		return ret;
+	}
+
+	return offset;
+}
+
 int ninep_build_twalk(uint8_t *buf, size_t buf_len, uint16_t tag,
                       uint32_t fid, uint32_t newfid,
                       uint16_t nwname, const char **wnames, const uint16_t *wname_lens)

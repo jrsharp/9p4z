@@ -490,9 +490,10 @@ static int srv_fs_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 
 /* Read directory or service info */
 static int srv_fs_read(struct ninep_fs_node *node, uint64_t offset,
-                       uint8_t *buf, uint32_t count, void *fs_ctx)
+                       uint8_t *buf, uint32_t count, const char *uname, void *fs_ctx)
 {
 	ARG_UNUSED(fs_ctx);
+	ARG_UNUSED(uname);
 
 	LOG_DBG("srv_fs_read: node=%p, offset=%llu, count=%u", node, offset, count);
 
@@ -576,7 +577,7 @@ static int srv_fs_read(struct ninep_fs_node *node, uint64_t offset,
 			void *ctx = entry->local.server->config.fs_ctx;
 
 			if (ops && ops->read) {
-				int ret = ops->read(node, offset, buf, count, ctx);
+				int ret = ops->read(node, offset, buf, count, NULL, ctx);
 				if (ret >= 0 || ret != -EINVAL) {
 					k_mutex_unlock(&global_srv_registry.lock);
 					return ret;

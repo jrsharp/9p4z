@@ -24,6 +24,7 @@ int ninep_session_pool_init(struct ninep_session_pool *pool,
 	pool->max_sessions = config->max_sessions;
 	pool->fs_ops = config->fs_ops;
 	pool->fs_context = config->fs_context;
+	pool->auth_config = config->auth_config;
 
 	ret = k_mutex_init(&pool->lock);
 	if (ret < 0) {

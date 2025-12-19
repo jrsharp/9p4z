@@ -8,8 +8,21 @@
 #include <zephyr/logging/log.h>
 #include <string.h>
 #include <errno.h>
+#include <stdio.h>
+#include <strings.h>  /* For strncasecmp */
+
+#ifdef __ZEPHYR__
+#include <zephyr/kernel.h>       /* For k_uptime_get */
+#include <zephyr/random/random.h> /* For sys_rand_get */
+#else
+#include <time.h>  /* For clock_gettime on Unix */
+#include <zephyr/kernel.h>  /* For k_uptime_get_32 shim */
+#endif
 
 LOG_MODULE_REGISTER(ninep_server, CONFIG_NINEP_LOG_LEVEL);
+
+/* Forward declarations */
+static uint64_t get_current_time_ms(void);
 
 /* Helper to find FID */
 static struct ninep_server_fid *find_fid(struct ninep_server *server, uint32_t fid)
@@ -38,6 +51,7 @@ static struct ninep_server_fid *alloc_fid(struct ninep_server *server, uint32_t 
 			server->fids[i].node = NULL;
 			server->fids[i].iounit = 0;
 			server->fids[i].uname[0] = '\0';  /* Empty by default */
+			server->fids[i].is_auth_fid = false;  /* Regular fid, not auth */
 			return &server->fids[i];
 		}
 	}
@@ -112,8 +126,9 @@ static void handle_tattach(struct ninep_server *server, uint16_t tag,
                            const uint8_t *msg, size_t len)
 {
 	uint32_t fid = msg[7] | (msg[8] << 8) | (msg[9] << 16) | (msg[10] << 24);
+	uint32_t afid = msg[11] | (msg[12] << 8) | (msg[13] << 16) | (msg[14] << 24);
 
-	LOG_DBG("Tattach: fid=%u", fid);
+	LOG_DBG("Tattach: fid=%u, afid=%u", fid, afid);
 
 	/* Validate pointers */
 	if (!server) {
@@ -147,6 +162,42 @@ static void handle_tattach(struct ninep_server *server, uint16_t tag,
 		if (len >= 17 + uname_len && uname_len > 0) {
 			uname = (const char *)&msg[17];
 		}
+	}
+
+	/* Check authentication requirement */
+	const struct ninep_auth_config *auth = server->config.auth_config;
+	if (auth && auth->required) {
+		/* afid == NOFID means no auth attempted */
+		if (afid == NINEP_NOFID) {
+			send_error(server, tag, "authentication required");
+			return;
+		}
+
+		/* Find and verify auth fid */
+		struct ninep_server_fid *auth_fid = find_fid(server, afid);
+		if (!auth_fid || !auth_fid->is_auth_fid) {
+			send_error(server, tag, "invalid auth fid");
+			return;
+		}
+
+		if (!auth_fid->auth.authenticated) {
+			send_error(server, tag, "authentication incomplete");
+			return;
+		}
+
+		/* Verify uname matches authenticated identity */
+		if (uname_len > 0 && strncmp(uname, auth_fid->auth.claimed_identity, uname_len) != 0) {
+			LOG_WRN("Tattach uname mismatch: claimed='%.*s', auth='%s'",
+			        uname_len, uname, auth_fid->auth.claimed_identity);
+			send_error(server, tag, "uname does not match authenticated identity");
+			return;
+		}
+
+		/* Use authenticated identity as uname */
+		uname = auth_fid->auth.claimed_identity;
+		uname_len = strlen(auth_fid->auth.claimed_identity);
+
+		LOG_INF("Authenticated attach for identity '%s'", uname);
 	}
 
 	/* Allocate FID */
@@ -312,7 +363,52 @@ static void handle_tread(struct ninep_server *server, uint16_t tag,
 
 	struct ninep_server_fid *sfid = find_fid(server, fid);
 
-	if (!sfid || !sfid->node) {
+	if (!sfid) {
+		send_error(server, tag, "unknown fid");
+		return;
+	}
+
+	/* Handle auth fid read (returns challenge) */
+	if (sfid->is_auth_fid) {
+		/* Check challenge expiry (60 seconds) */
+		uint64_t now = get_current_time_ms();
+		if (now - sfid->auth.challenge_time > 60000) {
+			send_error(server, tag, "authentication timeout");
+			return;
+		}
+
+		/* Return the challenge */
+		int bytes = 0;
+		if (offset < NINEP_AUTH_CHALLENGE_SIZE) {
+			bytes = NINEP_AUTH_CHALLENGE_SIZE - offset;
+			if ((uint32_t)bytes > count) {
+				bytes = count;
+			}
+			memcpy(&server->tx_buf[11], &sfid->auth.challenge[offset], bytes);
+		}
+
+		sfid->auth.challenge_issued = true;
+		LOG_DBG("Auth read: returning %d bytes of challenge", bytes);
+
+		/* Build Rread header */
+		uint32_t msg_size = 11 + bytes;
+		server->tx_buf[0] = msg_size & 0xFF;
+		server->tx_buf[1] = (msg_size >> 8) & 0xFF;
+		server->tx_buf[2] = (msg_size >> 16) & 0xFF;
+		server->tx_buf[3] = (msg_size >> 24) & 0xFF;
+		server->tx_buf[4] = NINEP_RREAD;
+		server->tx_buf[5] = tag & 0xFF;
+		server->tx_buf[6] = (tag >> 8) & 0xFF;
+		server->tx_buf[7] = bytes & 0xFF;
+		server->tx_buf[8] = (bytes >> 8) & 0xFF;
+		server->tx_buf[9] = (bytes >> 16) & 0xFF;
+		server->tx_buf[10] = (bytes >> 24) & 0xFF;
+
+		ninep_transport_send(server->transport, server->tx_buf, msg_size);
+		return;
+	}
+
+	if (!sfid->node) {
 		send_error(server, tag, "unknown fid");
 		return;
 	}
@@ -386,13 +482,103 @@ static void handle_tstat(struct ninep_server *server, uint16_t tag,
 	}
 }
 
-/* Handle Tauth */
+/* Generate random challenge for auth */
+static void generate_challenge(uint8_t *challenge, size_t len)
+{
+#ifdef __ZEPHYR__
+	/* Use Zephyr random generator */
+	sys_rand_get(challenge, len);
+#else
+	/* Unix fallback: use timer-based pseudo-random (not cryptographically secure) */
+	uint32_t seed = (uint32_t)k_uptime_get_32();
+	for (size_t i = 0; i < len; i++) {
+		seed = seed * 1103515245 + 12345;
+		challenge[i] = (seed >> 16) & 0xFF;
+	}
+#endif
+}
+
+/* Get current time in milliseconds for challenge expiry */
+static uint64_t get_current_time_ms(void)
+{
+#ifdef __ZEPHYR__
+	return k_uptime_get();
+#else
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+}
+
+/* Handle Tauth - authentication start */
 static void handle_tauth(struct ninep_server *server, uint16_t tag,
                          const uint8_t *msg, size_t len)
 {
-	LOG_DBG("Tauth: authentication not required");
-	/* We don't support authentication - return error */
-	send_error(server, tag, "authentication not required");
+	/* Parse Tauth: size[4] type[1] tag[2] afid[4] uname[s] aname[s] */
+	uint32_t afid = msg[7] | (msg[8] << 8) | (msg[9] << 16) | (msg[10] << 24);
+
+	/* Parse uname (identity string) */
+	uint16_t uname_len = 0;
+	const char *uname = "";
+	if (len > 13) {
+		uname_len = msg[11] | (msg[12] << 8);
+		if (len >= 13 + uname_len) {
+			uname = (const char *)&msg[13];
+		}
+	}
+
+	LOG_DBG("Tauth: afid=%u, uname='%.*s' (len=%u)", afid, uname_len, uname, uname_len);
+
+	/* Check if auth is configured */
+	const struct ninep_auth_config *auth = server->config.auth_config;
+	if (!auth) {
+		/* No auth configured - return error (authentication not required) */
+		send_error(server, tag, "authentication not required");
+		return;
+	}
+
+	/* Validate identity length (format validation is app's responsibility) */
+	if (uname_len == 0 || uname_len >= NINEP_AUTH_IDENTITY_MAX) {
+		LOG_WRN("Invalid identity length: %u", uname_len);
+		send_error(server, tag, "invalid identity");
+		return;
+	}
+
+	/* Allocate auth FID */
+	struct ninep_server_fid *sfid = alloc_fid(server, afid);
+	if (!sfid) {
+		send_error(server, tag, "cannot allocate afid");
+		return;
+	}
+
+	/* Mark as auth fid and initialize auth state */
+	sfid->is_auth_fid = true;
+	sfid->node = NULL;  /* Auth fids don't point to filesystem nodes */
+	memset(&sfid->auth, 0, sizeof(sfid->auth));
+
+	/* Store claimed identity */
+	memcpy(sfid->auth.claimed_identity, uname, uname_len);
+	sfid->auth.claimed_identity[uname_len] = '\0';
+
+	/* Generate challenge */
+	generate_challenge(sfid->auth.challenge, NINEP_AUTH_CHALLENGE_SIZE);
+	sfid->auth.challenge_time = get_current_time_ms();
+	sfid->auth.challenge_issued = false;
+	sfid->auth.authenticated = false;
+
+	LOG_INF("Tauth: generated challenge for identity '%s'", sfid->auth.claimed_identity);
+
+	/* Build Rauth response */
+	struct ninep_qid aqid = {
+		.type = NINEP_QTAUTH,
+		.version = 0,
+		.path = (uint64_t)afid  /* Use afid as unique path */
+	};
+
+	int ret = ninep_build_rauth(server->tx_buf, sizeof(server->tx_buf), tag, &aqid);
+	if (ret > 0) {
+		ninep_transport_send(server->transport, server->tx_buf, ret);
+	}
 }
 
 /* Handle Tflush */
@@ -475,7 +661,93 @@ static void handle_twrite(struct ninep_server *server, uint16_t tag,
 	LOG_DBG("Twrite: fid=%u, offset=%llu, count=%u", fid, offset, count);
 
 	struct ninep_server_fid *sfid = find_fid(server, fid);
-	if (!sfid || !sfid->node) {
+	if (!sfid) {
+		send_error(server, tag, "unknown fid");
+		return;
+	}
+
+	/* Handle auth fid write (receives signature + pubkey from client) */
+	if (sfid->is_auth_fid) {
+		/* Must have read challenge first */
+		if (!sfid->auth.challenge_issued) {
+			send_error(server, tag, "must read challenge first");
+			return;
+		}
+
+		/* Check challenge expiry (60 seconds) */
+		uint64_t now = get_current_time_ms();
+		if (now - sfid->auth.challenge_time > 60000) {
+			send_error(server, tag, "authentication timeout");
+			return;
+		}
+
+		/* Auth response format is application-defined
+		 * Common format: signature[64] + pubkey[32] = 96 bytes
+		 * But we don't assume - app callback parses the data */
+		if (count < 2) {  /* Minimum sanity check */
+			LOG_WRN("Auth response too short: %u bytes", count);
+			send_error(server, tag, "invalid auth response");
+			return;
+		}
+
+		/* Call application verify callback - app does ALL verification */
+		const struct ninep_auth_config *auth = server->config.auth_config;
+		if (!auth || !auth->verify_auth) {
+			LOG_ERR("No auth verify callback configured");
+			send_error(server, tag, "auth not configured");
+			return;
+		}
+
+		/* Common layout for Ed25519: signature[64] + pubkey[32]
+		 * App is free to interpret differently, but we provide common sizes */
+		const size_t sig_size = 64;
+		const size_t pubkey_size = 32;
+		if (count < sig_size + pubkey_size) {
+			LOG_WRN("Auth response size %u too small for sig+pubkey", count);
+			send_error(server, tag, "invalid auth response size");
+			return;
+		}
+
+		const uint8_t *signature = data;
+		const uint8_t *pubkey = data + sig_size;
+
+		/* App callback does ALL verification:
+		 * - Verify identity matches pubkey (e.g., CGA = SHA256(pubkey)[:20])
+		 * - Verify signature over challenge
+		 * - Check if identity is authorized */
+		int ret = auth->verify_auth(
+			sfid->auth.claimed_identity,
+			pubkey, pubkey_size,
+			signature, sig_size,
+			sfid->auth.challenge, NINEP_AUTH_CHALLENGE_SIZE,
+			auth->auth_ctx);
+
+		if (ret != 0) {
+			LOG_WRN("Auth verification failed for identity '%s'",
+			        sfid->auth.claimed_identity);
+			send_error(server, tag, "authentication failed");
+			return;
+		}
+
+		LOG_INF("Auth successful for identity '%s'", sfid->auth.claimed_identity);
+
+		/* Mark as authenticated */
+		sfid->auth.authenticated = true;
+
+		/* Store authenticated identity in uname */
+		strncpy(sfid->uname, sfid->auth.claimed_identity, sizeof(sfid->uname) - 1);
+		sfid->uname[sizeof(sfid->uname) - 1] = '\0';
+
+		/* Send Rwrite with bytes written */
+		ret = ninep_build_rwrite(server->tx_buf, sizeof(server->tx_buf),
+		                         tag, count);
+		if (ret > 0) {
+			ninep_transport_send(server->transport, server->tx_buf, ret);
+		}
+		return;
+	}
+
+	if (!sfid->node) {
 		send_error(server, tag, "unknown fid");
 		return;
 	}

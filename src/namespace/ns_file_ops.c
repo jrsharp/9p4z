@@ -364,7 +364,7 @@ ssize_t ns_read(int fd, void *buf, size_t count)
 		const struct ninep_fs_ops *ops = server->config.fs_ops;
 
 		ret = ops->read(entry->server_node, entry->server_offset,
-		                buf, count, server->config.fs_ctx);
+		                buf, count, NULL, server->config.fs_ctx);
 		if (ret < 0) {
 			LOG_ERR("Server read failed: %d", (int)ret);
 			return ret;
