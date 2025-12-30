@@ -81,14 +81,24 @@ static void l2cap_connected(struct bt_l2cap_chan *chan)
 	struct l2cap_9p_chan *ch = CONTAINER_OF(chan, struct l2cap_9p_chan, le.chan);
 #endif
 
-	LOG_INF("L2CAP channel connected (MTU: RX=%u, TX=%u)",
-	        ch->le.rx.mtu, ch->le.tx.mtu);
+	LOG_INF("L2CAP channel connected (MTU: RX=%u, TX=%u, MPS: RX=%u, TX=%u)",
+	        ch->le.rx.mtu, ch->le.tx.mtu, ch->le.rx.mps, ch->le.tx.mps);
+	LOG_INF("  RX CID=0x%04x, TX CID=0x%04x, credits=%d",
+	        ch->le.rx.cid, ch->le.tx.cid,
+	        (int)atomic_get(&ch->le.rx.credits));
 
 	/* Reset RX state machine */
 	ch->rx_len = 0;
 	ch->rx_expected = 0;
 	ch->rx_state = RX_WAIT_SIZE;
 	ch->in_use = true;
+
+	/* Grant additional credits to peer - Zephyr hardcodes initial credits to 1,
+	 * but we need more for 9P communication. Use recv_complete to grant 9 more. */
+	for (int i = 0; i < 9; i++) {
+		bt_l2cap_chan_recv_complete(chan);
+	}
+	LOG_INF("  recv callback=%p, chan ops=%p", ch->le.chan.ops->recv, ch->le.chan.ops);
 }
 
 static void l2cap_disconnected(struct bt_l2cap_chan *chan)

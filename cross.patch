@@ -1,0 +1,322 @@
+diff --git a/src/session_pool_l2cap.c b/src/session_pool_l2cap.c
+index 16e924b..eab7719 100644
+--- a/src/session_pool_l2cap.c
++++ b/src/session_pool_l2cap.c
+@@ -24,13 +24,11 @@
+ 
+ LOG_MODULE_REGISTER(ninep_session_pool_l2cap, CONFIG_NINEP_LOG_LEVEL);
+ 
+-#if NINEP_NCS_BUILD
+-/* NCS: Define TX buffer pool for L2CAP SDUs */
++/* Define TX buffer pool for L2CAP SDUs */
+ #define TX_BUF_COUNT 4
+ #define TX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_MAX_MESSAGE_SIZE)
+ NET_BUF_POOL_DEFINE(l2cap_session_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
+                     CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
+-#endif
+ 
+ /* Forward declarations */
+ static int l2cap_session_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
+@@ -39,11 +37,7 @@ static void l2cap_session_connected(struct bt_l2cap_chan *chan);
+ static void l2cap_session_disconnected(struct bt_l2cap_chan *chan);
+ static int l2cap_session_recv(struct bt_l2cap_chan *chan, struct net_buf *buf);
+ 
+-#if NINEP_NCS_BUILD
+ static void l2cap_session_sent(struct bt_l2cap_chan *chan);
+-#else
+-static void l2cap_session_sent(struct bt_l2cap_chan *chan, int status);
+-#endif
+ 
+ static struct bt_l2cap_chan_ops l2cap_session_chan_ops = {
+ 	.connected = l2cap_session_connected,
+@@ -174,21 +168,10 @@ static int l2cap_session_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
+ 	return 0;
+ }
+ 
+-#if NINEP_NCS_BUILD
+ static void l2cap_session_sent(struct bt_l2cap_chan *chan)
+ {
+ 	LOG_DBG("L2CAP sent successfully");
+ }
+-#else
+-static void l2cap_session_sent(struct bt_l2cap_chan *chan, int status)
+-{
+-	if (status < 0) {
+-		LOG_ERR("L2CAP send failed: %d", status);
+-	} else {
+-		LOG_DBG("L2CAP sent successfully");
+-	}
+-}
+-#endif
+ 
+ static int l2cap_session_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
+                                  struct bt_l2cap_chan **chan)
+@@ -257,8 +240,7 @@ static int l2cap_session_send(struct ninep_transport *transport, const uint8_t *
+ 
+ 	LOG_DBG("Sending %zu bytes on session %d", len, chan->session->session_id);
+ 
+-#if NINEP_NCS_BUILD
+-	/* NCS: Allocate from application buffer pool */
++	/* Allocate from application buffer pool */
+ 	msg_buf = net_buf_alloc(&l2cap_session_tx_pool, K_FOREVER);
+ 	if (!msg_buf) {
+ 		LOG_ERR("Failed to allocate net_buf");
+@@ -266,14 +248,6 @@ static int l2cap_session_send(struct ninep_transport *transport, const uint8_t *
+ 	}
+ 	/* Reserve L2CAP SDU headroom */
+ 	net_buf_reserve(msg_buf, BT_L2CAP_SDU_CHAN_SEND_RESERVE);
+-#else
+-	/* Mainline: Allocate from channel's built-in buffer pool */
+-	msg_buf = net_buf_alloc(&chan->le.tx.seg.pool, K_FOREVER);
+-	if (!msg_buf) {
+-		LOG_ERR("Failed to allocate net_buf");
+-		return -ENOMEM;
+-	}
+-#endif
+ 
+ 	/* Copy message data to net_buf */
+ 	net_buf_add_mem(msg_buf, buf, len);
+diff --git a/src/transport_l2cap.c b/src/transport_l2cap.c
+index 6ef4e8a..0a06ccc 100644
+--- a/src/transport_l2cap.c
++++ b/src/transport_l2cap.c
+@@ -6,6 +6,7 @@
+ #include <zephyr/9p/transport_l2cap.h>
+ #include <zephyr/9p/protocol.h>
+ #include <zephyr/bluetooth/bluetooth.h>
++#include <zephyr/bluetooth/conn.h>
+ #include <zephyr/bluetooth/l2cap.h>
+ #include <zephyr/kernel.h>
+ #include <zephyr/logging/log.h>
+@@ -43,6 +44,10 @@ struct l2cap_9p_chan {
+ 	uint32_t rx_expected;
+ 	enum l2cap_rx_state rx_state;
+ 	bool in_use;  /* Track if this channel slot is allocated */
++	/* Workqueue support - offload 9P processing from BT RX thread */
++	struct k_work process_work;
++	size_t pending_msg_len;  /* Length of complete message ready to process */
++	bool msg_pending;        /* Flag indicating message ready for processing */
+ };
+ 
+ /* Transport private data */
+@@ -59,17 +64,43 @@ struct l2cap_transport_data {
+ #endif
+ };
+ 
+-#if NINEP_NCS_BUILD
+-/* NCS: Define TX buffer pool for L2CAP SDUs */
++/* Define TX buffer pool for L2CAP SDUs */
+ #define TX_BUF_COUNT 4
+ #define TX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_MAX_MESSAGE_SIZE)
+ NET_BUF_POOL_DEFINE(l2cap_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE, CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
+-#endif
+ 
+ /* Forward declarations */
+ static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
+                         struct bt_l2cap_chan **chan);
+ 
++/* Work handler - processes 9P messages on system workqueue instead of BT RX thread */
++static void l2cap_process_msg_work(struct k_work *work)
++{
++	struct l2cap_9p_chan *ch = CONTAINER_OF(work, struct l2cap_9p_chan, process_work);
++	struct ninep_transport *transport = ch->transport;
++	struct l2cap_transport_data *data = transport->priv_data;
++
++	if (!ch->msg_pending) {
++		LOG_WRN("Work handler called but no message pending");
++		return;
++	}
++
++	LOG_INF(">>> PROCESSING 9P MESSAGE: %zu bytes, type=0x%02x",
++	        ch->pending_msg_len, ch->rx_buf[4]);
++
++	/* Set current channel for response routing */
++	data->current_rx_chan = ch;
++
++	/* Deliver to 9P layer - this happens on workqueue stack, not BT RX stack */
++	if (transport->recv_cb) {
++		transport->recv_cb(transport, ch->rx_buf, ch->pending_msg_len, transport->user_data);
++	}
++
++	/* Clear pending flag and reset for next message */
++	ch->msg_pending = false;
++	ch->pending_msg_len = 0;
++}
++
+ static void l2cap_connected(struct bt_l2cap_chan *chan)
+ {
+ #if NINEP_NCS_BUILD
+@@ -81,8 +112,11 @@ static void l2cap_connected(struct bt_l2cap_chan *chan)
+ 	struct l2cap_9p_chan *ch = CONTAINER_OF(chan, struct l2cap_9p_chan, le.chan);
+ #endif
+ 
+-	LOG_INF("L2CAP channel connected (MTU: RX=%u, TX=%u)",
+-	        ch->le.rx.mtu, ch->le.tx.mtu);
++	LOG_INF("L2CAP channel connected (MTU: RX=%u, TX=%u, MPS: RX=%u, TX=%u)",
++	        ch->le.rx.mtu, ch->le.tx.mtu, ch->le.rx.mps, ch->le.tx.mps);
++	LOG_INF("  RX CID=0x%04x, TX CID=0x%04x, credits=%d",
++	        ch->le.rx.cid, ch->le.tx.cid, atomic_get(&ch->le.rx.credits));
++	LOG_INF("  recv callback=%p, chan ops=%p", chan->ops->recv, chan->ops);
+ 
+ 	/* Reset RX state machine */
+ 	ch->rx_len = 0;
+@@ -111,19 +145,18 @@ static void l2cap_disconnected(struct bt_l2cap_chan *chan)
+ 
+ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
+ {
++	/* Raw printk first - before anything else */
++	printk("\n!!! L2CAP_RECV CALLED: chan=%p buf=%p len=%u !!!\n",
++	       chan, buf, buf ? buf->len : 0);
++
+ #if NINEP_NCS_BUILD
+ 	struct bt_l2cap_le_chan *le_chan = BT_L2CAP_LE_CHAN(chan);
+ 	struct l2cap_9p_chan *ch = CONTAINER_OF(le_chan, struct l2cap_9p_chan, le);
+ #else
+ 	struct l2cap_9p_chan *ch = CONTAINER_OF(chan, struct l2cap_9p_chan, le.chan);
+ #endif
+-	struct ninep_transport *transport = ch->transport;
+-	struct l2cap_transport_data *data = transport->priv_data;
+ 
+-	LOG_DBG("L2CAP recv: %u bytes", buf->len);
+-
+-	/* Track which channel is currently processing a request for response routing */
+-	data->current_rx_chan = ch;
++	LOG_INF(">>> L2CAP RECV: %u bytes", buf->len);
+ 
+ 	/* Process all data in the buffer */
+ 	while (buf->len > 0) {
+@@ -171,11 +204,10 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
+ 				/* Complete message received */
+ 				LOG_DBG("Complete message received: %u bytes", ch->rx_len);
+ 
+-				/* Deliver to 9P layer */
+-				if (transport->recv_cb) {
+-					transport->recv_cb(transport, ch->rx_buf,
+-					                   ch->rx_len, transport->user_data);
+-				}
++				/* Queue for processing on workqueue instead of BT RX thread */
++				ch->pending_msg_len = ch->rx_len;
++				ch->msg_pending = true;
++				k_work_submit(&ch->process_work);
+ 
+ 				/* Reset for next message */
+ 				ch->rx_len = 0;
+@@ -216,11 +248,22 @@ static struct bt_l2cap_chan_ops l2cap_chan_ops = {
+ static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
+                         struct bt_l2cap_chan **chan)
+ {
++	struct bt_conn_info info;
++
++	LOG_INF(">>> L2CAP ACCEPT CALLBACK INVOKED <<<");
++	LOG_INF("  server=%p, PSM=0x%04x", server, server->psm);
++
++	if (bt_conn_get_info(conn, &info) == 0) {
++		LOG_INF("  conn: role=%s, sec_level=%d",
++		        info.role == BT_CONN_ROLE_CENTRAL ? "central" : "peripheral",
++		        info.security.level);
++	}
++
+ 	struct l2cap_transport_data *data = CONTAINER_OF(server,
+ 	                                                   struct l2cap_transport_data,
+ 	                                                   server);
+ 
+-	LOG_INF("L2CAP connection accepted");
++	LOG_INF("L2CAP connection request accepted, finding free channel slot");
+ 
+ 	/* Find a free channel slot */
+ 	struct l2cap_9p_chan *free_chan = NULL;
+@@ -240,6 +283,7 @@ static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
+ 	/* Initialize channel */
+ 	memset(free_chan, 0, sizeof(*free_chan));
+ 	free_chan->le.chan.ops = &l2cap_chan_ops;
++	free_chan->le.rx.mtu = CONFIG_NINEP_MAX_MESSAGE_SIZE;  /* Required for L2CAP LE */
+ 	free_chan->transport = data->transport;
+ 	free_chan->rx_buf = data->rx_buf_pool + (free_chan - data->channels) * data->rx_buf_size_per_channel;
+ 	free_chan->rx_buf_size = data->rx_buf_size_per_channel;
+@@ -247,6 +291,8 @@ static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
+ 	free_chan->rx_expected = 0;
+ 	free_chan->rx_state = RX_WAIT_SIZE;
+ 	free_chan->in_use = true;
++	free_chan->msg_pending = false;
++	k_work_init(&free_chan->process_work, l2cap_process_msg_work);
+ 
+ 	LOG_INF("Assigned channel slot %d/%d", (int)(free_chan - data->channels), MAX_L2CAP_CHANNELS);
+ 
+@@ -261,7 +307,10 @@ static int l2cap_send(struct ninep_transport *transport, const uint8_t *buf,
+ 	struct net_buf *msg_buf;
+ 	int ret;
+ 
++	LOG_INF(">>> L2CAP SEND: %zu bytes, type=0x%02x", len, buf[4]);
++
+ 	if (!data) {
++		LOG_ERR("L2CAP send: no transport data");
+ 		return -ENOTCONN;
+ 	}
+ 
+@@ -273,8 +322,7 @@ static int l2cap_send(struct ninep_transport *transport, const uint8_t *buf,
+ 		return -ENOTCONN;
+ 	}
+ 
+-#if NINEP_NCS_BUILD
+-	/* NCS: Allocate from application buffer pool */
++	/* Allocate from application buffer pool */
+ 	msg_buf = net_buf_alloc(&l2cap_tx_pool, K_FOREVER);
+ 	if (!msg_buf) {
+ 		LOG_ERR("Failed to allocate net_buf");
+@@ -282,14 +330,6 @@ static int l2cap_send(struct ninep_transport *transport, const uint8_t *buf,
+ 	}
+ 	/* Reserve L2CAP SDU headroom */
+ 	net_buf_reserve(msg_buf, BT_L2CAP_SDU_CHAN_SEND_RESERVE);
+-#else
+-	/* Mainline: Allocate from channel's built-in buffer pool */
+-	msg_buf = net_buf_alloc(&active_chan->le.tx.seg.pool, K_FOREVER);
+-	if (!msg_buf) {
+-		LOG_ERR("Failed to allocate net_buf");
+-		return -ENOMEM;
+-	}
+-#endif
+ 
+ 	/* Copy message data to net_buf */
+ 	net_buf_add_mem(msg_buf, buf, len);
+@@ -315,14 +355,39 @@ static int l2cap_start(struct ninep_transport *transport)
+ 		return -EINVAL;
+ 	}
+ 
++	/* Verify BT is ready before registering */
++	if (!bt_is_ready()) {
++		LOG_ERR("BT not ready! Cannot register L2CAP server yet");
++		return -EAGAIN;
++	}
++
++	/* Log server state BEFORE registration */
++	LOG_INF("=== L2CAP SERVER REGISTRATION ===");
++	LOG_INF("  BEFORE: server=%p, psm=0x%04x, sec_level=%d, accept=%p",
++	        &data->server, data->server.psm, data->server.sec_level, data->server.accept);
++
+ 	/* Register L2CAP server */
+ 	ret = bt_l2cap_server_register(&data->server);
++
++	/* Log result immediately */
++	LOG_INF("  bt_l2cap_server_register() returned: %d", ret);
++
+ 	if (ret < 0) {
+-		LOG_ERR("Failed to register L2CAP server: %d", ret);
++		LOG_ERR("  FAILED to register L2CAP server: %d", ret);
++		if (ret == -EINVAL) {
++			LOG_ERR("  -EINVAL: Invalid params (PSM range? accept callback?)");
++		} else if (ret == -EADDRINUSE) {
++			LOG_ERR("  -EADDRINUSE: PSM already in use");
++		} else if (ret == -ENOBUFS) {
++			LOG_ERR("  -ENOBUFS: No buffer space");
++		}
+ 		return ret;
+ 	}
+ 
+-	LOG_INF("L2CAP server registered on PSM 0x%04x", data->server.psm);
++	/* Log server state AFTER registration */
++	LOG_INF("  AFTER: server=%p, psm=0x%04x (SUCCESS)", &data->server, data->server.psm);
++	LOG_INF("=== L2CAP SERVER READY ON PSM 0x%04x ===", data->server.psm);
++
+ 	return 0;
+ }
+ 
