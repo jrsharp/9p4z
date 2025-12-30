@@ -120,7 +120,7 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 	struct ninep_transport *transport = ch->transport;
 	struct l2cap_transport_data *data = transport->priv_data;
 
-	LOG_DBG("L2CAP recv: %u bytes", buf->len);
+	LOG_INF("L2CAP recv: %u bytes", buf->len);
 
 	/* Track which channel is currently processing a request for response routing */
 	data->current_rx_chan = ch;
@@ -169,7 +169,8 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 
 			if (ch->rx_len == ch->rx_expected) {
 				/* Complete message received */
-				LOG_DBG("Complete message received: %u bytes", ch->rx_len);
+				LOG_INF("Complete 9P message received: %u bytes (type=%u)",
+				        ch->rx_len, ch->rx_buf[4]);
 
 				/* Deliver to 9P layer */
 				if (transport->recv_cb) {
@@ -248,7 +249,13 @@ static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
 	free_chan->rx_state = RX_WAIT_SIZE;
 	free_chan->in_use = true;
 
-	LOG_INF("Assigned channel slot %d/%d", (int)(free_chan - data->channels), MAX_L2CAP_CHANNELS);
+	/* Set RX MTU and initial credits for the peer to send to us */
+	free_chan->le.rx.mtu = data->rx_buf_size_per_channel;
+	atomic_set(&free_chan->le.rx.credits, 10);  /* Grant 10 initial TX credits to peer */
+
+	LOG_INF("Assigned channel slot %d/%d (rx.mtu=%u, credits=%d)",
+	        (int)(free_chan - data->channels), MAX_L2CAP_CHANNELS,
+	        free_chan->le.rx.mtu, (int)atomic_get(&free_chan->le.rx.credits));
 
 	*chan = &free_chan->le.chan;
 	return 0;

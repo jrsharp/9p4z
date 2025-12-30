@@ -120,6 +120,25 @@ config NINEP_L2CAP_MTU
 
 endif # NINEP_TRANSPORT_L2CAP
 
+config NINEP_TRANSPORT_L2CAP_CLIENT
+	bool "Bluetooth L2CAP Client Transport"
+	depends on BT_L2CAP_DYNAMIC_CHANNEL && BT_CENTRAL
+	help
+	  Enable 9P client over Bluetooth L2CAP transport.
+
+	  This transport operates in CLIENT mode, initiating a BLE connection
+	  to a 9P server and establishing an L2CAP channel for communication.
+
+	  Two connection modes are supported:
+	  - Direct connect: Connect to a known device address
+	  - Scan and connect: Scan for devices advertising a specific service UUID
+
+	  Use this when your Zephyr device needs to connect to a remote 9P server
+	  over Bluetooth, for example connecting to a keyboard or sensor that
+	  exports data via 9P.
+
+	  Requires CONFIG_BT_CENTRAL for initiating BLE connections.
+
 config NINEP_TRANSPORT_COAP
 	bool "CoAP Transport (Server Mode)"
 	depends on NETWORKING && COAP
