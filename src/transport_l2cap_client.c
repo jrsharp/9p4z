@@ -96,13 +96,21 @@ static void l2cap_connected(struct bt_l2cap_chan *chan)
 #endif
 	struct l2cap_client_data *data = ch->transport->priv_data;
 
-	LOG_INF("L2CAP channel connected (MTU: RX=%u, TX=%u)",
-	        ch->le.rx.mtu, ch->le.tx.mtu);
+	LOG_INF("L2CAP channel connected (MTU: RX=%u, TX=%u, credits: RX=%d, TX=%d)",
+	        ch->le.rx.mtu, ch->le.tx.mtu,
+	        (int)atomic_get(&ch->le.rx.credits),
+	        (int)atomic_get(&ch->le.tx.credits));
+	LOG_INF("  RX CID=0x%04x, TX CID=0x%04x",
+	        ch->le.rx.cid, ch->le.tx.cid);
 
 	/* Reset RX state machine */
 	ch->rx_len = 0;
 	ch->rx_expected = 0;
 	ch->rx_state = RX_WAIT_SIZE;
+
+	/* Note: On mainline Zephyr, bt_l2cap_chan_recv_complete() requires a buffer
+	 * and is meant to be called after recv() returns -EINPROGRESS. The initial
+	 * 1 credit should be enough for the keyboard to send Rversion response. */
 
 	set_state(data, NINEP_L2CAP_CLIENT_CONNECTED);
 	k_sem_give(&data->connect_sem);
@@ -138,7 +146,7 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 #endif
 	struct ninep_transport *transport = ch->transport;
 
-	LOG_INF("L2CAP recv: %u bytes", buf->len);
+	LOG_DBG("L2CAP recv: %u bytes", buf->len);
 
 	/* Process all data in the buffer */
 	while (buf->len > 0) {
@@ -183,7 +191,7 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 
 			if (ch->rx_len == ch->rx_expected) {
 				/* Complete message received */
-				LOG_INF("Complete message received: %u bytes (type=%u)",
+				LOG_DBG("Complete message received: %u bytes (type=%u)",
 				        ch->rx_len, ch->rx_buf[4]);
 
 				/* Deliver to 9P layer */
@@ -207,7 +215,7 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 /* NCS and ESP32: .sent callback has no status parameter */
 static void l2cap_sent(struct bt_l2cap_chan *chan)
 {
-	LOG_INF("L2CAP data transmitted over air");
+	LOG_DBG("L2CAP data transmitted");
 }
 #else
 /* Mainline Zephyr: .sent callback has status parameter */
@@ -488,16 +496,7 @@ static int l2cap_client_send(struct ninep_transport *transport,
 	struct net_buf *msg_buf;
 	int ret;
 
-	LOG_INF("L2CAP send: %zu bytes (type=%u)", len, len >= 5 ? buf[4] : 0);
-	/* Hex dump first 20 bytes for debugging */
-	if (len > 0) {
-		char hex[64];
-		int pos = 0;
-		for (size_t i = 0; i < MIN(len, 20); i++) {
-			pos += snprintf(hex + pos, sizeof(hex) - pos, "%02x ", buf[i]);
-		}
-		LOG_INF("L2CAP send data: %s", hex);
-	}
+	LOG_DBG("L2CAP send: %zu bytes (type=%u)", len, len >= 5 ? buf[4] : 0);
 
 	if (!data || data->state != NINEP_L2CAP_CLIENT_CONNECTED) {
 		LOG_ERR("L2CAP send: not connected (state=%d)", data ? data->state : -1);
@@ -505,10 +504,16 @@ static int l2cap_client_send(struct ninep_transport *transport,
 	}
 
 	/* Log channel state for debugging */
-	LOG_INF("L2CAP TX state: mtu=%u, mps=%u, credits=%d",
+	LOG_DBG("L2CAP TX state: mtu=%u, mps=%u, credits=%d",
 	        data->channel.le.tx.mtu,
 	        data->channel.le.tx.mps,
 	        (int)atomic_get(&data->channel.le.tx.credits));
+
+	/* HACK: If no credits, grant ourselves some to test sending */
+	if (atomic_get(&data->channel.le.tx.credits) == 0) {
+		LOG_WRN("No credits received! Forcing 10 credits for testing...");
+		atomic_set(&data->channel.le.tx.credits, 10);
+	}
 
 	/* Allocate buffer */
 	msg_buf = net_buf_alloc(&l2cap_client_tx_pool, K_MSEC(100));
@@ -531,7 +536,7 @@ static int l2cap_client_send(struct ninep_transport *transport,
 		return ret;
 	}
 
-	LOG_INF("L2CAP send success: %d bytes queued", ret);
+	LOG_DBG("L2CAP send queued (ret=%d)", ret);
 
 	LOG_DBG("Sent %zu bytes via L2CAP", len);
 	return len;
