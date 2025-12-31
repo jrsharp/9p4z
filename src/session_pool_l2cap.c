@@ -24,13 +24,11 @@
 
 LOG_MODULE_REGISTER(ninep_session_pool_l2cap, CONFIG_NINEP_LOG_LEVEL);
 
-#if NINEP_NCS_BUILD
-/* NCS: Define TX buffer pool for L2CAP SDUs */
+/* Define TX buffer pool for L2CAP SDUs */
 #define TX_BUF_COUNT 4
 #define TX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_MAX_MESSAGE_SIZE)
 NET_BUF_POOL_DEFINE(l2cap_session_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
                     CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
-#endif
 
 /* Forward declarations */
 static int l2cap_session_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
@@ -39,11 +37,7 @@ static void l2cap_session_connected(struct bt_l2cap_chan *chan);
 static void l2cap_session_disconnected(struct bt_l2cap_chan *chan);
 static int l2cap_session_recv(struct bt_l2cap_chan *chan, struct net_buf *buf);
 
-#if NINEP_NCS_BUILD
 static void l2cap_session_sent(struct bt_l2cap_chan *chan);
-#else
-static void l2cap_session_sent(struct bt_l2cap_chan *chan, int status);
-#endif
 
 static struct bt_l2cap_chan_ops l2cap_session_chan_ops = {
 	.connected = l2cap_session_connected,
@@ -174,21 +168,10 @@ static int l2cap_session_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 	return 0;
 }
 
-#if NINEP_NCS_BUILD
 static void l2cap_session_sent(struct bt_l2cap_chan *chan)
 {
 	LOG_DBG("L2CAP sent successfully");
 }
-#else
-static void l2cap_session_sent(struct bt_l2cap_chan *chan, int status)
-{
-	if (status < 0) {
-		LOG_ERR("L2CAP send failed: %d", status);
-	} else {
-		LOG_DBG("L2CAP sent successfully");
-	}
-}
-#endif
 
 static int l2cap_session_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
                                  struct bt_l2cap_chan **chan)
@@ -257,8 +240,7 @@ static int l2cap_session_send(struct ninep_transport *transport, const uint8_t *
 
 	LOG_DBG("Sending %zu bytes on session %d", len, chan->session->session_id);
 
-#if NINEP_NCS_BUILD
-	/* NCS: Allocate from application buffer pool */
+	/* Allocate from application buffer pool */
 	msg_buf = net_buf_alloc(&l2cap_session_tx_pool, K_FOREVER);
 	if (!msg_buf) {
 		LOG_ERR("Failed to allocate net_buf");
@@ -266,14 +248,6 @@ static int l2cap_session_send(struct ninep_transport *transport, const uint8_t *
 	}
 	/* Reserve L2CAP SDU headroom */
 	net_buf_reserve(msg_buf, BT_L2CAP_SDU_CHAN_SEND_RESERVE);
-#else
-	/* Mainline: Allocate from channel's built-in buffer pool */
-	msg_buf = net_buf_alloc(&chan->le.tx.seg.pool, K_FOREVER);
-	if (!msg_buf) {
-		LOG_ERR("Failed to allocate net_buf");
-		return -ENOMEM;
-	}
-#endif
 
 	/* Copy message data to net_buf */
 	net_buf_add_mem(msg_buf, buf, len);
