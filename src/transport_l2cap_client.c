@@ -133,6 +133,13 @@ static void l2cap_disconnected(struct bt_l2cap_chan *chan)
 	ch->rx_expected = 0;
 	ch->rx_state = RX_WAIT_SIZE;
 
+	/* Clean up BLE connection to avoid EINVAL on reconnect */
+	if (data->conn) {
+		bt_conn_disconnect(data->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		bt_conn_unref(data->conn);
+		data->conn = NULL;
+	}
+
 	set_state(data, NINEP_L2CAP_CLIENT_DISCONNECTED);
 }
 
@@ -300,8 +307,18 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
 
 static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
 {
+	struct l2cap_client_data *data = g_connecting_data;
+
 	LOG_INF("BLE disconnected (reason: 0x%02x)", reason);
-	/* L2CAP disconnected callback will handle state change */
+
+	/* Clean up connection reference if it matches ours.
+	 * This handles cases where BLE disconnects before L2CAP is established,
+	 * or after L2CAP has already cleaned up. */
+	if (data && data->conn == conn) {
+		bt_conn_unref(data->conn);
+		data->conn = NULL;
+		set_state(data, NINEP_L2CAP_CLIENT_DISCONNECTED);
+	}
 }
 
 static struct bt_conn_cb conn_callbacks = {
@@ -361,9 +378,28 @@ static int connect_to_device(struct l2cap_client_data *data,
 {
 	int ret;
 	char addr_str[BT_ADDR_LE_STR_LEN];
+	struct bt_conn *existing;
 
 	bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
 	LOG_INF("Connecting to %s", addr_str);
+
+	/* Check if we already have a connection reference that wasn't cleaned up */
+	if (data->conn) {
+		LOG_WRN("Stale connection reference found, cleaning up");
+		bt_conn_disconnect(data->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		bt_conn_unref(data->conn);
+		data->conn = NULL;
+		k_sleep(K_MSEC(100));
+	}
+
+	/* Check if BT stack already has a connection to this address */
+	existing = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr);
+	if (existing) {
+		LOG_WRN("Existing BT connection found, disconnecting first");
+		bt_conn_disconnect(existing, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		bt_conn_unref(existing);
+		k_sleep(K_MSEC(200));
+	}
 
 	set_state(data, NINEP_L2CAP_CLIENT_CONNECTING);
 
@@ -393,9 +429,15 @@ static struct l2cap_client_data *g_scan_data = NULL;
 static void connect_work_handler(struct k_work *work)
 {
 	struct l2cap_client_data *data = CONTAINER_OF(work, struct l2cap_client_data, connect_work);
+	char addr_str[BT_ADDR_LE_STR_LEN];
 
-	LOG_INF("Deferred connect starting");
-	connect_to_device(data, &data->discovered_addr);
+	bt_addr_le_to_str(&data->discovered_addr, addr_str, sizeof(addr_str));
+	LOG_INF("Deferred connect starting to %s", addr_str);
+
+	int ret = connect_to_device(data, &data->discovered_addr);
+	if (ret < 0) {
+		LOG_ERR("Deferred connect failed: %d", ret);
+	}
 }
 
 static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
@@ -457,7 +499,19 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 
 		/* Save address and schedule deferred connection */
 		bt_addr_le_copy(&data->discovered_addr, addr);
-		k_work_submit(&data->connect_work);
+
+		/* Cancel any stale work before submitting */
+		k_work_cancel(&data->connect_work);
+
+		LOG_INF("Submitting connect work...");
+		int ret = k_work_submit(&data->connect_work);
+		if (ret == 0) {
+			LOG_WRN("Connect work was already pending (ret=0)");
+		} else if (ret == 1) {
+			LOG_INF("Connect work submitted successfully");
+		} else {
+			LOG_ERR("Connect work submit failed: %d", ret);
+		}
 	}
 }
 
@@ -573,11 +627,12 @@ static int l2cap_client_stop(struct ninep_transport *transport)
 		return -EINVAL;
 	}
 
+	/* Cancel any pending connect work first */
+	k_work_cancel(&data->connect_work);
+
 	/* Stop scanning if active */
-	if (data->state == NINEP_L2CAP_CLIENT_SCANNING) {
-		bt_le_scan_stop();
-		g_scan_data = NULL;
-	}
+	bt_le_scan_stop();
+	g_scan_data = NULL;
 
 	/* Disconnect L2CAP channel */
 	if (data->state == NINEP_L2CAP_CLIENT_CONNECTED) {
