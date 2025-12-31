@@ -26,17 +26,36 @@
 LOG_MODULE_REGISTER(ninep_l2cap_transport, CONFIG_NINEP_LOG_LEVEL);
 
 /*
- * Dedicated workqueue for 9P message processing.
- * This is critical - we CANNOT use the system workqueue because blocking
- * reads in the 9P server would block ZMK event processing (which also
- * uses the system workqueue), causing a deadlock.
+ * Thread pool for 9P message processing.
+ *
+ * This is critical for true 9P multiplexing - we need MULTIPLE threads
+ * so that a blocking read (like kbin waiting for key events) doesn't
+ * block other 9P operations (like battery reads, DFU, etc.).
+ *
+ * Architecture:
+ * - N worker threads wait on a message queue
+ * - When a 9P message arrives, it's queued
+ * - The next available thread picks it up and processes it
+ * - If one thread blocks, others continue processing new requests
  */
-#define NINEP_WORKQUEUE_STACK_SIZE 4096
-#define NINEP_WORKQUEUE_PRIORITY 5
+#define NINEP_THREAD_POOL_SIZE 3
+#define NINEP_THREAD_STACK_SIZE 4096
+#define NINEP_THREAD_PRIORITY 5
+#define NINEP_MSG_QUEUE_SIZE 8
 
-K_THREAD_STACK_DEFINE(ninep_workqueue_stack, NINEP_WORKQUEUE_STACK_SIZE);
-static struct k_work_q ninep_workqueue;
-static bool ninep_workqueue_started = false;
+/* Work item for thread pool */
+struct ninep_work_item {
+	struct l2cap_9p_chan *channel;
+	size_t msg_len;
+};
+
+/* Message queue for thread pool */
+K_MSGQ_DEFINE(ninep_msg_queue, sizeof(struct ninep_work_item), NINEP_MSG_QUEUE_SIZE, 4);
+
+/* Thread pool stacks and threads */
+K_THREAD_STACK_ARRAY_DEFINE(ninep_thread_stacks, NINEP_THREAD_POOL_SIZE, NINEP_THREAD_STACK_SIZE);
+static struct k_thread ninep_threads[NINEP_THREAD_POOL_SIZE];
+static bool ninep_thread_pool_started = false;
 
 /* RX state machine states */
 enum l2cap_rx_state {
@@ -57,8 +76,7 @@ struct l2cap_9p_chan {
 	uint32_t rx_expected;
 	enum l2cap_rx_state rx_state;
 	bool in_use;  /* Track if this channel slot is allocated */
-	/* Workqueue support - offload 9P processing from BT RX thread */
-	struct k_work process_work;
+	/* Thread pool support - offload 9P processing from BT RX thread */
 	size_t pending_msg_len;  /* Length of complete message ready to process */
 	bool msg_pending;        /* Flag indicating message ready for processing */
 };
@@ -86,32 +104,76 @@ NET_BUF_POOL_DEFINE(l2cap_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE, CONFIG_BT_CONN_TX_
 static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
                         struct bt_l2cap_chan **chan);
 
-/* Work handler - processes 9P messages on system workqueue instead of BT RX thread */
-static void l2cap_process_msg_work(struct k_work *work)
+/* Thread pool worker - waits on message queue and processes 9P messages */
+static void ninep_thread_pool_worker(void *arg1, void *arg2, void *arg3)
 {
-	struct l2cap_9p_chan *ch = CONTAINER_OF(work, struct l2cap_9p_chan, process_work);
-	struct ninep_transport *transport = ch->transport;
-	struct l2cap_transport_data *data = transport->priv_data;
+	int thread_id = (int)(intptr_t)arg1;
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
 
-	if (!ch->msg_pending) {
-		LOG_WRN("Work handler called but no message pending");
+	LOG_INF("9P worker thread %d started", thread_id);
+
+	while (1) {
+		struct ninep_work_item item;
+
+		/* Wait for work item from queue */
+		int ret = k_msgq_get(&ninep_msg_queue, &item, K_FOREVER);
+		if (ret != 0) {
+			LOG_ERR("Thread %d: msgq_get failed: %d", thread_id, ret);
+			continue;
+		}
+
+		struct l2cap_9p_chan *ch = item.channel;
+		struct ninep_transport *transport = ch->transport;
+		struct l2cap_transport_data *data = transport->priv_data;
+
+		if (!ch->msg_pending) {
+			LOG_WRN("Thread %d: work item but no message pending", thread_id);
+			continue;
+		}
+
+		LOG_INF("Thread %d: processing 9P msg %zu bytes, type=0x%02x",
+		        thread_id, ch->pending_msg_len, ch->rx_buf[4]);
+
+		/* Set current channel for response routing */
+		data->current_rx_chan = ch;
+
+		/* Deliver to 9P layer - may block (e.g., kbin read) */
+		if (transport->recv_cb) {
+			transport->recv_cb(transport, ch->rx_buf, ch->pending_msg_len, transport->user_data);
+		}
+
+		/* Clear pending flag and reset for next message */
+		ch->msg_pending = false;
+		ch->pending_msg_len = 0;
+
+		LOG_DBG("Thread %d: done processing", thread_id);
+	}
+}
+
+/* Start thread pool if not already running */
+static void ninep_start_thread_pool(void)
+{
+	if (ninep_thread_pool_started) {
 		return;
 	}
 
-	LOG_INF(">>> PROCESSING 9P MESSAGE: %zu bytes, type=0x%02x",
-	        ch->pending_msg_len, ch->rx_buf[4]);
+	for (int i = 0; i < NINEP_THREAD_POOL_SIZE; i++) {
+		k_thread_create(&ninep_threads[i],
+		                ninep_thread_stacks[i],
+		                K_THREAD_STACK_SIZEOF(ninep_thread_stacks[i]),
+		                ninep_thread_pool_worker,
+		                (void *)(intptr_t)i, NULL, NULL,
+		                NINEP_THREAD_PRIORITY, 0, K_NO_WAIT);
 
-	/* Set current channel for response routing */
-	data->current_rx_chan = ch;
-
-	/* Deliver to 9P layer - this happens on workqueue stack, not BT RX stack */
-	if (transport->recv_cb) {
-		transport->recv_cb(transport, ch->rx_buf, ch->pending_msg_len, transport->user_data);
+		char name[16];
+		snprintf(name, sizeof(name), "9p_worker_%d", i);
+		k_thread_name_set(&ninep_threads[i], name);
 	}
 
-	/* Clear pending flag and reset for next message */
-	ch->msg_pending = false;
-	ch->pending_msg_len = 0;
+	ninep_thread_pool_started = true;
+	LOG_INF("Started 9P thread pool: %d threads, stack=%d, prio=%d",
+	        NINEP_THREAD_POOL_SIZE, NINEP_THREAD_STACK_SIZE, NINEP_THREAD_PRIORITY);
 }
 
 static void l2cap_connected(struct bt_l2cap_chan *chan)
@@ -217,10 +279,20 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 				LOG_INF("Complete 9P message received: %u bytes (type=%u)",
 				        ch->rx_len, ch->rx_buf[4]);
 
-				/* Queue for processing on DEDICATED 9P workqueue (not system workqueue!) */
+				/* Queue for processing by thread pool */
 				ch->pending_msg_len = ch->rx_len;
 				ch->msg_pending = true;
-				k_work_submit_to_queue(&ninep_workqueue, &ch->process_work);
+
+				struct ninep_work_item item = {
+					.channel = ch,
+					.msg_len = ch->rx_len,
+				};
+
+				int ret = k_msgq_put(&ninep_msg_queue, &item, K_NO_WAIT);
+				if (ret != 0) {
+					LOG_ERR("Failed to queue 9P message: %d (queue full?)", ret);
+					ch->msg_pending = false;
+				}
 
 				/* Reset for next message */
 				ch->rx_len = 0;
@@ -292,7 +364,6 @@ static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
 	free_chan->rx_state = RX_WAIT_SIZE;
 	free_chan->in_use = true;
 	free_chan->msg_pending = false;
-	k_work_init(&free_chan->process_work, l2cap_process_msg_work);
 
 	/* Set RX MTU and initial credits for the peer to send to us */
 	free_chan->le.rx.mtu = data->rx_buf_size_per_channel;
@@ -460,17 +531,8 @@ int ninep_transport_l2cap_init(struct ninep_transport *transport,
 		return -EINVAL;
 	}
 
-	/* Start dedicated 9P workqueue if not already running */
-	if (!ninep_workqueue_started) {
-		k_work_queue_init(&ninep_workqueue);
-		k_work_queue_start(&ninep_workqueue, ninep_workqueue_stack,
-		                   K_THREAD_STACK_SIZEOF(ninep_workqueue_stack),
-		                   NINEP_WORKQUEUE_PRIORITY, NULL);
-		k_thread_name_set(&ninep_workqueue.thread, "9p_workq");
-		ninep_workqueue_started = true;
-		LOG_INF("Started dedicated 9P workqueue (stack=%d, prio=%d)",
-		        NINEP_WORKQUEUE_STACK_SIZE, NINEP_WORKQUEUE_PRIORITY);
-	}
+	/* Start 9P thread pool if not already running */
+	ninep_start_thread_pool();
 
 	/* Allocate private data */
 	data = k_malloc(sizeof(*data));

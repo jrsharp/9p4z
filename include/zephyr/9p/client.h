@@ -37,6 +37,11 @@ struct ninep_client_fid {
 
 /**
  * @brief Pending request structure (for request/response matching)
+ *
+ * Each pending request has its own response buffer, enabling true
+ * concurrent 9P operations across multiple threads. The 9P protocol
+ * uses tags to multiplex requests - this structure tracks each
+ * outstanding request until its response arrives.
  */
 struct ninep_pending_req {
 	uint16_t tag;
@@ -45,10 +50,9 @@ struct ninep_pending_req {
 	int error;
 	struct k_sem sem;
 
-	/* Response data */
-	uint8_t *resp_buf;
+	/* Per-request response buffer for concurrent operations */
+	uint8_t resp_data[CONFIG_NINEP_RESP_BUF_SIZE];
 	size_t resp_len;
-	size_t resp_max;
 };
 
 /**
@@ -62,6 +66,10 @@ struct ninep_client_config {
 
 /**
  * @brief 9P client instance
+ *
+ * Thread-safe 9P client supporting concurrent operations. Multiple threads
+ * can issue 9P requests simultaneously - the client serializes TX (message
+ * building and sending) but allows concurrent waits for responses.
  */
 struct ninep_client {
 	const struct ninep_client_config *config;
@@ -70,19 +78,18 @@ struct ninep_client {
 	/* FID table */
 	struct ninep_client_fid fids[CONFIG_NINEP_MAX_FIDS];
 
-	/* Pending requests table */
+	/* Pending requests table - each slot has its own response buffer */
 	struct ninep_pending_req pending[CONFIG_NINEP_MAX_TAGS];
 
-	/* Request/response buffers */
+	/* TX buffer - protected by lock during build+send */
 	uint8_t tx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
-	uint8_t rx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
 
 	/* State */
 	uint32_t msize;  /* Negotiated max message size */
 	uint32_t next_fid;
 	uint16_t next_tag;
 
-	/* Synchronization */
+	/* Synchronization - held only during TX (build + send) */
 	struct k_mutex lock;
 };
 

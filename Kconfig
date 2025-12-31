@@ -27,10 +27,25 @@ config NINEP_MAX_FIDS
 
 config NINEP_MAX_TAGS
 	int "Maximum number of pending requests"
-	default 16
+	default 4
 	help
 	  Maximum number of concurrent outstanding requests.
-	  Each request in flight requires a unique tag.
+	  Each request in flight requires a unique tag and its own
+	  response buffer (NINEP_RESP_BUF_SIZE bytes).
+
+config NINEP_RESP_BUF_SIZE
+	int "Per-request response buffer size"
+	default 256
+	help
+	  Size of the response buffer for each pending request slot.
+	  This enables true concurrent 9P operations - multiple threads
+	  can have requests in flight simultaneously.
+
+	  256 bytes is sufficient for most operations (walk, open, clunk,
+	  small reads). For large file transfers, use streaming reads
+	  that fit within this buffer.
+
+	  Memory usage: NINEP_MAX_TAGS * NINEP_RESP_BUF_SIZE bytes.
 
 config NINEP_SERVER
 	bool "9P Server Support"
