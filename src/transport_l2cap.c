@@ -81,14 +81,24 @@ static void l2cap_connected(struct bt_l2cap_chan *chan)
 	struct l2cap_9p_chan *ch = CONTAINER_OF(chan, struct l2cap_9p_chan, le.chan);
 #endif
 
-	LOG_INF("L2CAP channel connected (MTU: RX=%u, TX=%u)",
-	        ch->le.rx.mtu, ch->le.tx.mtu);
+	LOG_INF("L2CAP channel connected (MTU: RX=%u, TX=%u, MPS: RX=%u, TX=%u)",
+	        ch->le.rx.mtu, ch->le.tx.mtu, ch->le.rx.mps, ch->le.tx.mps);
+	LOG_INF("  RX CID=0x%04x, TX CID=0x%04x, credits=%d",
+	        ch->le.rx.cid, ch->le.tx.cid,
+	        (int)atomic_get(&ch->le.rx.credits));
 
 	/* Reset RX state machine */
 	ch->rx_len = 0;
 	ch->rx_expected = 0;
 	ch->rx_state = RX_WAIT_SIZE;
 	ch->in_use = true;
+
+	/* Grant additional credits to peer - Zephyr hardcodes initial credits to 1,
+	 * but we need more for 9P communication. Use recv_complete to grant 9 more. */
+	for (int i = 0; i < 9; i++) {
+		bt_l2cap_chan_recv_complete(chan);
+	}
+	LOG_INF("  recv callback=%p, chan ops=%p", ch->le.chan.ops->recv, ch->le.chan.ops);
 }
 
 static void l2cap_disconnected(struct bt_l2cap_chan *chan)
@@ -172,7 +182,8 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 
 			if (ch->rx_len == ch->rx_expected) {
 				/* Complete message received */
-				LOG_DBG("Complete message received: %u bytes", ch->rx_len);
+				LOG_INF("Complete 9P message received: %u bytes (type=%u)",
+				        ch->rx_len, ch->rx_buf[4]);
 
 				/* Deliver to 9P layer */
 				if (transport->recv_cb) {
@@ -251,7 +262,13 @@ static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
 	free_chan->rx_state = RX_WAIT_SIZE;
 	free_chan->in_use = true;
 
-	LOG_INF("Assigned channel slot %d/%d", (int)(free_chan - data->channels), MAX_L2CAP_CHANNELS);
+	/* Set RX MTU and initial credits for the peer to send to us */
+	free_chan->le.rx.mtu = data->rx_buf_size_per_channel;
+	atomic_set(&free_chan->le.rx.credits, 10);  /* Grant 10 initial TX credits to peer */
+
+	LOG_INF("Assigned channel slot %d/%d (rx.mtu=%u, credits=%d)",
+	        (int)(free_chan - data->channels), MAX_L2CAP_CHANNELS,
+	        free_chan->le.rx.mtu, (int)atomic_get(&free_chan->le.rx.credits));
 
 	*chan = &free_chan->le.chan;
 	return 0;
