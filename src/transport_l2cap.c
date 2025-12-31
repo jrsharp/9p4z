@@ -43,10 +43,11 @@ LOG_MODULE_REGISTER(ninep_l2cap_transport, CONFIG_NINEP_LOG_LEVEL);
 #define NINEP_THREAD_PRIORITY 5
 #define NINEP_MSG_QUEUE_SIZE 8
 
-/* Work item for thread pool */
+/* Work item for thread pool - owns a COPY of the message data */
 struct ninep_work_item {
 	struct l2cap_9p_chan *channel;
 	size_t msg_len;
+	uint8_t *msg_buf;  /* Allocated copy of message - worker must free */
 };
 
 /* Message queue for thread pool */
@@ -70,15 +71,12 @@ enum l2cap_rx_state {
 struct l2cap_9p_chan {
 	struct bt_l2cap_le_chan le;
 	struct ninep_transport *transport;
-	uint8_t *rx_buf;
+	uint8_t *rx_buf;           /* Buffer for assembling incoming message */
 	size_t rx_buf_size;
-	size_t rx_len;
-	uint32_t rx_expected;
+	size_t rx_len;             /* Current position in rx_buf */
+	uint32_t rx_expected;      /* Expected total message size */
 	enum l2cap_rx_state rx_state;
-	bool in_use;  /* Track if this channel slot is allocated */
-	/* Thread pool support - offload 9P processing from BT RX thread */
-	size_t pending_msg_len;  /* Length of complete message ready to process */
-	bool msg_pending;        /* Flag indicating message ready for processing */
+	bool in_use;               /* Track if this channel slot is allocated */
 };
 
 /* Transport private data */
@@ -123,29 +121,35 @@ static void ninep_thread_pool_worker(void *arg1, void *arg2, void *arg3)
 			continue;
 		}
 
+		/* Validate work item */
+		if (!item.msg_buf || item.msg_len == 0) {
+			LOG_ERR("Thread %d: invalid work item (buf=%p, len=%zu)",
+			        thread_id, item.msg_buf, item.msg_len);
+			continue;
+		}
+
 		struct l2cap_9p_chan *ch = item.channel;
 		struct ninep_transport *transport = ch->transport;
 		struct l2cap_transport_data *data = transport->priv_data;
 
-		if (!ch->msg_pending) {
-			LOG_WRN("Thread %d: work item but no message pending", thread_id);
-			continue;
-		}
-
 		LOG_INF("Thread %d: processing 9P msg %zu bytes, type=0x%02x",
-		        thread_id, ch->pending_msg_len, ch->rx_buf[4]);
+		        thread_id, item.msg_len, item.msg_buf[4]);
 
-		/* Set current channel for response routing */
+		/*
+		 * Set current channel for response routing.
+		 * NOTE: With single L2CAP channel (typical case), this is safe.
+		 * For multi-channel, there's a theoretical race but responses
+		 * still go to a valid connected channel.
+		 */
 		data->current_rx_chan = ch;
 
 		/* Deliver to 9P layer - may block (e.g., kbin read) */
 		if (transport->recv_cb) {
-			transport->recv_cb(transport, ch->rx_buf, ch->pending_msg_len, transport->user_data);
+			transport->recv_cb(transport, item.msg_buf, item.msg_len, transport->user_data);
 		}
 
-		/* Clear pending flag and reset for next message */
-		ch->msg_pending = false;
-		ch->pending_msg_len = 0;
+		/* Free the message buffer - we own it */
+		k_free(item.msg_buf);
 
 		LOG_DBG("Thread %d: done processing", thread_id);
 	}
@@ -279,22 +283,45 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 				LOG_INF("Complete 9P message received: %u bytes (type=%u)",
 				        ch->rx_len, ch->rx_buf[4]);
 
-				/* Queue for processing by thread pool */
-				ch->pending_msg_len = ch->rx_len;
-				ch->msg_pending = true;
+				/*
+				 * CRITICAL: Allocate and copy message before queuing.
+				 * We must not reference ch->rx_buf after resetting state,
+				 * as new BLE packets could overwrite it before the worker
+				 * thread processes this message.
+				 */
+				uint8_t *msg_copy = k_malloc(ch->rx_len);
+				if (!msg_copy) {
+					LOG_ERR("Failed to allocate %u bytes for message copy",
+					        ch->rx_len);
+					/* Reset for next message anyway - this one is lost */
+					ch->rx_len = 0;
+					ch->rx_expected = 0;
+					ch->rx_state = RX_WAIT_SIZE;
+					return -ENOMEM;
+				}
+
+				memcpy(msg_copy, ch->rx_buf, ch->rx_len);
 
 				struct ninep_work_item item = {
 					.channel = ch,
 					.msg_len = ch->rx_len,
+					.msg_buf = msg_copy,
 				};
 
-				int ret = k_msgq_put(&ninep_msg_queue, &item, K_NO_WAIT);
+				/*
+				 * Try to queue with a short timeout. We're in the BT RX thread,
+				 * so we can't block forever, but a brief wait gives workers
+				 * a chance to catch up if the queue is momentarily full.
+				 */
+				int ret = k_msgq_put(&ninep_msg_queue, &item, K_MSEC(100));
 				if (ret != 0) {
-					LOG_ERR("Failed to queue 9P message: %d (queue full?)", ret);
-					ch->msg_pending = false;
+					LOG_ERR("Failed to queue 9P message after 100ms: %d", ret);
+					LOG_ERR("  Queue may be full (workers all blocked?) - message lost");
+					k_free(msg_copy);
+					/* Client will timeout waiting for response */
 				}
 
-				/* Reset for next message */
+				/* Reset for next message - safe now that data is copied */
 				ch->rx_len = 0;
 				ch->rx_expected = 0;
 				ch->rx_state = RX_WAIT_SIZE;
@@ -363,7 +390,6 @@ static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
 	free_chan->rx_expected = 0;
 	free_chan->rx_state = RX_WAIT_SIZE;
 	free_chan->in_use = true;
-	free_chan->msg_pending = false;
 
 	/* Set RX MTU and initial credits for the peer to send to us */
 	free_chan->le.rx.mtu = data->rx_buf_size_per_channel;
@@ -391,7 +417,7 @@ static int l2cap_send(struct ninep_transport *transport, const uint8_t *buf,
 		return -ENOTCONN;
 	}
 
-	/* Use the channel that's currently processing a request (set by l2cap_recv) */
+	/* Use the channel that's currently processing a request */
 	struct l2cap_9p_chan *active_chan = data->current_rx_chan;
 
 	if (!active_chan || !active_chan->in_use) {
