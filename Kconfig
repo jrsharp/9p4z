@@ -55,6 +55,27 @@ config NINEP_FS_PASSTHROUGH
 	  - Share SD card contents over Bluetooth L2CAP
 	  - Remote file access over TCP/IP
 
+config NINEP_DFU
+	bool "9P DFU (Device Firmware Update)"
+	depends on IMG_MANAGER
+	depends on FLASH_MAP
+	help
+	  Enable firmware update via 9P filesystem.
+
+	  Exposes /dev/firmware (or custom path) as a sysfs file that
+	  accepts MCUboot firmware images. The module handles:
+	  - Pre-erasing secondary slot on first write
+	  - Buffered streaming writes to flash
+	  - Image validation on file close
+	  - Marking image for test upgrade
+
+	  Usage from a 9P client:
+	    cat firmware.bin | 9p write /dev/firmware
+	    9p read /dev/firmware  # check status
+
+	  After upload, reboot to apply. Call ninep_dfu_confirm()
+	  from application code to make the update permanent.
+
 endif # NINEP_SERVER
 
 config NINEP_CLIENT

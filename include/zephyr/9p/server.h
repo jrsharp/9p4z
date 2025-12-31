@@ -303,6 +303,16 @@ int ninep_server_init(struct ninep_server *server,
                       struct ninep_transport *transport);
 
 /**
+ * @brief Clean up 9P server - clunk all open fids
+ *
+ * Call this before destroying a server instance to properly release
+ * filesystem resources. This clunks all open fids.
+ *
+ * @param server Server instance
+ */
+void ninep_server_cleanup(struct ninep_server *server);
+
+/**
  * @brief Start 9P server
  *
  * @param server Server instance

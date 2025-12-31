@@ -86,7 +86,7 @@ static void handle_tversion(struct ninep_server *server, const uint8_t *msg, siz
 	uint16_t version_len = msg[11] | (msg[12] << 8);
 	const char *version = (const char *)&msg[13];
 
-	LOG_DBG("Tversion: msize=%u, version=%.*s", msize, version_len, version);
+	LOG_INF("Tversion: msize=%u, version=%.*s", msize, version_len, version);
 
 	/* Tversion flushes all server state - clear all fids */
 	for (int i = 0; i < CONFIG_NINEP_MAX_FIDS; i++) {
@@ -240,7 +240,7 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 	uint32_t newfid = msg[11] | (msg[12] << 8) | (msg[13] << 16) | (msg[14] << 24);
 	uint16_t nwname = msg[15] | (msg[16] << 8);
 
-	LOG_DBG("Twalk: fid=%u, newfid=%u, nwname=%u", fid, newfid, nwname);
+	LOG_INF("Twalk: fid=%u, newfid=%u, nwname=%u", fid, newfid, nwname);
 
 	struct ninep_server_fid *sfid = find_fid(server, fid);
 
@@ -320,7 +320,7 @@ static void handle_topen(struct ninep_server *server, uint16_t tag,
 	uint32_t fid = msg[7] | (msg[8] << 8) | (msg[9] << 16) | (msg[10] << 24);
 	uint8_t mode = msg[11];
 
-	LOG_DBG("Topen: fid=%u, mode=%u", fid, mode);
+	LOG_INF("Topen: fid=%u, mode=0x%02x", fid, mode);
 
 	struct ninep_server_fid *sfid = find_fid(server, fid);
 
@@ -337,14 +337,21 @@ static void handle_topen(struct ninep_server *server, uint16_t tag,
 		return;
 	}
 
-	/* Set iounit (0 = use msize - header) */
-	sfid->iounit = 0;
+	/* Set iounit to a reasonable value for I/O operations */
+	sfid->iounit = CONFIG_NINEP_MAX_MESSAGE_SIZE - 24; /* msize minus Twrite header */
 
 	/* Send Ropen */
 	ret = ninep_build_ropen(server->tx_buf, sizeof(server->tx_buf),
 	                         tag, &sfid->node->qid, sfid->iounit);
 	if (ret > 0) {
-		ninep_transport_send(server->transport, server->tx_buf, ret);
+		LOG_INF("Sending Ropen: tag=%u, qid.type=%u, qid.path=0x%llx, iounit=%u, size=%d",
+		        tag, sfid->node->qid.type, sfid->node->qid.path, sfid->iounit, ret);
+		int send_ret = ninep_transport_send(server->transport, server->tx_buf, ret);
+		if (send_ret < 0) {
+			LOG_ERR("Failed to send Ropen: %d", send_ret);
+		}
+	} else {
+		LOG_ERR("Failed to build Ropen: %d", ret);
 	}
 }
 
@@ -837,22 +844,19 @@ static void handle_tclunk(struct ninep_server *server, uint16_t tag,
 {
 	uint32_t fid = msg[7] | (msg[8] << 8) | (msg[9] << 16) | (msg[10] << 24);
 
-	LOG_DBG("Tclunk: fid=%u", fid);
+	LOG_INF("Tclunk: fid=%u tag=%u", fid, tag);
 
 	struct ninep_server_fid *sfid = find_fid(server, fid);
 
 	if (!sfid) {
+		LOG_WRN("Tclunk: unknown fid %u", fid);
 		send_error(server, tag, "unknown fid");
 		return;
 	}
 
 	/* Call filesystem clunk handler if available */
 	if (server->config.fs_ops->clunk && sfid->node) {
-		int clunk_ret = server->config.fs_ops->clunk(sfid->node, server->config.fs_ctx);
-		if (clunk_ret < 0) {
-			LOG_WRN("Filesystem clunk failed: %d", clunk_ret);
-			/* Continue anyway - client expects Rclunk */
-		}
+		server->config.fs_ops->clunk(sfid->node, server->config.fs_ctx);
 	}
 
 	/* Free FID */
@@ -860,9 +864,9 @@ static void handle_tclunk(struct ninep_server *server, uint16_t tag,
 
 	/* Send Rclunk */
 	int ret = ninep_build_rclunk(server->tx_buf, sizeof(server->tx_buf), tag);
-
 	if (ret > 0) {
-		ninep_transport_send(server->transport, server->tx_buf, ret);
+		int send_ret = ninep_transport_send(server->transport, server->tx_buf, ret);
+		LOG_INF("Rclunk sent: tag=%u, ret=%d", tag, send_ret);
 	}
 }
 
@@ -882,7 +886,7 @@ void ninep_server_process_message(struct ninep_server *server,
 		return;
 	}
 
-	LOG_DBG("Received message: type=%u, tag=%u, size=%u", hdr.type, hdr.tag, hdr.size);
+	LOG_INF("Received 9P message: type=%u, tag=%u, size=%u", hdr.type, hdr.tag, hdr.size);
 
 	switch (hdr.type) {
 	case NINEP_TVERSION:
@@ -963,6 +967,33 @@ int ninep_server_init(struct ninep_server *server,
 	}
 
 	return 0;
+}
+
+void ninep_server_cleanup(struct ninep_server *server)
+{
+	if (!server) {
+		return;
+	}
+
+	LOG_INF("Cleaning up 9P server - clunking open fids");
+
+	/* Clunk all open fids to properly release filesystem resources */
+	for (int i = 0; i < CONFIG_NINEP_MAX_FIDS; i++) {
+		struct ninep_server_fid *sfid = &server->fids[i];
+		if (sfid->in_use && sfid->node) {
+			LOG_DBG("Cleanup: clunking fid %u node '%s'", sfid->fid, sfid->node->name);
+
+			/* Call filesystem clunk handler if available */
+			if (server->config.fs_ops && server->config.fs_ops->clunk) {
+				server->config.fs_ops->clunk(sfid->node, server->config.fs_ctx);
+			}
+
+			sfid->node = NULL;
+			sfid->in_use = false;
+		}
+	}
+
+	LOG_INF("9P server cleanup complete");
 }
 
 int ninep_server_start(struct ninep_server *server)

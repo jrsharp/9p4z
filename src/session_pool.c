@@ -4,6 +4,7 @@
  */
 
 #include <zephyr/9p/session_pool.h>
+#include <zephyr/9p/server.h>
 #include <zephyr/logging/log.h>
 #include <string.h>
 #include <errno.h>
@@ -98,9 +99,9 @@ void ninep_session_free(struct ninep_session *session)
 		session->transport.ops->stop(&session->transport);
 	}
 
-	/* Clean up server state */
-	/* Note: ninep_server doesn't currently have a cleanup function,
-	 * but we reset state here for future use */
+	/* Clean up server state - properly clunk all open fids */
+	ninep_server_cleanup(&session->server);
+
 	memset(&session->server, 0, sizeof(session->server));
 	memset(&session->transport, 0, sizeof(session->transport));
 

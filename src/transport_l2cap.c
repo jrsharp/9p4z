@@ -120,10 +120,13 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 	struct ninep_transport *transport = ch->transport;
 	struct l2cap_transport_data *data = transport->priv_data;
 
-	LOG_DBG("L2CAP recv: %u bytes", buf->len);
+	LOG_INF("L2CAP recv: %u bytes (rx_state=%d, rx_len=%zu)", buf->len, ch->rx_state, ch->rx_len);
 
 	/* Track which channel is currently processing a request for response routing */
 	data->current_rx_chan = ch;
+
+	/* Release credits back to sender - must be done for flow control */
+	bt_l2cap_chan_recv_complete(chan, buf);
 
 	/* Process all data in the buffer */
 	while (buf->len > 0) {
@@ -274,19 +277,19 @@ static int l2cap_send(struct ninep_transport *transport, const uint8_t *buf,
 	}
 
 #if NINEP_NCS_BUILD
-	/* NCS: Allocate from application buffer pool */
-	msg_buf = net_buf_alloc(&l2cap_tx_pool, K_FOREVER);
+	/* NCS: Allocate from application buffer pool with timeout to avoid hanging */
+	msg_buf = net_buf_alloc(&l2cap_tx_pool, K_MSEC(1000));
 	if (!msg_buf) {
-		LOG_ERR("Failed to allocate net_buf");
+		LOG_ERR("Failed to allocate net_buf (TX pool exhausted)");
 		return -ENOMEM;
 	}
 	/* Reserve L2CAP SDU headroom */
 	net_buf_reserve(msg_buf, BT_L2CAP_SDU_CHAN_SEND_RESERVE);
 #else
-	/* Mainline: Allocate from channel's built-in buffer pool */
-	msg_buf = net_buf_alloc(&active_chan->le.tx.seg.pool, K_FOREVER);
+	/* Mainline: Allocate from channel's built-in buffer pool with timeout */
+	msg_buf = net_buf_alloc(&active_chan->le.tx.seg.pool, K_MSEC(1000));
 	if (!msg_buf) {
-		LOG_ERR("Failed to allocate net_buf");
+		LOG_ERR("Failed to allocate net_buf (TX pool exhausted)");
 		return -ENOMEM;
 	}
 #endif

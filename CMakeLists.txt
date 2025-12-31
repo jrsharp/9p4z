@@ -26,6 +26,10 @@ if(CONFIG_NINEP_SERVER)
   if(CONFIG_NINEP_FS_PASSTHROUGH)
     zephyr_library_sources(src/passthrough_fs.c)
   endif()
+
+  if(CONFIG_NINEP_DFU)
+    zephyr_library_sources(src/dfu.c)
+  endif()
 endif()
 
 if(CONFIG_NINEP_CLIENT)
