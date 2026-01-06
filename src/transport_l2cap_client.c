@@ -78,6 +78,10 @@ struct l2cap_client_data {
 	/* Deferred connection work (to avoid blocking BT thread) */
 	struct k_work connect_work;
 	bt_addr_le_t discovered_addr;
+
+	/* Deferred state callback work (to avoid calling from BLE callback context) */
+	struct k_work state_work;
+	enum ninep_l2cap_client_state pending_state;
 };
 
 /* Define TX buffer pool for L2CAP SDUs */
@@ -367,7 +371,7 @@ static struct bt_conn_cb conn_callbacks = {
 
 static bool conn_cb_registered = false;
 
-/* State management */
+/* State management - defer callback to work queue to avoid calling from BLE context */
 static void set_state(struct l2cap_client_data *data,
                       enum ninep_l2cap_client_state new_state)
 {
@@ -376,8 +380,10 @@ static void set_state(struct l2cap_client_data *data,
 		data->state = new_state;
 
 		if (data->state_cb) {
-			data->state_cb(data->transport, new_state,
-			               data->transport->user_data);
+			/* Defer callback to work queue - BLE callbacks may be in
+			 * ISR or BT thread context where mutex/condvar ops fail */
+			data->pending_state = new_state;
+			k_work_submit(&data->state_work);
 		}
 	}
 }
@@ -511,6 +517,19 @@ static void connect_work_handler(struct k_work *work)
 	int ret = connect_to_device(data, &data->discovered_addr);
 	if (ret < 0) {
 		LOG_ERR("Deferred connect failed: %d", ret);
+	}
+}
+
+/* Work handler for deferred state callback (runs outside BT callback context) */
+static void state_work_handler(struct k_work *work)
+{
+	struct l2cap_client_data *data = CONTAINER_OF(work, struct l2cap_client_data, state_work);
+
+	LOG_DBG("Deferred state callback: %d", data->pending_state);
+
+	if (data->state_cb) {
+		data->state_cb(data->transport, data->pending_state,
+		               data->transport->user_data);
 	}
 }
 
@@ -703,8 +722,9 @@ static int l2cap_client_stop(struct ninep_transport *transport)
 
 	LOG_INF("L2CAP client stop (state=%d)", data->state);
 
-	/* Cancel any pending connect work first */
+	/* Cancel any pending work items first */
 	k_work_cancel(&data->connect_work);
+	k_work_cancel(&data->state_work);
 
 	/* Stop scanning if active */
 	bt_le_scan_stop();
@@ -793,9 +813,10 @@ int ninep_transport_l2cap_client_init(struct ninep_transport *transport,
 	data->channel.rx_buf_size = config->rx_buf_size;
 	data->channel.transport = transport;
 
-	/* Initialize semaphore and work item */
+	/* Initialize semaphore and work items */
 	k_sem_init(&data->connect_sem, 0, 1);
 	k_work_init(&data->connect_work, connect_work_handler);
+	k_work_init(&data->state_work, state_work_handler);
 
 	/* Initialize transport */
 	transport->ops = &l2cap_client_ops;
