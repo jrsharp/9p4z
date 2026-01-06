@@ -79,9 +79,12 @@ struct l2cap_client_data {
 	struct k_work connect_work;
 	bt_addr_le_t discovered_addr;
 
-	/* Deferred state callback work (to avoid calling from BLE callback context) */
+	/* Deferred state callback work (to avoid calling from BLE callback context)
+	 * Uses a message queue to preserve state transition order when multiple
+	 * state changes happen before work runs (e.g., quick disconnect+reconnect) */
 	struct k_work state_work;
-	enum ninep_l2cap_client_state pending_state;
+	struct k_msgq state_queue;
+	char state_queue_buffer[4 * sizeof(enum ninep_l2cap_client_state)];
 };
 
 /* Define TX buffer pool for L2CAP SDUs */
@@ -380,10 +383,16 @@ static void set_state(struct l2cap_client_data *data,
 		data->state = new_state;
 
 		if (data->state_cb) {
-			/* Defer callback to work queue - BLE callbacks may be in
-			 * ISR or BT thread context where mutex/condvar ops fail */
-			data->pending_state = new_state;
-			k_work_submit(&data->state_work);
+			/* Queue state for deferred callback - BLE callbacks may be in
+			 * ISR or BT thread context where mutex/condvar ops fail.
+			 * Using a queue preserves ordering when multiple state changes
+			 * happen before work runs (e.g., disconnect then quick reconnect). */
+			int ret = k_msgq_put(&data->state_queue, &new_state, K_NO_WAIT);
+			if (ret == 0) {
+				k_work_submit(&data->state_work);
+			} else {
+				LOG_ERR("State queue full, dropping state %d", new_state);
+			}
 		}
 	}
 }
@@ -524,12 +533,16 @@ static void connect_work_handler(struct k_work *work)
 static void state_work_handler(struct k_work *work)
 {
 	struct l2cap_client_data *data = CONTAINER_OF(work, struct l2cap_client_data, state_work);
+	enum ninep_l2cap_client_state state;
 
-	LOG_DBG("Deferred state callback: %d", data->pending_state);
+	/* Drain the queue - process all pending state transitions in order */
+	while (k_msgq_get(&data->state_queue, &state, K_NO_WAIT) == 0) {
+		LOG_DBG("Deferred state callback: %d", state);
 
-	if (data->state_cb) {
-		data->state_cb(data->transport, data->pending_state,
-		               data->transport->user_data);
+		if (data->state_cb) {
+			data->state_cb(data->transport, state,
+			               data->transport->user_data);
+		}
 	}
 }
 
@@ -722,9 +735,10 @@ static int l2cap_client_stop(struct ninep_transport *transport)
 
 	LOG_INF("L2CAP client stop (state=%d)", data->state);
 
-	/* Cancel any pending work items first */
+	/* Cancel any pending work items and purge state queue */
 	k_work_cancel(&data->connect_work);
 	k_work_cancel(&data->state_work);
+	k_msgq_purge(&data->state_queue);
 
 	/* Stop scanning if active */
 	bt_le_scan_stop();
@@ -817,6 +831,8 @@ int ninep_transport_l2cap_client_init(struct ninep_transport *transport,
 	k_sem_init(&data->connect_sem, 0, 1);
 	k_work_init(&data->connect_work, connect_work_handler);
 	k_work_init(&data->state_work, state_work_handler);
+	k_msgq_init(&data->state_queue, data->state_queue_buffer,
+	            sizeof(enum ninep_l2cap_client_state), 4);
 
 	/* Initialize transport */
 	transport->ops = &l2cap_client_ops;
