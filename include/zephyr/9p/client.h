@@ -36,23 +36,22 @@ struct ninep_client_fid {
 };
 
 /**
- * @brief Pending request structure (for request/response matching)
+ * @brief Lightweight tag tracking structure
  *
- * Each pending request has its own response buffer, enabling true
- * concurrent 9P operations across multiple threads. The 9P protocol
- * uses tags to multiplex requests - this structure tracks each
- * outstanding request until its response arrives.
+ * Tags are cheap - just tracking state, no buffers. The 9P protocol
+ * uses tags to multiplex requests on a single connection. Responses
+ * arrive serially on the transport, so we only need ONE shared response
+ * buffer, not one per tag.
+ *
+ * This design allows many concurrent tags (64+) with minimal memory:
+ * - 64 tags × ~16 bytes = 1KB (vs old: 64 × 300 bytes = 19KB)
  */
-struct ninep_pending_req {
-	uint16_t tag;
-	bool in_use;
-	bool complete;
-	int error;
-	struct k_sem sem;
-
-	/* Per-request response buffer for concurrent operations */
-	uint8_t resp_data[CONFIG_NINEP_RESP_BUF_SIZE];
-	size_t resp_len;
+struct ninep_tag_entry {
+	uint16_t tag;           /* Tag number */
+	bool in_use;            /* Tag is allocated */
+	bool complete;          /* Response received */
+	int error;              /* Error code (0 = success) */
+	void *user_ctx;         /* Caller-provided context for result */
 };
 
 /**
@@ -70,6 +69,13 @@ struct ninep_client_config {
  * Thread-safe 9P client supporting concurrent operations. Multiple threads
  * can issue 9P requests simultaneously - the client serializes TX (message
  * building and sending) but allows concurrent waits for responses.
+ *
+ * Memory-efficient design:
+ * - Single shared response buffer (responses arrive serially on transport)
+ * - Lightweight tag tracking (no per-tag buffers or semaphores)
+ * - Single condvar for all waiters (broadcast on response arrival)
+ *
+ * This allows 64+ concurrent tags in ~2KB vs the old ~20KB.
  */
 struct ninep_client {
 	const struct ninep_client_config *config;
@@ -78,19 +84,24 @@ struct ninep_client {
 	/* FID table */
 	struct ninep_client_fid fids[CONFIG_NINEP_MAX_FIDS];
 
-	/* Pending requests table - each slot has its own response buffer */
-	struct ninep_pending_req pending[CONFIG_NINEP_MAX_TAGS];
+	/* Lightweight tag tracking - no per-tag buffers! */
+	struct ninep_tag_entry tags[CONFIG_NINEP_MAX_TAGS];
 
 	/* TX buffer - protected by lock during build+send */
 	uint8_t tx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
+
+	/* Single shared response buffer - responses arrive serially */
+	uint8_t resp_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
+	size_t resp_len;
 
 	/* State */
 	uint32_t msize;  /* Negotiated max message size */
 	uint32_t next_fid;
 	uint16_t next_tag;
 
-	/* Synchronization - held only during TX (build + send) */
-	struct k_mutex lock;
+	/* Synchronization */
+	struct k_mutex lock;       /* Protects TX and tag table */
+	struct k_condvar resp_cv;  /* Signaled when any response arrives */
 };
 
 /**

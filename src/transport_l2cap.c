@@ -37,11 +37,15 @@ LOG_MODULE_REGISTER(ninep_l2cap_transport, CONFIG_NINEP_LOG_LEVEL);
  * - When a 9P message arrives, it's queued
  * - The next available thread picks it up and processes it
  * - If one thread blocks, others continue processing new requests
+ *
+ * Note: Reduced from 3 threads/4KB stacks to fit in ESP32 DRAM constraints.
+ * 1024 bytes is tight but sufficient for simple 9P operations.
+ * TODO: Make these configurable via Kconfig.
  */
-#define NINEP_THREAD_POOL_SIZE 3
-#define NINEP_THREAD_STACK_SIZE 4096
+#define NINEP_THREAD_POOL_SIZE 1
+#define NINEP_THREAD_STACK_SIZE 1024
 #define NINEP_THREAD_PRIORITY 5
-#define NINEP_MSG_QUEUE_SIZE 8
+#define NINEP_MSG_QUEUE_SIZE 4
 
 /* Work item for thread pool - owns a COPY of the message data */
 struct ninep_work_item {
@@ -64,8 +68,8 @@ enum l2cap_rx_state {
 	RX_WAIT_MSG     /* Waiting for message body */
 };
 
-/* Maximum concurrent L2CAP channels per PSM */
-#define MAX_L2CAP_CHANNELS 4
+/* Maximum concurrent L2CAP channels per PSM (reduced for ESP32 DRAM) */
+#define MAX_L2CAP_CHANNELS 1
 
 /* L2CAP channel structure */
 struct l2cap_9p_chan {
@@ -93,8 +97,8 @@ struct l2cap_transport_data {
 #endif
 };
 
-/* Define TX buffer pool for L2CAP SDUs */
-#define TX_BUF_COUNT 4
+/* Define TX buffer pool for L2CAP SDUs (reduced for ESP32 DRAM) */
+#define TX_BUF_COUNT 2
 #define TX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_MAX_MESSAGE_SIZE)
 NET_BUF_POOL_DEFINE(l2cap_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE, CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
 
@@ -391,13 +395,12 @@ static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
 	free_chan->rx_state = RX_WAIT_SIZE;
 	free_chan->in_use = true;
 
-	/* Set RX MTU and initial credits for the peer to send to us */
+	/* Set RX MTU for the peer to send to us */
 	free_chan->le.rx.mtu = data->rx_buf_size_per_channel;
-	free_chan->le.rx.init_credits = 10;  /* Grant 10 initial credits to peer */
 
-	LOG_INF("Assigned channel slot %d/%d (rx.mtu=%u, init_credits=%u)",
+	LOG_INF("Assigned channel slot %d/%d (rx.mtu=%u)",
 	        (int)(free_chan - data->channels), MAX_L2CAP_CHANNELS,
-	        free_chan->le.rx.mtu, free_chan->le.rx.init_credits);
+	        free_chan->le.rx.mtu);
 
 	*chan = &free_chan->le.chan;
 	return 0;

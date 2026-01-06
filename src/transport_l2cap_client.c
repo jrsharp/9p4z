@@ -32,6 +32,14 @@
 
 LOG_MODULE_REGISTER(ninep_l2cap_client, CONFIG_NINEP_LOG_LEVEL);
 
+/* Forward declarations for global state tracking.
+ * g_connecting_data is set during connection establishment.
+ * g_active_data persists after connection for disconnect handling.
+ * g_scan_data tracks the client during BLE scanning. */
+static struct l2cap_client_data *g_connecting_data;
+static struct l2cap_client_data *g_active_data;
+static struct l2cap_client_data *g_scan_data;
+
 /* RX state machine states */
 enum l2cap_rx_state {
 	RX_WAIT_SIZE,   /* Waiting for 4-byte size field */
@@ -77,6 +85,19 @@ struct l2cap_client_data {
 #define TX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_MAX_MESSAGE_SIZE)
 NET_BUF_POOL_DEFINE(l2cap_client_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
                     CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
+
+/* Low-latency connection parameters for keyboard input
+ * Min interval: 6 × 1.25ms = 7.5ms (BLE minimum)
+ * Max interval: 9 × 1.25ms = 11.25ms
+ * Latency: 0 (respond to every event)
+ * Timeout: 100 × 10ms = 1000ms
+ */
+static const struct bt_le_conn_param conn_param_low_latency = {
+	.interval_min = 6,
+	.interval_max = 9,
+	.latency = 0,
+	.timeout = 100,
+};
 
 /* Forward declarations */
 static void set_state(struct l2cap_client_data *data,
@@ -133,12 +154,11 @@ static void l2cap_disconnected(struct bt_l2cap_chan *chan)
 	ch->rx_expected = 0;
 	ch->rx_state = RX_WAIT_SIZE;
 
-	/* Clean up BLE connection to avoid EINVAL on reconnect */
-	if (data->conn) {
-		bt_conn_disconnect(data->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-		bt_conn_unref(data->conn);
-		data->conn = NULL;
-	}
+	/* DON'T clean up BLE connection here - let ble_disconnected() handle it.
+	 * If we unref here, ble_disconnected() won't be able to properly clean up
+	 * and the connection will remain in the BT stack's internal list. */
+
+	/* DON'T clear g_active_data - ble_disconnected() needs it */
 
 	set_state(data, NINEP_L2CAP_CLIENT_DISCONNECTED);
 }
@@ -244,8 +264,6 @@ static struct bt_l2cap_chan_ops l2cap_chan_ops = {
 };
 
 /* BLE connection callbacks */
-/* Forward declaration for accessing data from connection */
-static struct l2cap_client_data *g_connecting_data = NULL;
 
 static void ble_connected(struct bt_conn *conn, uint8_t err)
 {
@@ -276,8 +294,9 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
 		return;
 	}
 
-	/* Store the connection reference */
+	/* Store the connection reference and track active data for disconnect handling */
 	data->conn = bt_conn_ref(conn);
+	g_active_data = data;
 	LOG_INF("BLE connected successfully to %s", addr_str);
 
 	/* Initialize L2CAP channel and connect immediately (like old code did)
@@ -307,17 +326,28 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
 
 static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
 {
+	/* Try g_connecting_data first (for disconnects during connection),
+	 * then g_active_data (for disconnects after successful connection) */
 	struct l2cap_client_data *data = g_connecting_data;
+	if (!data) {
+		data = g_active_data;
+	}
 
-	LOG_INF("BLE disconnected (reason: 0x%02x)", reason);
+	LOG_INF("BLE disconnected (reason: 0x%02x, data=%p)", reason, data);
 
 	/* Clean up connection reference if it matches ours.
 	 * This handles cases where BLE disconnects before L2CAP is established,
 	 * or after L2CAP has already cleaned up. */
 	if (data && data->conn == conn) {
+		LOG_INF("Cleaning up BLE connection reference");
 		bt_conn_unref(data->conn);
 		data->conn = NULL;
+		g_active_data = NULL;
 		set_state(data, NINEP_L2CAP_CLIENT_DISCONNECTED);
+	} else if (data && data->conn == NULL) {
+		/* L2CAP already cleaned up, just clear active data */
+		LOG_INF("BLE disconnected after L2CAP cleanup");
+		g_active_data = NULL;
 	}
 }
 
@@ -392,13 +422,37 @@ static int connect_to_device(struct l2cap_client_data *data,
 		k_sleep(K_MSEC(100));
 	}
 
-	/* Check if BT stack already has a connection to this address */
+	/* Check if BT stack already has a connection to this address.
+	 * If so, wait for it to be fully removed before creating a new one.
+	 * This handles the case where keyboard went to sleep and we're reconnecting. */
 	existing = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr);
 	if (existing) {
 		LOG_WRN("Existing BT connection found, disconnecting first");
 		bt_conn_disconnect(existing, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 		bt_conn_unref(existing);
-		k_sleep(K_MSEC(200));
+
+		/* Wait for connection to be fully removed (up to 3 seconds) */
+		int wait_count = 0;
+		while (wait_count < 30) {
+			k_sleep(K_MSEC(100));
+			existing = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr);
+			if (!existing) {
+				LOG_INF("Old connection removed after %d ms", (wait_count + 1) * 100);
+				break;
+			}
+			/* Connection still exists - try disconnecting again every 500ms */
+			if (wait_count > 0 && (wait_count % 5) == 0) {
+				LOG_WRN("Retrying disconnect after %d ms", wait_count * 100);
+				bt_conn_disconnect(existing, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+			}
+			bt_conn_unref(existing);
+			wait_count++;
+		}
+		if (wait_count >= 30) {
+			/* Last resort: try to proceed anyway - the BT stack might
+			 * handle the collision, or we'll fail cleanly */
+			LOG_WRN("Old connection still exists after 3s, proceeding anyway");
+		}
 	}
 
 	set_state(data, NINEP_L2CAP_CLIENT_CONNECTING);
@@ -406,11 +460,18 @@ static int connect_to_device(struct l2cap_client_data *data,
 	/* Set global for connection callback context */
 	g_connecting_data = data;
 
-	/* Create BLE connection - callbacks handle the rest:
+	/* Create BLE connection with low-latency parameters for keyboard input.
+	 * Callbacks handle the rest:
 	 * 1. ble_connected() will initiate L2CAP
-	 * 2. l2cap_connected() will set state to CONNECTED */
+	 * 2. l2cap_connected() will set state to CONNECTED
+	 *
+	 * IMPORTANT: bt_conn_le_create() returns a reference that we must release.
+	 * We'll take a new reference in ble_connected() when we actually need it.
+	 * If we don't release here, we leak a reference and the connection can
+	 * never be fully cleaned up. */
+	struct bt_conn *conn = NULL;
 	ret = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
-	                        BT_LE_CONN_PARAM_DEFAULT, &data->conn);
+	                        &conn_param_low_latency, &conn);
 	if (ret < 0) {
 		LOG_ERR("Failed to create connection: %d", ret);
 		g_connecting_data = NULL;
@@ -418,12 +479,16 @@ static int connect_to_device(struct l2cap_client_data *data,
 		return ret;
 	}
 
+	/* Release the reference from bt_conn_le_create().
+	 * The BT stack keeps its own internal reference until disconnect.
+	 * We'll take a reference in ble_connected() callback. */
+	if (conn) {
+		bt_conn_unref(conn);
+	}
+
 	LOG_INF("BLE connection initiated, callbacks will handle L2CAP");
 	return 0;  /* Success - connection in progress, callbacks handle the rest */
 }
-
-/* Scan callback - stored globally since BT scan API doesn't provide context */
-static struct l2cap_client_data *g_scan_data = NULL;
 
 /* Work handler for deferred connection (runs outside BT thread) */
 static void connect_work_handler(struct k_work *work)
@@ -627,12 +692,18 @@ static int l2cap_client_stop(struct ninep_transport *transport)
 		return -EINVAL;
 	}
 
+	LOG_INF("L2CAP client stop (state=%d)", data->state);
+
 	/* Cancel any pending connect work first */
 	k_work_cancel(&data->connect_work);
 
 	/* Stop scanning if active */
 	bt_le_scan_stop();
 	g_scan_data = NULL;
+
+	/* Clear global references to avoid stale pointers */
+	g_connecting_data = NULL;
+	g_active_data = NULL;
 
 	/* Disconnect L2CAP channel */
 	if (data->state == NINEP_L2CAP_CLIENT_CONNECTED) {

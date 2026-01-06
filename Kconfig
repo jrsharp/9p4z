@@ -26,32 +26,51 @@ config NINEP_MAX_FIDS
 	  Each fid represents an open file or directory handle.
 
 config NINEP_MAX_TAGS
-	int "Maximum number of pending requests"
-	default 4
+	int "Maximum number of pending requests (tags)"
+	default 32
 	help
-	  Maximum number of concurrent outstanding requests.
-	  Each request in flight requires a unique tag and its own
-	  response buffer (NINEP_RESP_BUF_SIZE bytes).
+	  Maximum number of concurrent outstanding 9P requests.
 
-config NINEP_RESP_BUF_SIZE
-	int "Per-request response buffer size"
-	default 256
-	help
-	  Size of the response buffer for each pending request slot.
-	  This enables true concurrent 9P operations - multiple threads
-	  can have requests in flight simultaneously.
+	  Tags are lightweight (~16 bytes each) - they only track request
+	  state, not buffers. A single shared response buffer is used since
+	  responses arrive serially on the transport.
 
-	  256 bytes is sufficient for most operations (walk, open, clunk,
-	  small reads). For large file transfers, use streaming reads
-	  that fit within this buffer.
-
-	  Memory usage: NINEP_MAX_TAGS * NINEP_RESP_BUF_SIZE bytes.
+	  Memory usage: ~16 bytes per tag.
+	  Example: 64 tags = ~1KB (vs old design: 64 × 300 = 19KB)
 
 config NINEP_SERVER
 	bool "9P Server Support"
 	default y
 	help
 	  Enable 9P server functionality.
+
+config NINEP_SERVER_MAX_FIDS
+	int "Maximum FIDs per server session"
+	default 32
+	depends on NINEP_SERVER
+	help
+	  Maximum number of concurrent file IDs per server session.
+	  Server FIDs are lightweight (~20 bytes each) since auth state
+	  and usernames are pooled separately.
+
+config NINEP_SERVER_AUTH_POOL
+	int "Authentication state pool size"
+	default 4
+	depends on NINEP_SERVER
+	help
+	  Maximum concurrent authentication handshakes. Most connections
+	  only need 1 auth fid at a time, so a small pool (2-4) is sufficient.
+	  Memory: ~130 bytes per slot.
+
+config NINEP_SERVER_UNAME_POOL
+	int "Username pool size"
+	default 8
+	depends on NINEP_SERVER
+	help
+	  Maximum unique usernames across all FIDs. Usernames are interned
+	  to avoid 64-byte duplication in every FID. Most servers see only
+	  a few unique users.
+	  Memory: 64 bytes per slot.
 
 if NINEP_SERVER
 

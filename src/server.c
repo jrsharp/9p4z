@@ -24,10 +24,100 @@ LOG_MODULE_REGISTER(ninep_server, CONFIG_NINEP_LOG_LEVEL);
 /* Forward declarations */
 static uint64_t get_current_time_ms(void);
 
+/*
+ * Username pool management - intern strings to avoid duplication
+ */
+
+/* Intern a username, returning pool index (or NINEP_POOL_NONE on failure) */
+static uint8_t uname_intern(struct ninep_server *server, const char *uname, size_t len)
+{
+	/* Truncate if necessary */
+	if (len >= 64) len = 63;
+
+	/* First, check if already interned */
+	for (int i = 0; i < CONFIG_NINEP_SERVER_UNAME_POOL; i++) {
+		if (server->uname_refcount[i] > 0 &&
+		    strncmp(server->uname_pool[i], uname, len) == 0 &&
+		    server->uname_pool[i][len] == '\0') {
+			server->uname_refcount[i]++;
+			return i;
+		}
+	}
+
+	/* Not found - allocate new slot */
+	for (int i = 0; i < CONFIG_NINEP_SERVER_UNAME_POOL; i++) {
+		if (server->uname_refcount[i] == 0) {
+			memcpy(server->uname_pool[i], uname, len);
+			server->uname_pool[i][len] = '\0';
+			server->uname_refcount[i] = 1;
+			return i;
+		}
+	}
+
+	LOG_WRN("Username pool exhausted");
+	return NINEP_POOL_NONE;
+}
+
+/* Release a username reference */
+static void uname_release(struct ninep_server *server, uint8_t idx)
+{
+	if (idx < CONFIG_NINEP_SERVER_UNAME_POOL && server->uname_refcount[idx] > 0) {
+		server->uname_refcount[idx]--;
+	}
+}
+
+/* Get username string from index */
+static const char *uname_get(struct ninep_server *server, uint8_t idx)
+{
+	if (idx < CONFIG_NINEP_SERVER_UNAME_POOL && server->uname_refcount[idx] > 0) {
+		return server->uname_pool[idx];
+	}
+	return "";
+}
+
+/*
+ * Auth state pool management - only allocate for auth fids
+ */
+
+/* Allocate auth state slot, returns index (or NINEP_POOL_NONE on failure) */
+static uint8_t auth_alloc(struct ninep_server *server)
+{
+	for (int i = 0; i < CONFIG_NINEP_SERVER_AUTH_POOL; i++) {
+		if (!server->auth_pool_used[i]) {
+			server->auth_pool_used[i] = true;
+			memset(&server->auth_pool[i], 0, sizeof(server->auth_pool[i]));
+			return i;
+		}
+	}
+	LOG_WRN("Auth pool exhausted");
+	return NINEP_POOL_NONE;
+}
+
+/* Free auth state slot */
+static void auth_free(struct ninep_server *server, uint8_t idx)
+{
+	if (idx < CONFIG_NINEP_SERVER_AUTH_POOL) {
+		server->auth_pool_used[idx] = false;
+	}
+}
+
+/* Get auth state from index */
+static struct ninep_auth_state *auth_get(struct ninep_server *server, uint8_t idx)
+{
+	if (idx < CONFIG_NINEP_SERVER_AUTH_POOL && server->auth_pool_used[idx]) {
+		return &server->auth_pool[idx];
+	}
+	return NULL;
+}
+
+/*
+ * FID management - lightweight with pooled resources
+ */
+
 /* Helper to find FID */
 static struct ninep_server_fid *find_fid(struct ninep_server *server, uint32_t fid)
 {
-	for (int i = 0; i < CONFIG_NINEP_MAX_FIDS; i++) {
+	for (int i = 0; i < CONFIG_NINEP_SERVER_MAX_FIDS; i++) {
 		if (server->fids[i].in_use && server->fids[i].fid == fid) {
 			return &server->fids[i];
 		}
@@ -44,35 +134,45 @@ static struct ninep_server_fid *alloc_fid(struct ninep_server *server, uint32_t 
 	}
 
 	/* Find free slot */
-	for (int i = 0; i < CONFIG_NINEP_MAX_FIDS; i++) {
+	for (int i = 0; i < CONFIG_NINEP_SERVER_MAX_FIDS; i++) {
 		if (!server->fids[i].in_use) {
 			server->fids[i].fid = fid;
 			server->fids[i].in_use = true;
 			server->fids[i].node = NULL;
 			server->fids[i].iounit = 0;
-			server->fids[i].uname[0] = '\0';  /* Empty by default */
-			server->fids[i].is_auth_fid = false;  /* Regular fid, not auth */
+			server->fids[i].uname_idx = NINEP_POOL_NONE;
+			server->fids[i].auth_idx = NINEP_POOL_NONE;
+			server->fids[i].is_auth_fid = false;
 			return &server->fids[i];
 		}
 	}
 	return NULL;
 }
 
-/* Helper to free FID */
+/* Helper to free FID and release pooled resources */
 static void free_fid(struct ninep_server *server, uint32_t fid)
 {
 	struct ninep_server_fid *sfid = find_fid(server, fid);
 
 	if (sfid) {
+		/* Release pooled resources */
+		if (sfid->uname_idx != NINEP_POOL_NONE) {
+			uname_release(server, sfid->uname_idx);
+		}
+		if (sfid->auth_idx != NINEP_POOL_NONE) {
+			auth_free(server, sfid->auth_idx);
+		}
 		sfid->in_use = false;
 		sfid->node = NULL;
+		sfid->uname_idx = NINEP_POOL_NONE;
+		sfid->auth_idx = NINEP_POOL_NONE;
 	}
 }
 
 /* Send error response */
 static void send_error(struct ninep_server *server, uint16_t tag, const char *error)
 {
-	int ret = ninep_build_rerror(server->tx_buf, sizeof(server->tx_buf),
+	int ret = ninep_build_rerror(server->tx_buf, server->tx_buf_size,
 	                               tag, error, strlen(error));
 	if (ret > 0) {
 		ninep_transport_send(server->transport, server->tx_buf, ret);
@@ -88,12 +188,26 @@ static void handle_tversion(struct ninep_server *server, const uint8_t *msg, siz
 
 	LOG_INF("Tversion: msize=%u, version=%.*s", msize, version_len, version);
 
-	/* Tversion flushes all server state - clear all fids */
-	for (int i = 0; i < CONFIG_NINEP_MAX_FIDS; i++) {
+	/* Tversion flushes all server state - clear all fids and pools */
+	for (int i = 0; i < CONFIG_NINEP_SERVER_MAX_FIDS; i++) {
+		if (server->fids[i].in_use) {
+			/* Release pooled resources */
+			if (server->fids[i].uname_idx != NINEP_POOL_NONE) {
+				uname_release(server, server->fids[i].uname_idx);
+			}
+			if (server->fids[i].auth_idx != NINEP_POOL_NONE) {
+				auth_free(server, server->fids[i].auth_idx);
+			}
+		}
 		server->fids[i].in_use = false;
 		server->fids[i].node = NULL;
+		server->fids[i].uname_idx = NINEP_POOL_NONE;
+		server->fids[i].auth_idx = NINEP_POOL_NONE;
 	}
-	LOG_DBG("All fids cleared for new session");
+	/* Clear pools */
+	memset(server->uname_refcount, 0, sizeof(server->uname_refcount));
+	memset(server->auth_pool_used, 0, sizeof(server->auth_pool_used));
+	LOG_DBG("All fids and pools cleared for new session");
 
 	/* Negotiate message size - use minimum of client, config, and transport MTU */
 	if (msize > CONFIG_NINEP_MAX_MESSAGE_SIZE) {
@@ -114,7 +228,7 @@ static void handle_tversion(struct ninep_server *server, const uint8_t *msg, siz
 	}
 
 	/* Send Rversion */
-	int ret = ninep_build_rversion(server->tx_buf, sizeof(server->tx_buf),
+	int ret = ninep_build_rversion(server->tx_buf, server->tx_buf_size,
 	                                 NINEP_NOTAG, msize, "9P2000", 6);
 	if (ret > 0) {
 		ninep_transport_send(server->transport, server->tx_buf, ret);
@@ -165,8 +279,8 @@ static void handle_tattach(struct ninep_server *server, uint16_t tag,
 	}
 
 	/* Check authentication requirement */
-	const struct ninep_auth_config *auth = server->config.auth_config;
-	if (auth && auth->required) {
+	const struct ninep_auth_config *auth_cfg = server->config.auth_config;
+	if (auth_cfg && auth_cfg->required) {
 		/* afid == NOFID means no auth attempted */
 		if (afid == NINEP_NOFID) {
 			send_error(server, tag, "authentication required");
@@ -180,22 +294,24 @@ static void handle_tattach(struct ninep_server *server, uint16_t tag,
 			return;
 		}
 
-		if (!auth_fid->auth.authenticated) {
+		/* Get auth state from pool */
+		struct ninep_auth_state *auth_state = auth_get(server, auth_fid->auth_idx);
+		if (!auth_state || !auth_state->authenticated) {
 			send_error(server, tag, "authentication incomplete");
 			return;
 		}
 
 		/* Verify uname matches authenticated identity */
-		if (uname_len > 0 && strncmp(uname, auth_fid->auth.claimed_identity, uname_len) != 0) {
+		if (uname_len > 0 && strncmp(uname, auth_state->claimed_identity, uname_len) != 0) {
 			LOG_WRN("Tattach uname mismatch: claimed='%.*s', auth='%s'",
-			        uname_len, uname, auth_fid->auth.claimed_identity);
+			        uname_len, uname, auth_state->claimed_identity);
 			send_error(server, tag, "uname does not match authenticated identity");
 			return;
 		}
 
 		/* Use authenticated identity as uname */
-		uname = auth_fid->auth.claimed_identity;
-		uname_len = strlen(auth_fid->auth.claimed_identity);
+		uname = auth_state->claimed_identity;
+		uname_len = strlen(auth_state->claimed_identity);
 
 		LOG_INF("Authenticated attach for identity '%s'", uname);
 	}
@@ -208,13 +324,10 @@ static void handle_tattach(struct ninep_server *server, uint16_t tag,
 		return;
 	}
 
-	/* Store uname (truncate if necessary) */
-	size_t copy_len = uname_len < sizeof(sfid->uname) - 1 ?
-	                  uname_len : sizeof(sfid->uname) - 1;
-	memcpy(sfid->uname, uname, copy_len);
-	sfid->uname[copy_len] = '\0';
+	/* Intern uname in pool */
+	sfid->uname_idx = uname_intern(server, uname, uname_len);
 
-	LOG_INF("Tattach: fid=%u, uname='%s'", fid, sfid->uname);
+	LOG_INF("Tattach: fid=%u, uname='%s'", fid, uname_get(server, sfid->uname_idx));
 
 	/* Get root node */
 	sfid->node = server->config.fs_ops->get_root(server->config.fs_ctx);
@@ -225,7 +338,7 @@ static void handle_tattach(struct ninep_server *server, uint16_t tag,
 	}
 
 	/* Send Rattach */
-	int ret = ninep_build_rattach(server->tx_buf, sizeof(server->tx_buf),
+	int ret = ninep_build_rattach(server->tx_buf, server->tx_buf_size,
 	                                tag, &sfid->node->qid);
 	if (ret > 0) {
 		ninep_transport_send(server->transport, server->tx_buf, ret);
@@ -258,12 +371,14 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 			return;
 		}
 		new_sfid->node = sfid->node;
-		/* Copy uname from parent fid */
-		strncpy(new_sfid->uname, sfid->uname, sizeof(new_sfid->uname) - 1);
-		new_sfid->uname[sizeof(new_sfid->uname) - 1] = '\0';
+		/* Share uname from parent fid (increment refcount) */
+		if (sfid->uname_idx != NINEP_POOL_NONE) {
+			new_sfid->uname_idx = sfid->uname_idx;
+			server->uname_refcount[sfid->uname_idx]++;
+		}
 
 		/* Send Rwalk with 0 qids */
-		int ret = ninep_build_rwalk(server->tx_buf, sizeof(server->tx_buf),
+		int ret = ninep_build_rwalk(server->tx_buf, server->tx_buf_size,
 		                             tag, 0, NULL);
 		if (ret > 0) {
 			ninep_transport_send(server->transport, server->tx_buf, ret);
@@ -301,12 +416,14 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 		return;
 	}
 	new_sfid->node = node;
-	/* Copy uname from parent fid */
-	strncpy(new_sfid->uname, sfid->uname, sizeof(new_sfid->uname) - 1);
-	new_sfid->uname[sizeof(new_sfid->uname) - 1] = '\0';
+	/* Share uname from parent fid (increment refcount) */
+	if (sfid->uname_idx != NINEP_POOL_NONE) {
+		new_sfid->uname_idx = sfid->uname_idx;
+		server->uname_refcount[sfid->uname_idx]++;
+	}
 
 	/* Send Rwalk */
-	int ret = ninep_build_rwalk(server->tx_buf, sizeof(server->tx_buf),
+	int ret = ninep_build_rwalk(server->tx_buf, server->tx_buf_size,
 	                             tag, nwname, wqids);
 	if (ret > 0) {
 		ninep_transport_send(server->transport, server->tx_buf, ret);
@@ -341,7 +458,7 @@ static void handle_topen(struct ninep_server *server, uint16_t tag,
 	sfid->iounit = CONFIG_NINEP_MAX_MESSAGE_SIZE - 24; /* msize minus Twrite header */
 
 	/* Send Ropen */
-	ret = ninep_build_ropen(server->tx_buf, sizeof(server->tx_buf),
+	ret = ninep_build_ropen(server->tx_buf, server->tx_buf_size,
 	                         tag, &sfid->node->qid, sfid->iounit);
 	if (ret > 0) {
 		LOG_INF("Sending Ropen: tag=%u, qid.type=%u, qid.path=0x%llx, iounit=%u, size=%d",
@@ -377,9 +494,15 @@ static void handle_tread(struct ninep_server *server, uint16_t tag,
 
 	/* Handle auth fid read (returns challenge) */
 	if (sfid->is_auth_fid) {
+		struct ninep_auth_state *auth_state = auth_get(server, sfid->auth_idx);
+		if (!auth_state) {
+			send_error(server, tag, "invalid auth state");
+			return;
+		}
+
 		/* Check challenge expiry (60 seconds) */
 		uint64_t now = get_current_time_ms();
-		if (now - sfid->auth.challenge_time > 60000) {
+		if (now - auth_state->challenge_time > 60000) {
 			send_error(server, tag, "authentication timeout");
 			return;
 		}
@@ -391,10 +514,10 @@ static void handle_tread(struct ninep_server *server, uint16_t tag,
 			if ((uint32_t)bytes > count) {
 				bytes = count;
 			}
-			memcpy(&server->tx_buf[11], &sfid->auth.challenge[offset], bytes);
+			memcpy(&server->tx_buf[11], &auth_state->challenge[offset], bytes);
 		}
 
-		sfid->auth.challenge_issued = true;
+		auth_state->challenge_issued = true;
 		LOG_DBG("Auth read: returning %d bytes of challenge", bytes);
 
 		/* Build Rread header */
@@ -421,7 +544,7 @@ static void handle_tread(struct ninep_server *server, uint16_t tag,
 	}
 
 	/* Limit count to available buffer space */
-	uint32_t max_data = sizeof(server->tx_buf) - 11; /* Header + count field */
+	uint32_t max_data = server->tx_buf_size - 11; /* Header + count field */
 
 	if (count > max_data) {
 		count = max_data;
@@ -430,7 +553,8 @@ static void handle_tread(struct ninep_server *server, uint16_t tag,
 	/* Read data */
 	int bytes = server->config.fs_ops->read(sfid->node, offset,
 	                                          &server->tx_buf[11], count,
-	                                          sfid->uname, server->config.fs_ctx);
+	                                          uname_get(server, sfid->uname_idx),
+	                                          server->config.fs_ctx);
 	if (bytes < 0) {
 		send_error(server, tag, "read failed");
 		return;
@@ -480,7 +604,7 @@ static void handle_tstat(struct ninep_server *server, uint16_t tag,
 	}
 
 	/* Build Rstat */
-	int ret = ninep_build_rstat(server->tx_buf, sizeof(server->tx_buf),
+	int ret = ninep_build_rstat(server->tx_buf, server->tx_buf_size,
 	                             tag, stat_buf, stat_len);
 	if (ret > 0) {
 		ninep_transport_send(server->transport, server->tx_buf, ret);
@@ -558,22 +682,32 @@ static void handle_tauth(struct ninep_server *server, uint16_t tag,
 		return;
 	}
 
-	/* Mark as auth fid and initialize auth state */
+	/* Allocate auth state from pool */
+	uint8_t auth_idx = auth_alloc(server);
+	if (auth_idx == NINEP_POOL_NONE) {
+		free_fid(server, afid);
+		send_error(server, tag, "too many concurrent authentications");
+		return;
+	}
+
+	struct ninep_auth_state *auth_state = auth_get(server, auth_idx);
+
+	/* Mark as auth fid */
 	sfid->is_auth_fid = true;
+	sfid->auth_idx = auth_idx;
 	sfid->node = NULL;  /* Auth fids don't point to filesystem nodes */
-	memset(&sfid->auth, 0, sizeof(sfid->auth));
 
 	/* Store claimed identity */
-	memcpy(sfid->auth.claimed_identity, uname, uname_len);
-	sfid->auth.claimed_identity[uname_len] = '\0';
+	memcpy(auth_state->claimed_identity, uname, uname_len);
+	auth_state->claimed_identity[uname_len] = '\0';
 
 	/* Generate challenge */
-	generate_challenge(sfid->auth.challenge, NINEP_AUTH_CHALLENGE_SIZE);
-	sfid->auth.challenge_time = get_current_time_ms();
-	sfid->auth.challenge_issued = false;
-	sfid->auth.authenticated = false;
+	generate_challenge(auth_state->challenge, NINEP_AUTH_CHALLENGE_SIZE);
+	auth_state->challenge_time = get_current_time_ms();
+	auth_state->challenge_issued = false;
+	auth_state->authenticated = false;
 
-	LOG_INF("Tauth: generated challenge for identity '%s'", sfid->auth.claimed_identity);
+	LOG_INF("Tauth: generated challenge for identity '%s'", auth_state->claimed_identity);
 
 	/* Build Rauth response */
 	struct ninep_qid aqid = {
@@ -582,7 +716,7 @@ static void handle_tauth(struct ninep_server *server, uint16_t tag,
 		.path = (uint64_t)afid  /* Use afid as unique path */
 	};
 
-	int ret = ninep_build_rauth(server->tx_buf, sizeof(server->tx_buf), tag, &aqid);
+	int ret = ninep_build_rauth(server->tx_buf, server->tx_buf_size, tag, &aqid);
 	if (ret > 0) {
 		ninep_transport_send(server->transport, server->tx_buf, ret);
 	}
@@ -597,7 +731,7 @@ static void handle_tflush(struct ninep_server *server, uint16_t tag,
 
 	/* Simple implementation: just acknowledge the flush */
 	/* A full implementation would cancel pending operations for oldtag */
-	int ret = ninep_build_rflush(server->tx_buf, sizeof(server->tx_buf), tag);
+	int ret = ninep_build_rflush(server->tx_buf, server->tx_buf_size, tag);
 	if (ret > 0) {
 		ninep_transport_send(server->transport, server->tx_buf, ret);
 	}
@@ -631,8 +765,9 @@ static void handle_tcreate(struct ninep_server *server, uint16_t tag,
 
 	/* Create new file/directory */
 	struct ninep_fs_node *new_node = NULL;
+	const char *uname = uname_get(server, sfid->uname_idx);
 	int ret = server->config.fs_ops->create(
-		sfid->node, name, name_len, perm, mode, sfid->uname, &new_node, server->config.fs_ctx);
+		sfid->node, name, name_len, perm, mode, uname, &new_node, server->config.fs_ctx);
 
 	if (ret < 0 || !new_node) {
 		send_error(server, tag, "create failed");
@@ -644,7 +779,7 @@ static void handle_tcreate(struct ninep_server *server, uint16_t tag,
 	sfid->iounit = 0;
 
 	/* Send Rcreate */
-	ret = ninep_build_rcreate(server->tx_buf, sizeof(server->tx_buf),
+	ret = ninep_build_rcreate(server->tx_buf, server->tx_buf_size,
 	                          tag, &new_node->qid, sfid->iounit);
 	if (ret > 0) {
 		ninep_transport_send(server->transport, server->tx_buf, ret);
@@ -675,15 +810,21 @@ static void handle_twrite(struct ninep_server *server, uint16_t tag,
 
 	/* Handle auth fid write (receives signature + pubkey from client) */
 	if (sfid->is_auth_fid) {
+		struct ninep_auth_state *auth_state = auth_get(server, sfid->auth_idx);
+		if (!auth_state) {
+			send_error(server, tag, "auth state lost");
+			return;
+		}
+
 		/* Must have read challenge first */
-		if (!sfid->auth.challenge_issued) {
+		if (!auth_state->challenge_issued) {
 			send_error(server, tag, "must read challenge first");
 			return;
 		}
 
 		/* Check challenge expiry (60 seconds) */
 		uint64_t now = get_current_time_ms();
-		if (now - sfid->auth.challenge_time > 60000) {
+		if (now - auth_state->challenge_time > 60000) {
 			send_error(server, tag, "authentication timeout");
 			return;
 		}
@@ -723,30 +864,33 @@ static void handle_twrite(struct ninep_server *server, uint16_t tag,
 		 * - Verify signature over challenge
 		 * - Check if identity is authorized */
 		int ret = auth->verify_auth(
-			sfid->auth.claimed_identity,
+			auth_state->claimed_identity,
 			pubkey, pubkey_size,
 			signature, sig_size,
-			sfid->auth.challenge, NINEP_AUTH_CHALLENGE_SIZE,
+			auth_state->challenge, NINEP_AUTH_CHALLENGE_SIZE,
 			auth->auth_ctx);
 
 		if (ret != 0) {
 			LOG_WRN("Auth verification failed for identity '%s'",
-			        sfid->auth.claimed_identity);
+			        auth_state->claimed_identity);
 			send_error(server, tag, "authentication failed");
 			return;
 		}
 
-		LOG_INF("Auth successful for identity '%s'", sfid->auth.claimed_identity);
+		LOG_INF("Auth successful for identity '%s'", auth_state->claimed_identity);
 
 		/* Mark as authenticated */
-		sfid->auth.authenticated = true;
+		auth_state->authenticated = true;
 
-		/* Store authenticated identity in uname */
-		strncpy(sfid->uname, sfid->auth.claimed_identity, sizeof(sfid->uname) - 1);
-		sfid->uname[sizeof(sfid->uname) - 1] = '\0';
+		/* Store authenticated identity in uname (intern it) */
+		if (sfid->uname_idx != NINEP_POOL_NONE) {
+			uname_release(server, sfid->uname_idx);
+		}
+		sfid->uname_idx = uname_intern(server, auth_state->claimed_identity,
+		                               strlen(auth_state->claimed_identity));
 
 		/* Send Rwrite with bytes written */
-		ret = ninep_build_rwrite(server->tx_buf, sizeof(server->tx_buf),
+		ret = ninep_build_rwrite(server->tx_buf, server->tx_buf_size,
 		                         tag, count);
 		if (ret > 0) {
 			ninep_transport_send(server->transport, server->tx_buf, ret);
@@ -766,15 +910,16 @@ static void handle_twrite(struct ninep_server *server, uint16_t tag,
 	}
 
 	/* Write data */
+	const char *uname = uname_get(server, sfid->uname_idx);
 	int bytes = server->config.fs_ops->write(sfid->node, offset, data, count,
-	                                           sfid->uname, server->config.fs_ctx);
+	                                           uname, server->config.fs_ctx);
 	if (bytes < 0) {
 		send_error(server, tag, "write failed");
 		return;
 	}
 
 	/* Send Rwrite */
-	int ret = ninep_build_rwrite(server->tx_buf, sizeof(server->tx_buf),
+	int ret = ninep_build_rwrite(server->tx_buf, server->tx_buf_size,
 	                              tag, bytes);
 	if (ret > 0) {
 		ninep_transport_send(server->transport, server->tx_buf, ret);
@@ -814,7 +959,7 @@ static void handle_tremove(struct ninep_server *server, uint16_t tag,
 	free_fid(server, fid);
 
 	/* Send Rremove */
-	ret = ninep_build_rremove(server->tx_buf, sizeof(server->tx_buf), tag);
+	ret = ninep_build_rremove(server->tx_buf, server->tx_buf_size, tag);
 	if (ret > 0) {
 		ninep_transport_send(server->transport, server->tx_buf, ret);
 	}
@@ -863,7 +1008,7 @@ static void handle_tclunk(struct ninep_server *server, uint16_t tag,
 	free_fid(server, fid);
 
 	/* Send Rclunk */
-	int ret = ninep_build_rclunk(server->tx_buf, sizeof(server->tx_buf), tag);
+	int ret = ninep_build_rclunk(server->tx_buf, server->tx_buf_size, tag);
 	if (ret > 0) {
 		int send_ret = ninep_transport_send(server->transport, server->tx_buf, ret);
 		LOG_INF("Rclunk sent: tag=%u, ret=%d", tag, send_ret);
@@ -957,6 +1102,28 @@ int ninep_server_init(struct ninep_server *server,
 	memcpy(&server->config, config, sizeof(server->config));
 	server->transport = transport;
 
+	/* Dynamically allocate RX/TX buffers (may use PSRAM on ESP32) */
+	size_t buf_size = CONFIG_NINEP_MAX_MESSAGE_SIZE;
+
+	server->rx_buf = k_malloc(buf_size);
+	if (!server->rx_buf) {
+		LOG_ERR("Failed to allocate %zu bytes for RX buffer", buf_size);
+		return -ENOMEM;
+	}
+	server->rx_buf_size = buf_size;
+
+	server->tx_buf = k_malloc(buf_size);
+	if (!server->tx_buf) {
+		LOG_ERR("Failed to allocate %zu bytes for TX buffer", buf_size);
+		k_free(server->rx_buf);
+		server->rx_buf = NULL;
+		return -ENOMEM;
+	}
+	server->tx_buf_size = buf_size;
+
+	LOG_INF("9P server buffers allocated: RX=%zu TX=%zu bytes (may be PSRAM)",
+	        buf_size, buf_size);
+
 	/* Set transport callback (only for network servers) */
 	if (transport) {
 		transport->recv_cb = server_recv_callback;
@@ -978,19 +1145,43 @@ void ninep_server_cleanup(struct ninep_server *server)
 	LOG_INF("Cleaning up 9P server - clunking open fids");
 
 	/* Clunk all open fids to properly release filesystem resources */
-	for (int i = 0; i < CONFIG_NINEP_MAX_FIDS; i++) {
+	for (int i = 0; i < CONFIG_NINEP_SERVER_MAX_FIDS; i++) {
 		struct ninep_server_fid *sfid = &server->fids[i];
-		if (sfid->in_use && sfid->node) {
-			LOG_DBG("Cleanup: clunking fid %u node '%s'", sfid->fid, sfid->node->name);
+		if (sfid->in_use) {
+			if (sfid->node) {
+				LOG_DBG("Cleanup: clunking fid %u node '%s'", sfid->fid, sfid->node->name);
 
-			/* Call filesystem clunk handler if available */
-			if (server->config.fs_ops && server->config.fs_ops->clunk) {
-				server->config.fs_ops->clunk(sfid->node, server->config.fs_ctx);
+				/* Call filesystem clunk handler if available */
+				if (server->config.fs_ops && server->config.fs_ops->clunk) {
+					server->config.fs_ops->clunk(sfid->node, server->config.fs_ctx);
+				}
+				sfid->node = NULL;
 			}
 
-			sfid->node = NULL;
+			/* Release pooled resources */
+			if (sfid->uname_idx != NINEP_POOL_NONE) {
+				uname_release(server, sfid->uname_idx);
+				sfid->uname_idx = NINEP_POOL_NONE;
+			}
+			if (sfid->auth_idx != NINEP_POOL_NONE) {
+				auth_free(server, sfid->auth_idx);
+				sfid->auth_idx = NINEP_POOL_NONE;
+			}
+
 			sfid->in_use = false;
 		}
+	}
+
+	/* Free dynamically allocated buffers */
+	if (server->rx_buf) {
+		k_free(server->rx_buf);
+		server->rx_buf = NULL;
+		server->rx_buf_size = 0;
+	}
+	if (server->tx_buf) {
+		k_free(server->tx_buf);
+		server->tx_buf = NULL;
+		server->tx_buf_size = 0;
 	}
 
 	LOG_INF("9P server cleanup complete");

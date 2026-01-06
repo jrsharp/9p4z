@@ -24,8 +24,8 @@
 
 LOG_MODULE_REGISTER(ninep_session_pool_l2cap, CONFIG_NINEP_LOG_LEVEL);
 
-/* Define TX buffer pool for L2CAP SDUs */
-#define TX_BUF_COUNT 4
+/* Define TX buffer pool for L2CAP SDUs (reduced for ESP32 DRAM) */
+#define TX_BUF_COUNT 2
 #define TX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_MAX_MESSAGE_SIZE)
 NET_BUF_POOL_DEFINE(l2cap_session_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
                     CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);

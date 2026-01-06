@@ -259,34 +259,59 @@ struct ninep_auth_state {
 	bool authenticated;                             /**< Auth completed successfully */
 };
 
+/** Invalid index for pools */
+#define NINEP_POOL_NONE 0xFF
+
 /**
- * @brief FID entry (maps FID to filesystem node)
+ * @brief Lightweight FID entry (maps FID to filesystem node)
+ *
+ * Memory-efficient design using pooled auth state and interned usernames:
+ * - Old: 220 bytes per FID (embedded auth + uname)
+ * - New: ~20 bytes per FID (indices into shared pools)
+ *
+ * 32 FIDs: 640 bytes (vs old: 7KB)
  */
 struct ninep_server_fid {
 	uint32_t fid;
 	struct ninep_fs_node *node;
-	bool in_use;
 	uint32_t iounit;
-	char uname[64];  /**< User name from Tattach (CGA or anonymous) */
-
-	/** Auth state (only used for auth fids) */
-	struct ninep_auth_state auth;
-	bool is_auth_fid;  /**< True if this is an auth fid from Tauth */
+	uint8_t uname_idx;    /**< Index into uname pool, or NINEP_POOL_NONE */
+	uint8_t auth_idx;     /**< Index into auth pool, or NINEP_POOL_NONE */
+	bool in_use;
+	bool is_auth_fid;     /**< True if this is an auth fid from Tauth */
 };
 
 /**
  * @brief 9P server instance
+ *
+ * Memory-efficient design:
+ * - Lightweight FID table (~20 bytes per FID)
+ * - Pooled auth state (only allocated for auth fids in progress)
+ * - Interned usernames (shared across FIDs)
+ * - Dynamic RX/TX buffers (can use PSRAM on ESP32)
+ *
+ * Total overhead for 32 FIDs: ~2KB (vs old: ~7KB)
  */
 struct ninep_server {
 	struct ninep_server_config config;  /* Store by value, not pointer */
 	struct ninep_transport *transport;
 
-	/* FID table */
-	struct ninep_server_fid fids[CONFIG_NINEP_MAX_FIDS];
+	/* Lightweight FID table */
+	struct ninep_server_fid fids[CONFIG_NINEP_SERVER_MAX_FIDS];
 
-	/* Request/response buffers */
-	uint8_t rx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
-	uint8_t tx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
+	/* Auth state pool - only a few concurrent auths needed */
+	struct ninep_auth_state auth_pool[CONFIG_NINEP_SERVER_AUTH_POOL];
+	bool auth_pool_used[CONFIG_NINEP_SERVER_AUTH_POOL];
+
+	/* Interned username pool - most sessions share usernames */
+	char uname_pool[CONFIG_NINEP_SERVER_UNAME_POOL][64];
+	uint8_t uname_refcount[CONFIG_NINEP_SERVER_UNAME_POOL];
+
+	/* Request/response buffers (dynamically allocated, may use PSRAM) */
+	uint8_t *rx_buf;
+	uint8_t *tx_buf;
+	size_t rx_buf_size;  /* Allocated size for validation */
+	size_t tx_buf_size;  /* Allocated size for validation */
 	size_t rx_len;
 };
 
