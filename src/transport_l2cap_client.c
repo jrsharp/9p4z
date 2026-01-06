@@ -235,6 +235,15 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 		}
 	}
 
+	/*
+	 * Grant a credit back to the server after processing received data.
+	 * This is needed on mainline Zephyr for credit-based flow control.
+	 * ESP32 and NCS may handle credits differently.
+	 */
+#if !NINEP_NCS_BUILD && !NINEP_ESP32_BUILD
+	bt_l2cap_chan_recv_complete(chan, buf);
+#endif
+
 	return 0;
 }
 

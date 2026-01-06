@@ -333,6 +333,19 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 		}
 	}
 
+	/*
+	 * CRITICAL: Grant a credit back to the remote peer after processing.
+	 * Without this, the client runs out of credits and can't send more data.
+	 * On mainline Zephyr, bt_l2cap_chan_recv_complete() returns the buffer
+	 * and grants one credit.
+	 *
+	 * Note: This server transport is only used on nRF52/ZMK (not ESP32).
+	 * NCS has a different credit model so we skip it there.
+	 */
+#if !NINEP_NCS_BUILD
+	bt_l2cap_chan_recv_complete(chan, buf);
+#endif
+
 	return 0;
 }
 
