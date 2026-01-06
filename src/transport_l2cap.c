@@ -42,10 +42,15 @@ LOG_MODULE_REGISTER(ninep_l2cap_transport, CONFIG_NINEP_LOG_LEVEL);
  * 1024 bytes is tight but sufficient for simple 9P operations.
  * TODO: Make these configurable via Kconfig.
  */
-#define NINEP_THREAD_POOL_SIZE 1
-#define NINEP_THREAD_STACK_SIZE 1024
+/*
+ * Thread pool sizing: Multiple threads allow concurrent 9P operations.
+ * Use cases: kbin blocking read, battery polling, DFU, memfault, settings, etc.
+ * Each thread needs stack space (2KB), so balance concurrency vs memory.
+ */
+#define NINEP_THREAD_POOL_SIZE 4
+#define NINEP_THREAD_STACK_SIZE 2048
 #define NINEP_THREAD_PRIORITY 5
-#define NINEP_MSG_QUEUE_SIZE 4
+#define NINEP_MSG_QUEUE_SIZE 16
 
 /* Work item for thread pool - owns a COPY of the message data */
 struct ninep_work_item {
