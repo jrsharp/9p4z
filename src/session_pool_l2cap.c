@@ -91,6 +91,9 @@ static void l2cap_session_disconnected(struct bt_l2cap_chan *chan)
 
 	/* Free the session back to the pool */
 	ninep_session_free(ch->session);
+
+	/* Log pool status after free */
+	LOG_INF("Session freed - check pool for available slots");
 }
 
 static int l2cap_session_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)

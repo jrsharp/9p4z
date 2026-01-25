@@ -454,8 +454,13 @@ static void handle_topen(struct ninep_server *server, uint16_t tag,
 		return;
 	}
 
-	/* Set iounit to a reasonable value for I/O operations */
-	sfid->iounit = CONFIG_NINEP_MAX_MESSAGE_SIZE - 24; /* msize minus Twrite header */
+	/* Set iounit based on actual transport MTU, not just config */
+	int transport_mtu = ninep_transport_get_mtu(server->transport);
+	if (transport_mtu > 24) {
+		sfid->iounit = transport_mtu - 24; /* MTU minus Twrite/Rread header */
+	} else {
+		sfid->iounit = CONFIG_NINEP_MAX_MESSAGE_SIZE - 24; /* Fallback */
+	}
 
 	/* Send Ropen */
 	ret = ninep_build_ropen(server->tx_buf, server->tx_buf_size,

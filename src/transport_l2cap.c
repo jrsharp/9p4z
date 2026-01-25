@@ -243,7 +243,11 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 	struct l2cap_9p_chan *ch = CONTAINER_OF(chan, struct l2cap_9p_chan, le.chan);
 #endif
 
-	LOG_INF(">>> L2CAP RECV: %u bytes", buf->len);
+	LOG_INF("L2CAP recv: %u bytes (rx_state=%d, rx_len=%zu)",
+	        buf->len, ch->rx_state, ch->rx_len);
+
+	/* Track which channel is currently processing a request for response routing */
+	data->current_rx_chan = ch;
 
 	/* Process all data in the buffer */
 	while (buf->len > 0) {
@@ -272,6 +276,8 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 					/* Reset and skip this message */
 					ch->rx_len = 0;
 					ch->rx_state = RX_WAIT_SIZE;
+					/* CRITICAL: Must still release credits! */
+					bt_l2cap_chan_recv_complete(chan, buf);
 					return -EINVAL;
 				}
 
@@ -350,6 +356,8 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 #if !NINEP_NCS_BUILD
 	bt_l2cap_chan_recv_complete(chan, buf);
 #endif
+
+	LOG_DBG("L2CAP recv done, credits released");
 
 	return 0;
 }
@@ -458,6 +466,8 @@ static int l2cap_send(struct ninep_transport *transport, const uint8_t *buf,
 	/* Copy message data to net_buf */
 	net_buf_add_mem(msg_buf, buf, len);
 
+	LOG_INF("L2CAP send: %zu bytes", len);
+
 	/* Send via L2CAP channel */
 	ret = bt_l2cap_chan_send(&active_chan->le.chan, msg_buf);
 	if (ret < 0) {
@@ -466,7 +476,7 @@ static int l2cap_send(struct ninep_transport *transport, const uint8_t *buf,
 		return ret;
 	}
 
-	LOG_DBG("Sent %zu bytes via L2CAP", len);
+	LOG_INF("L2CAP sent %zu bytes successfully", len);
 	return len;
 }
 

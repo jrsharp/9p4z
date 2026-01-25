@@ -67,8 +67,18 @@ struct ninep_session *ninep_session_alloc(struct ninep_session_pool *pool)
 	k_mutex_unlock(&pool->lock);
 
 	if (!session) {
-		LOG_WRN("Session pool exhausted (%d/%d in use)",
-		        pool->max_sessions, pool->max_sessions);
+		/* Count how many are in each state for debugging */
+		int free_count = 0, alloc_count = 0, conn_count = 0, disc_count = 0;
+		for (int i = 0; i < pool->max_sessions; i++) {
+			switch (pool->sessions[i].state) {
+			case NINEP_SESSION_FREE: free_count++; break;
+			case NINEP_SESSION_ALLOCATED: alloc_count++; break;
+			case NINEP_SESSION_CONNECTED: conn_count++; break;
+			case NINEP_SESSION_DISCONNECTING: disc_count++; break;
+			}
+		}
+		LOG_ERR("Session pool exhausted! States: free=%d alloc=%d conn=%d disc=%d",
+		        free_count, alloc_count, conn_count, disc_count);
 	}
 
 	return session;
