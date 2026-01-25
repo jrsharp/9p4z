@@ -243,6 +243,9 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 	struct l2cap_9p_chan *ch = CONTAINER_OF(chan, struct l2cap_9p_chan, le.chan);
 #endif
 
+	struct ninep_transport *transport = ch->transport;
+	struct l2cap_transport_data *data = transport->priv_data;
+
 	LOG_INF("L2CAP recv: %u bytes (rx_state=%d, rx_len=%zu)",
 	        buf->len, ch->rx_state, ch->rx_len);
 
