@@ -105,6 +105,48 @@ int ninep_build_rversion(uint8_t *buf, size_t buf_len, uint16_t tag,
 	return offset;
 }
 
+int ninep_build_tauth(uint8_t *buf, size_t buf_len, uint16_t tag,
+                      uint32_t afid,
+                      const char *uname, uint16_t uname_len,
+                      const char *aname, uint16_t aname_len)
+{
+	if (!buf || buf_len < 7) {
+		return -EINVAL;
+	}
+
+	uint32_t msg_size = 7 + 4 + 2 + uname_len + 2 + aname_len;
+	if (buf_len < msg_size) {
+		return -ENOSPC;
+	}
+
+	size_t offset = 0;
+	struct ninep_msg_header hdr = {
+		.size = msg_size,
+		.type = NINEP_TAUTH,
+		.tag = tag,
+	};
+
+	int ret = ninep_write_header(buf, buf_len, &hdr);
+	if (ret < 0) {
+		return ret;
+	}
+	offset = 7;
+
+	write_u32_le(buf, &offset, afid);
+
+	ret = ninep_write_string(buf, buf_len, &offset, uname, uname_len);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = ninep_write_string(buf, buf_len, &offset, aname, aname_len);
+	if (ret < 0) {
+		return ret;
+	}
+
+	return offset;
+}
+
 int ninep_build_tattach(uint8_t *buf, size_t buf_len, uint16_t tag,
                         uint32_t fid, uint32_t afid,
                         const char *uname, uint16_t uname_len,

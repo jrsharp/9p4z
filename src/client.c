@@ -226,7 +226,11 @@ int ninep_client_init(struct ninep_client *client,
 	/* Start transport */
 	int ret = ninep_transport_start(transport);
 	if (ret < 0) {
-		LOG_ERR("Failed to start transport: %d", ret);
+		if (ret == -EAGAIN) {
+			LOG_WRN("Transport not ready (will retry): %d", ret);
+		} else {
+			LOG_ERR("Failed to start transport: %d", ret);
+		}
 		return ret;
 	}
 
@@ -288,6 +292,86 @@ int ninep_client_version(struct ninep_client *client)
 		client->msize = client->resp_buf[7] | (client->resp_buf[8] << 8) |
 		                (client->resp_buf[9] << 16) | (client->resp_buf[10] << 24);
 		LOG_INF("Negotiated msize: %u", client->msize);
+	}
+
+	free_tag_locked(client, tag);
+	k_mutex_unlock(&client->lock);
+	return 0;
+}
+
+int ninep_client_auth(struct ninep_client *client, uint32_t *afid,
+                      struct ninep_qid *aqid, const char *uname, const char *aname)
+{
+	uint16_t tag;
+	struct ninep_tag_entry *entry;
+	uint32_t allocated_afid;
+
+	k_mutex_lock(&client->lock, K_FOREVER);
+
+	entry = alloc_tag_locked(client, &tag);
+	if (!entry) {
+		k_mutex_unlock(&client->lock);
+		return -ENOMEM;
+	}
+
+	/* Allocate afid inline */
+	for (int i = 0; i < CONFIG_NINEP_MAX_FIDS; i++) {
+		if (!client->fids[i].in_use) {
+			client->fids[i].in_use = true;
+			client->fids[i].fid = client->next_fid++;
+			allocated_afid = client->fids[i].fid;
+			*afid = allocated_afid;
+			goto afid_allocated;
+		}
+	}
+	free_tag_locked(client, tag);
+	k_mutex_unlock(&client->lock);
+	return -ENOMEM;
+
+afid_allocated:;
+
+	/* Build Tauth */
+	int len = ninep_build_tauth(client->tx_buf, sizeof(client->tx_buf),
+	                            tag, allocated_afid,
+	                            uname, strlen(uname),
+	                            aname, strlen(aname));
+	if (len < 0) {
+		struct ninep_client_fid *cfid = find_fid_locked(client, allocated_afid);
+		if (cfid) cfid->in_use = false;
+		free_tag_locked(client, tag);
+		k_mutex_unlock(&client->lock);
+		return len;
+	}
+
+	/* Send request */
+	int ret = ninep_transport_send(client->transport, client->tx_buf, len);
+	if (ret < 0) {
+		struct ninep_client_fid *cfid = find_fid_locked(client, allocated_afid);
+		if (cfid) cfid->in_use = false;
+		free_tag_locked(client, tag);
+		k_mutex_unlock(&client->lock);
+		return ret;
+	}
+
+	/* Wait for response */
+	ret = wait_for_tag(client, entry, client->config->timeout_ms);
+	if (ret < 0) {
+		LOG_ERR("Auth request failed: %d", ret);
+		struct ninep_client_fid *cfid = find_fid_locked(client, allocated_afid);
+		if (cfid) cfid->in_use = false;
+		free_tag_locked(client, tag);
+		k_mutex_unlock(&client->lock);
+		return ret;
+	}
+
+	/* Parse Rauth to get auth qid */
+	struct ninep_client_fid *cfid = find_fid_locked(client, allocated_afid);
+	if (cfid && client->resp_len >= 20) {
+		size_t offset = 7;
+		ninep_parse_qid(client->resp_buf, client->resp_len, &offset, &cfid->qid);
+		if (aqid) {
+			*aqid = cfid->qid;
+		}
 	}
 
 	free_tag_locked(client, tag);

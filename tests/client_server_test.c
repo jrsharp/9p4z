@@ -466,6 +466,32 @@ ZTEST(client_server, test_walk_error)
 	ninep_client_clunk(&client, root_fid);
 }
 
+/*
+ * Test: ninep_client_auth basic functionality
+ *
+ * Note: Full auth testing with signature verification requires crypto setup.
+ * This test verifies the Tauth message is sent correctly but the server
+ * (without auth config) will reject it with an error, which we expect.
+ * A proper integration test should be added when testing with a real
+ * auth-enabled server (e.g., aetherd BBS).
+ */
+ZTEST(client_server, test_auth_no_server_support)
+{
+	uint32_t afid;
+	struct ninep_qid aqid;
+	int ret;
+
+	ret = ninep_client_version(&client);
+	zassert_equal(ret, 0, "Version failed");
+
+	/* Try auth - server has no auth config, so this should fail gracefully */
+	ret = ninep_client_auth(&client, &afid, &aqid, "testuser", "");
+
+	/* Without server auth support, we expect failure */
+	/* This tests that the client handles the error response correctly */
+	zassert_true(ret != 0, "Auth should fail when server has no auth support");
+}
+
 ZTEST_SUITE(client_server, NULL, client_server_setup, NULL, NULL, client_server_teardown);
 
 #endif /* CONFIG_NINEP_CLIENT && CONFIG_NINEP_SERVER */

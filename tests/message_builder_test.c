@@ -45,6 +45,32 @@ ZTEST(ninep_message_builder, test_build_rversion)
 	zassert_equal(hdr.type, NINEP_RVERSION, "Wrong type");
 }
 
+ZTEST(ninep_message_builder, test_build_tauth)
+{
+	/* Test Tauth message: afid=5, uname="0ebb4aae7486" (CGA), aname="" */
+	int ret = ninep_build_tauth(test_buffer, sizeof(test_buffer),
+	                            1, 5,
+	                            "0ebb4aae7486", 12, "", 0);
+	zassert_true(ret > 0, "Build failed");
+
+	/* Tauth: size[4] + type[1] + tag[2] + afid[4] + uname[2+12] + aname[2+0] = 27 */
+	zassert_equal(ret, 27, "Wrong message size: expected 27, got %d", ret);
+
+	struct ninep_msg_header hdr;
+	ninep_parse_header(test_buffer, ret, &hdr);
+	zassert_equal(hdr.type, NINEP_TAUTH, "Wrong type");
+	zassert_equal(hdr.tag, 1, "Wrong tag");
+
+	/* Verify afid field at offset 7 */
+	uint32_t afid = test_buffer[7] | (test_buffer[8] << 8) |
+	                (test_buffer[9] << 16) | (test_buffer[10] << 24);
+	zassert_equal(afid, 5, "Wrong afid");
+
+	/* Verify uname length at offset 11 */
+	uint16_t uname_len = test_buffer[11] | (test_buffer[12] << 8);
+	zassert_equal(uname_len, 12, "Wrong uname length");
+}
+
 ZTEST(ninep_message_builder, test_build_tattach)
 {
 	int ret = ninep_build_tattach(test_buffer, sizeof(test_buffer),

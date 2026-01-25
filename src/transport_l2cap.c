@@ -602,7 +602,7 @@ int ninep_transport_l2cap_init(struct ninep_transport *transport,
 	/* Initialize L2CAP server */
 	data->server.psm = config->psm;
 	data->server.accept = l2cap_accept;
-	data->server.sec_level = BT_SECURITY_L1; /* No encryption required */
+	data->server.sec_level = BT_SECURITY_L2; /* Require encryption (triggers bonding) */
 
 	/* Initialize transport */
 	transport->ops = &l2cap_transport_ops;

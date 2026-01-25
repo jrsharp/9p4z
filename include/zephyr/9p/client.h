@@ -125,6 +125,23 @@ int ninep_client_init(struct ninep_client *client,
 int ninep_client_version(struct ninep_client *client);
 
 /**
+ * @brief Authenticate with server (Tauth/Rauth)
+ *
+ * Initiates the authentication protocol by sending Tauth and receiving
+ * an auth file QID. After this, the caller should read a challenge from
+ * the afid, sign it, and write the response before calling attach.
+ *
+ * @param client Client instance
+ * @param afid Output: allocated auth FID
+ * @param aqid Output: auth file QID (optional, can be NULL)
+ * @param uname User name (typically CGA hex string like "0ebb4aae7486")
+ * @param aname Attach name (filesystem to attach)
+ * @return 0 on success, negative error code on failure
+ */
+int ninep_client_auth(struct ninep_client *client, uint32_t *afid,
+                      struct ninep_qid *aqid, const char *uname, const char *aname);
+
+/**
  * @brief Attach to server root (Tattach/Rattach)
  *
  * @param client Client instance

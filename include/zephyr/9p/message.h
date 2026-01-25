@@ -49,6 +49,24 @@ int ninep_build_rversion(uint8_t *buf, size_t buf_len, uint16_t tag,
                          uint32_t msize, const char *version, uint16_t version_len);
 
 /**
+ * @brief Build a Tauth message
+ *
+ * @param buf Output buffer
+ * @param buf_len Buffer length
+ * @param tag Message tag
+ * @param afid Auth file identifier to establish
+ * @param uname User name (typically CGA hex string)
+ * @param uname_len User name length
+ * @param aname Attach name (filesystem/tree to attach to)
+ * @param aname_len Attach name length
+ * @return Number of bytes written, or negative error code
+ */
+int ninep_build_tauth(uint8_t *buf, size_t buf_len, uint16_t tag,
+                      uint32_t afid,
+                      const char *uname, uint16_t uname_len,
+                      const char *aname, uint16_t aname_len);
+
+/**
  * @brief Build a Tattach message
  *
  * @param buf Output buffer

@@ -846,12 +846,21 @@ static void handle_twrite(struct ninep_server *server, uint16_t tag,
 			return;
 		}
 
-		/* Common layout for Ed25519: signature[64] + pubkey[32]
-		 * App is free to interpret differently, but we provide common sizes */
+		/* Auth response layout: signature[64] + pubkey[pubkey_size]
+		 * P-256 (ECDSA): sig=64, pubkey=65 (uncompressed: 04 || x || y)
+		 * Ed25519: sig=64, pubkey=32
+		 * Detect format by total size */
 		const size_t sig_size = 64;
-		const size_t pubkey_size = 32;
-		if (count < sig_size + pubkey_size) {
-			LOG_WRN("Auth response size %u too small for sig+pubkey", count);
+		size_t pubkey_size;
+
+		if (count == 64 + 65) {
+			/* P-256 format: sig[64] + pubkey[65] = 129 bytes */
+			pubkey_size = 65;
+		} else if (count == 64 + 32) {
+			/* Ed25519 format: sig[64] + pubkey[32] = 96 bytes */
+			pubkey_size = 32;
+		} else {
+			LOG_WRN("Auth response size %u doesn't match known formats (96 or 129)", count);
 			send_error(server, tag, "invalid auth response size");
 			return;
 		}

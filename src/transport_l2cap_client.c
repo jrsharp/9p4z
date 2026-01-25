@@ -8,10 +8,15 @@
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/l2cap.h>
+#include <zephyr/bluetooth/uuid.h>
+#if defined(CONFIG_BT_GATT_CLIENT)
+#include <zephyr/bluetooth/gatt.h>
+#endif
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/byteorder.h>
 #include <string.h>
+#include <stdlib.h>
 #include <errno.h>
 
 /* Platform detection: NCS vs mainline Zephyr vs ESP32 */
@@ -31,6 +36,18 @@
 #endif
 
 LOG_MODULE_REGISTER(ninep_l2cap_client, CONFIG_NINEP_LOG_LEVEL);
+
+#if defined(CONFIG_BT_GATT_CLIENT)
+/* 9PIS Transport Information Characteristic UUID: 39500004-feed-4a91-ba88-a1e0f6e4c001 */
+#define BT_UUID_9PIS_TRANSPORT_VAL \
+	BT_UUID_128_ENCODE(0x39500004, 0xfeed, 0x4a91, 0xba88, 0xa1e0f6e4c001)
+static struct bt_uuid_128 uuid_9pis_transport = BT_UUID_INIT_128(BT_UUID_9PIS_TRANSPORT_VAL);
+
+/* 9PIS Features Characteristic UUID: 39500002-feed-4a91-ba88-a1e0f6e4c001 */
+#define BT_UUID_9PIS_FEATURES_VAL \
+	BT_UUID_128_ENCODE(0x39500002, 0xfeed, 0x4a91, 0xba88, 0xa1e0f6e4c001)
+static struct bt_uuid_128 uuid_9pis_features = BT_UUID_INIT_128(BT_UUID_9PIS_FEATURES_VAL);
+#endif /* CONFIG_BT_GATT_CLIENT */
 
 /* Forward declarations for global state tracking.
  * g_connecting_data is set during connection establishment.
@@ -67,9 +84,26 @@ struct l2cap_client_data {
 	/* Configuration (copied to avoid lifetime issues) */
 	bt_addr_le_t target_addr;
 	bool has_target_addr;
+	bt_addr_le_t filter_addr;    /* MAC filter for UUID scanning */
+	bool has_filter_addr;        /* If true, only connect to filter_addr during scan */
+	bool use_accept_list;        /* If true, use BLE filter accept list during scan */
 	uint16_t psm;
-	uint16_t service_uuid;
+	uint8_t service_uuid128[16];   /* 128-bit UUID in little-endian */
+	bool has_uuid128;              /* true if using 128-bit UUID */
+	uint16_t service_uuid16;       /* fallback 16-bit UUID */
 	ninep_l2cap_client_state_cb_t state_cb;
+	void *state_cb_user_data;      /* user_data for state callback (preserved from init) */
+
+	/* 9PIS GATT discovery (requires CONFIG_BT_GATT_CLIENT) */
+	bool discover_9pis;            /* true to read PSM from 9PIS GATT */
+	const char *required_features; /* If set, verify features contains this string */
+#if defined(CONFIG_BT_GATT_CLIENT)
+	struct bt_gatt_read_params read_params;
+	char transport_info_buf[64];   /* Buffer for transport info string */
+	char features_buf[128];        /* Buffer for features string */
+	uint16_t discovered_psm;       /* PSM from 9PIS, 0 if not discovered */
+	bool features_verified;        /* true after features check passed */
+#endif
 
 	/* Synchronization */
 	struct k_sem connect_sem;
@@ -123,6 +157,11 @@ static void l2cap_connected(struct bt_l2cap_chan *chan)
 	struct l2cap_client_chan *ch = CONTAINER_OF(chan, struct l2cap_client_chan, le.chan);
 #endif
 	struct l2cap_client_data *data = ch->transport->priv_data;
+
+	LOG_DBG("l2cap_connected: chan=%p ch=%p ch->transport=%p priv_data=%p",
+		chan, ch, ch->transport, data);
+	LOG_DBG("  state_cb_user_data=%p state_cb=%p",
+		data->state_cb_user_data, data->state_cb);
 
 	LOG_INF("L2CAP channel connected (MTU: RX=%u, TX=%u, credits: RX=%d, TX=%d)",
 	        ch->le.rx.mtu, ch->le.tx.mtu,
@@ -279,6 +318,275 @@ static struct bt_l2cap_chan_ops l2cap_chan_ops = {
 	.sent = l2cap_sent,
 };
 
+#if defined(CONFIG_BT_GATT_CLIENT)
+/*
+ * Parse PSM from 9PIS Transport Information string.
+ * Format: "l2cap:psm=0xNNNN,mtu=NNNN" or "l2cap:psm=0xNNNN"
+ * Returns PSM value or 0 on parse failure.
+ */
+static uint16_t parse_transport_info_psm(const char *transport_info)
+{
+	const char *psm_str;
+	char *end;
+	unsigned long psm;
+
+	if (!transport_info) {
+		return 0;
+	}
+
+	/* Look for "psm=" */
+	psm_str = strstr(transport_info, "psm=");
+	if (!psm_str) {
+		LOG_WRN("No 'psm=' found in transport info");
+		return 0;
+	}
+
+	psm_str += 4;  /* Skip "psm=" */
+
+	/* Parse hex or decimal */
+	psm = strtoul(psm_str, &end, 0);
+	if (end == psm_str || psm > 0xFFFF) {
+		LOG_WRN("Invalid PSM value in transport info");
+		return 0;
+	}
+
+	LOG_INF("Parsed PSM 0x%04lx from transport info", psm);
+	return (uint16_t)psm;
+}
+
+/* Forward declarations */
+static int start_l2cap_connect(struct l2cap_client_data *data);
+static int start_transport_info_read(struct l2cap_client_data *data);
+
+/*
+ * GATT read callback for 9PIS Features characteristic
+ * Verifies the device supports required features before proceeding
+ */
+static uint8_t features_read_cb(struct bt_conn *conn, uint8_t err,
+				struct bt_gatt_read_params *params,
+				const void *data, uint16_t length)
+{
+	struct l2cap_client_data *client_data = g_active_data;
+
+	if (!client_data) {
+		LOG_ERR("No active client data in features callback");
+		return BT_GATT_ITER_STOP;
+	}
+
+	if (err) {
+		LOG_WRN("Features read failed (err %d), assuming compatible", err);
+		client_data->features_verified = true;
+		goto read_transport;
+	}
+
+	if (!data) {
+		/* Read complete */
+		return BT_GATT_ITER_STOP;
+	}
+
+	/* Copy features string */
+	size_t copy_len = MIN(length, sizeof(client_data->features_buf) - 1);
+	memcpy(client_data->features_buf, data, copy_len);
+	client_data->features_buf[copy_len] = '\0';
+
+	LOG_INF("9PIS Features: %s", client_data->features_buf);
+
+	/* Check if required features are present */
+	if (client_data->required_features) {
+		if (strstr(client_data->features_buf, client_data->required_features) == NULL) {
+			LOG_WRN("Device features '%s' don't include required '%s' - disconnecting",
+				client_data->features_buf, client_data->required_features);
+			/* Disconnect and resume scanning */
+			bt_conn_disconnect(client_data->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+			return BT_GATT_ITER_STOP;
+		}
+		LOG_INF("Required feature '%s' verified", client_data->required_features);
+	}
+
+	client_data->features_verified = true;
+
+read_transport:
+	/* Proceed to read transport info */
+	start_transport_info_read(client_data);
+	return BT_GATT_ITER_STOP;
+}
+
+/*
+ * GATT read callback for 9PIS Transport Information characteristic
+ */
+static uint8_t transport_info_read_cb(struct bt_conn *conn, uint8_t err,
+				      struct bt_gatt_read_params *params,
+				      const void *data, uint16_t length)
+{
+	struct l2cap_client_data *client_data = g_active_data;
+
+	if (!client_data) {
+		LOG_ERR("No active client data in GATT callback");
+		return BT_GATT_ITER_STOP;
+	}
+
+	if (err) {
+		LOG_WRN("9PIS read failed (err %d), using fallback PSM 0x%04x",
+			err, client_data->psm);
+		goto connect_l2cap;
+	}
+
+	if (!data) {
+		/* Read complete */
+		LOG_DBG("9PIS read complete");
+		return BT_GATT_ITER_STOP;
+	}
+
+	/* Copy transport info (ensure null termination) */
+	size_t copy_len = MIN(length, sizeof(client_data->transport_info_buf) - 1);
+	memcpy(client_data->transport_info_buf, data, copy_len);
+	client_data->transport_info_buf[copy_len] = '\0';
+
+	LOG_INF("9PIS Transport Info: %s", client_data->transport_info_buf);
+
+	/* Parse PSM from transport info */
+	client_data->discovered_psm = parse_transport_info_psm(client_data->transport_info_buf);
+
+connect_l2cap:
+	/* Proceed with L2CAP connection using discovered or fallback PSM */
+	if (start_l2cap_connect(client_data) < 0) {
+		set_state(client_data, NINEP_L2CAP_CLIENT_DISCONNECTED);
+	}
+
+	return BT_GATT_ITER_STOP;
+}
+
+/*
+ * Start reading 9PIS Transport Information characteristic (step 2 of discovery)
+ */
+static int start_transport_info_read(struct l2cap_client_data *data)
+{
+	int ret;
+
+	LOG_INF("Reading 9PIS Transport Info...");
+
+	memset(&data->read_params, 0, sizeof(data->read_params));
+	data->read_params.func = transport_info_read_cb;
+	data->read_params.handle_count = 0;  /* Read by UUID */
+	data->read_params.by_uuid.start_handle = 0x0001;
+	data->read_params.by_uuid.end_handle = 0xFFFF;
+	data->read_params.by_uuid.uuid = &uuid_9pis_transport.uuid;
+
+	data->discovered_psm = 0;
+	memset(data->transport_info_buf, 0, sizeof(data->transport_info_buf));
+
+	ret = bt_gatt_read(data->conn, &data->read_params);
+	if (ret < 0) {
+		LOG_WRN("Transport info read failed: %d, using fallback PSM 0x%04x",
+			ret, data->psm);
+		/* Fall through to L2CAP connect anyway */
+		if (start_l2cap_connect(data) < 0) {
+			set_state(data, NINEP_L2CAP_CLIENT_DISCONNECTED);
+		}
+		return ret;
+	}
+
+	return 0;
+}
+
+/*
+ * Start 9PIS GATT discovery
+ * If required_features is set, reads Features characteristic first to verify
+ * the device supports the required feature before connecting.
+ */
+static int start_9pis_discovery(struct l2cap_client_data *data)
+{
+	int ret;
+
+	LOG_INF("Starting 9PIS GATT discovery...");
+	set_state(data, NINEP_L2CAP_CLIENT_DISCOVERING);
+
+	data->features_verified = false;
+	memset(data->features_buf, 0, sizeof(data->features_buf));
+
+	/* If required_features is set, read features first to verify compatibility */
+	if (data->required_features) {
+		LOG_INF("Verifying required feature: %s", data->required_features);
+
+		memset(&data->read_params, 0, sizeof(data->read_params));
+		data->read_params.func = features_read_cb;
+		data->read_params.handle_count = 0;  /* Read by UUID */
+		data->read_params.by_uuid.start_handle = 0x0001;
+		data->read_params.by_uuid.end_handle = 0xFFFF;
+		data->read_params.by_uuid.uuid = &uuid_9pis_features.uuid;
+
+		ret = bt_gatt_read(data->conn, &data->read_params);
+		if (ret < 0) {
+			LOG_WRN("Features read failed: %d, skipping verification", ret);
+			/* Fall through to transport info read */
+			return start_transport_info_read(data);
+		}
+		return 0;  /* features_read_cb will call start_transport_info_read */
+	}
+
+	/* No features check needed, go directly to transport info */
+	return start_transport_info_read(data);
+}
+#endif /* CONFIG_BT_GATT_CLIENT */
+
+/*
+ * Start L2CAP channel connection (called after BLE connect, optionally after 9PIS discovery)
+ */
+static int start_l2cap_connect(struct l2cap_client_data *data)
+{
+	int ret;
+	uint16_t psm_to_use;
+
+#if defined(CONFIG_BT_GATT_CLIENT)
+	/* Use discovered PSM if available, otherwise fallback */
+	psm_to_use = (data->discovered_psm != 0) ? data->discovered_psm : data->psm;
+#else
+	psm_to_use = data->psm;
+#endif
+
+	/* Validate PSM - 0 is not a valid L2CAP PSM */
+	if (psm_to_use == 0) {
+		LOG_ERR("Invalid PSM 0 - 9PIS discovery failed and no fallback PSM configured");
+		bt_conn_disconnect(data->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		bt_conn_unref(data->conn);
+		data->conn = NULL;
+		return -EINVAL;
+	}
+
+	/* Request security/bonding BEFORE L2CAP connect.
+	 * This triggers SMP pairing which exchanges IRK for address resolution.
+	 * Must be done before L2CAP or security request may fail. */
+	ret = bt_conn_set_security(data->conn, BT_SECURITY_L2);
+	if (ret < 0 && ret != -EALREADY) {
+		LOG_WRN("Failed to request security: %d (continuing anyway)", ret);
+	} else {
+		LOG_INF("Security level L2 requested (bonding enabled)");
+	}
+
+	/* Initialize L2CAP channel - preserve rx_buf settings */
+	uint8_t *saved_rx_buf = data->channel.rx_buf;
+	size_t saved_rx_buf_size = data->channel.rx_buf_size;
+	memset(&data->channel, 0, sizeof(data->channel));
+	data->channel.le.chan.ops = &l2cap_chan_ops;
+	data->channel.le.rx.mtu = CONFIG_NINEP_MAX_MESSAGE_SIZE;
+	data->channel.transport = data->transport;
+	data->channel.rx_buf = saved_rx_buf;
+	data->channel.rx_buf_size = saved_rx_buf_size;
+
+	LOG_INF("Initiating L2CAP channel to PSM 0x%04x", psm_to_use);
+	ret = bt_l2cap_chan_connect(data->conn, &data->channel.le.chan, psm_to_use);
+	if (ret < 0) {
+		LOG_ERR("L2CAP connect failed: %d", ret);
+		bt_conn_disconnect(data->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		bt_conn_unref(data->conn);
+		data->conn = NULL;
+		return ret;
+	}
+
+	LOG_INF("L2CAP connect initiated");
+	return 0;
+}
+
 /* BLE connection callbacks */
 
 static void ble_connected(struct bt_conn *conn, uint8_t err)
@@ -286,7 +594,6 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
 	struct l2cap_client_data *data = g_connecting_data;
 	char addr_str[BT_ADDR_LE_STR_LEN];
 	const bt_addr_le_t *addr = bt_conn_get_dst(conn);
-	int ret;
 
 	bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
 	LOG_INF("ble_connected callback: addr=%s err=%d data=%p", addr_str, err, data);
@@ -315,28 +622,22 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
 	g_active_data = data;
 	LOG_INF("BLE connected successfully to %s", addr_str);
 
-	/* Initialize L2CAP channel and connect immediately (like old code did)
-	 * Note: Preserve rx_buf and rx_buf_size set during init - only zero the le struct */
-	uint8_t *saved_rx_buf = data->channel.rx_buf;
-	size_t saved_rx_buf_size = data->channel.rx_buf_size;
-	memset(&data->channel, 0, sizeof(data->channel));
-	data->channel.le.chan.ops = &l2cap_chan_ops;
-	data->channel.le.rx.mtu = CONFIG_NINEP_MAX_MESSAGE_SIZE;
-	data->channel.transport = data->transport;
-	data->channel.rx_buf = saved_rx_buf;
-	data->channel.rx_buf_size = saved_rx_buf_size;
+#if defined(CONFIG_BT_GATT_CLIENT)
+	/* If 9PIS discovery is enabled, read Transport Info to get PSM */
+	if (data->discover_9pis) {
+		int ret = start_9pis_discovery(data);
+		if (ret == 0) {
+			/* Callback will handle L2CAP connect */
+			return;
+		}
+		/* Discovery failed, fall through to direct L2CAP connect */
+		LOG_WRN("9PIS discovery failed, using configured PSM");
+	}
+#endif
 
-	LOG_INF("Initiating L2CAP channel to PSM 0x%04x", data->psm);
-	ret = bt_l2cap_chan_connect(conn, &data->channel.le.chan, data->psm);
-	if (ret < 0) {
-		LOG_ERR("L2CAP connect failed: %d", ret);
-		bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-		bt_conn_unref(data->conn);
-		data->conn = NULL;
+	/* Direct L2CAP connect */
+	if (start_l2cap_connect(data) < 0) {
 		set_state(data, NINEP_L2CAP_CLIENT_DISCONNECTED);
-	} else {
-		LOG_INF("L2CAP connect initiated");
-		/* l2cap_connected callback will set state to CONNECTED */
 	}
 }
 
@@ -367,9 +668,23 @@ static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
 	}
 }
 
+static void ble_security_changed(struct bt_conn *conn, bt_security_t level,
+				 enum bt_security_err err)
+{
+	char addr_str[BT_ADDR_LE_STR_LEN];
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr_str, sizeof(addr_str));
+
+	if (err) {
+		LOG_ERR("Security change failed: %s level %u err %d", addr_str, level, err);
+	} else {
+		LOG_INF("Security changed: %s level %u", addr_str, level);
+	}
+}
+
 static struct bt_conn_cb conn_callbacks = {
 	.connected = ble_connected,
 	.disconnected = ble_disconnected,
+	.security_changed = ble_security_changed,
 };
 
 static bool conn_cb_registered = false;
@@ -519,11 +834,19 @@ static void connect_work_handler(struct k_work *work)
 {
 	struct l2cap_client_data *data = CONTAINER_OF(work, struct l2cap_client_data, connect_work);
 	char addr_str[BT_ADDR_LE_STR_LEN];
+	int ret;
+
+	/* Stop scanning first - must be done outside scan callback context
+	 * to avoid ESP32 BLE controller issues */
+	ret = bt_le_scan_stop();
+	if (ret < 0 && ret != -EALREADY) {
+		LOG_WRN("Scan stop returned %d (continuing anyway)", ret);
+	}
 
 	bt_addr_le_to_str(&data->discovered_addr, addr_str, sizeof(addr_str));
 	LOG_INF("Deferred connect starting to %s", addr_str);
 
-	int ret = connect_to_device(data, &data->discovered_addr);
+	ret = connect_to_device(data, &data->discovered_addr);
 	if (ret < 0) {
 		LOG_ERR("Deferred connect failed: %d", ret);
 	}
@@ -535,13 +858,17 @@ static void state_work_handler(struct k_work *work)
 	struct l2cap_client_data *data = CONTAINER_OF(work, struct l2cap_client_data, state_work);
 	enum ninep_l2cap_client_state state;
 
+	LOG_DBG("state_work_handler: work=%p data=%p transport=%p state_cb_user_data=%p",
+		work, data, data->transport, data->state_cb_user_data);
+
 	/* Drain the queue - process all pending state transitions in order */
 	while (k_msgq_get(&data->state_queue, &state, K_NO_WAIT) == 0) {
-		LOG_DBG("Deferred state callback: %d", state);
+		LOG_DBG("Deferred state callback: state=%d", state);
 
 		if (data->state_cb) {
-			data->state_cb(data->transport, state,
-			               data->transport->user_data);
+			/* Use preserved state_cb_user_data, NOT transport->user_data
+			 * (ninep_client_init overwrites transport->user_data with client ptr) */
+			data->state_cb(data->transport, state, data->state_cb_user_data);
 		}
 	}
 }
@@ -574,15 +901,31 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			break;
 		}
 
-		uint8_t type = net_buf_simple_pull_u8(ad);
+		uint8_t ad_type = net_buf_simple_pull_u8(ad);
 		len--;
 
-		if ((type == BT_DATA_UUID16_ALL || type == BT_DATA_UUID16_SOME) &&
+		/* Check for 128-bit UUID if we're looking for one */
+		if (data->has_uuid128 &&
+		    (ad_type == BT_DATA_UUID128_ALL || ad_type == BT_DATA_UUID128_SOME) &&
+		    len >= 16) {
+			/* Check each 128-bit UUID in the list */
+			for (int i = 0; i + 15 < len; i += 16) {
+				if (memcmp(&ad->data[i], data->service_uuid128, 16) == 0) {
+					LOG_INF("Found 9PIS service at %s", addr_str);
+					found = true;
+					break;
+				}
+			}
+		}
+
+		/* Check for 16-bit UUID (fallback or primary if no 128-bit) */
+		if (!found && data->service_uuid16 != 0 &&
+		    (ad_type == BT_DATA_UUID16_ALL || ad_type == BT_DATA_UUID16_SOME) &&
 		    len >= 2) {
 			for (int i = 0; i + 1 < len; i += 2) {
 				uint16_t uuid = sys_get_le16(&ad->data[i]);
-				if (uuid == data->service_uuid) {
-					LOG_INF("Found target service 0x%04x at %s",
+				if (uuid == data->service_uuid16) {
+					LOG_INF("Found service 0x%04x at %s",
 					        uuid, addr_str);
 					found = true;
 					break;
@@ -598,16 +941,33 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 	}
 
 	if (found) {
-		/* Stop scanning and defer connection to work queue
-		 * (can't block BT thread with semaphore wait) */
-		bt_le_scan_stop();
+		/* Check MAC filter - if set, only connect to matching device */
+		if (data->has_filter_addr) {
+			char filter_str[BT_ADDR_LE_STR_LEN];
+			bt_addr_le_to_str(&data->filter_addr, filter_str, sizeof(filter_str));
+			LOG_INF("Checking filter: found=%s, want=%s", addr_str, filter_str);
+			if (bt_addr_le_cmp(addr, &data->filter_addr) != 0) {
+				LOG_INF("Skipping %s (doesn't match filter %s)", addr_str, filter_str);
+				return;  /* Continue scanning for the right device */
+			}
+			LOG_INF("Found paired device %s", addr_str);
+		}
+
+		/* Check if we're already connected to this device */
+		struct bt_conn *existing = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr);
+		if (existing) {
+			LOG_WRN("Device %s already connected, skipping", addr_str);
+			bt_conn_unref(existing);
+			return;  /* Continue scanning for other devices */
+		}
+
+		/* Mark that we found the target - the work handler will stop scan.
+		 * Don't call bt_le_scan_stop() from scan callback context as it
+		 * can cause ESP32 BLE controller to become unresponsive. */
 		g_scan_data = NULL;
 
 		/* Save address and schedule deferred connection */
 		bt_addr_le_copy(&data->discovered_addr, addr);
-
-		/* Cancel any stale work before submitting */
-		k_work_cancel(&data->connect_work);
 
 		LOG_INF("Submitting connect work...");
 		int ret = k_work_submit(&data->connect_work);
@@ -625,21 +985,48 @@ static int start_scan(struct l2cap_client_data *data)
 {
 	int ret;
 
-	LOG_INF("Starting scan for service UUID 0x%04x", data->service_uuid);
+	/* Check if another transport is already scanning */
+	if (g_scan_data != NULL && g_scan_data != data) {
+		LOG_WRN("Another scan already in progress, cannot start new scan");
+		return -EBUSY;
+	}
+
+	if (data->has_uuid128) {
+		LOG_INF("Starting scan for 9PIS service (128-bit UUID, accept_list=%d)",
+			data->use_accept_list);
+	} else {
+		LOG_INF("Starting scan for service UUID 0x%04x (accept_list=%d)",
+			data->service_uuid16, data->use_accept_list);
+	}
 
 	set_state(data, NINEP_L2CAP_CLIENT_SCANNING);
 	g_scan_data = data;
 
+	/* Build scan options based on configuration.
+	 * When use_accept_list is enabled, only devices in the BLE filter accept
+	 * list (or whose RPA resolves to an identity in the list) are reported.
+	 * This enables reconnection to bonded devices using BLE privacy/RPA. */
+	uint32_t scan_options = BT_LE_SCAN_OPT_FILTER_DUPLICATE;
+	if (data->use_accept_list) {
+		scan_options |= BT_LE_SCAN_OPT_FILTER_ACCEPT_LIST;
+		LOG_INF("Using filter accept list for IRK-based resolution");
+	}
+
 	struct bt_le_scan_param scan_param = {
 		.type = BT_LE_SCAN_TYPE_ACTIVE,
-		.options = BT_LE_SCAN_OPT_FILTER_DUPLICATE,
+		.options = scan_options,
 		.interval = BT_GAP_SCAN_FAST_INTERVAL,
 		.window = BT_GAP_SCAN_FAST_WINDOW,
 	};
 
 	ret = bt_le_scan_start(&scan_param, scan_cb);
 	if (ret < 0) {
-		LOG_ERR("Scan start failed: %d", ret);
+		if (ret == -EAGAIN) {
+			/* BT not ready yet - expected during early boot */
+			LOG_WRN("Scan start: BT not ready (will retry)");
+		} else {
+			LOG_ERR("Scan start failed: %d", ret);
+		}
 		g_scan_data = NULL;
 		set_state(data, NINEP_L2CAP_CLIENT_DISCONNECTED);
 		return ret;
@@ -710,6 +1097,14 @@ static int l2cap_client_start(struct ninep_transport *transport)
 		return -EINVAL;
 	}
 
+	/* If already scanning or connecting, treat as success (idempotent start) */
+	if (data->state == NINEP_L2CAP_CLIENT_SCANNING ||
+	    data->state == NINEP_L2CAP_CLIENT_CONNECTING ||
+	    data->state == NINEP_L2CAP_CLIENT_CONNECTED) {
+		LOG_DBG("Transport already active (state=%d)", data->state);
+		return 0;
+	}
+
 	/* Register connection callbacks (once) */
 	if (!conn_cb_registered) {
 		bt_conn_cb_register(&conn_callbacks);
@@ -735,18 +1130,25 @@ static int l2cap_client_stop(struct ninep_transport *transport)
 
 	LOG_INF("L2CAP client stop (state=%d)", data->state);
 
-	/* Cancel any pending work items and purge state queue */
+	/* Cancel any pending work items and purge state queue to prevent
+	 * stale callbacks. Note: we keep state_cb so it works on restart. */
 	k_work_cancel(&data->connect_work);
 	k_work_cancel(&data->state_work);
 	k_msgq_purge(&data->state_queue);
 
 	/* Stop scanning if active */
-	bt_le_scan_stop();
-	g_scan_data = NULL;
+	if (g_scan_data == data) {
+		bt_le_scan_stop();
+		g_scan_data = NULL;
+	}
 
 	/* Clear global references to avoid stale pointers */
-	g_connecting_data = NULL;
-	g_active_data = NULL;
+	if (g_connecting_data == data) {
+		g_connecting_data = NULL;
+	}
+	if (g_active_data == data) {
+		g_active_data = NULL;
+	}
 
 	/* Disconnect L2CAP channel */
 	if (data->state == NINEP_L2CAP_CLIENT_CONNECTED) {
@@ -760,7 +1162,11 @@ static int l2cap_client_stop(struct ninep_transport *transport)
 		data->conn = NULL;
 	}
 
-	set_state(data, NINEP_L2CAP_CLIENT_DISCONNECTED);
+	/* Set state directly - don't use set_state() which would re-queue work
+	 * as that would cause stale callbacks after stop returns */
+	data->state = NINEP_L2CAP_CLIENT_DISCONNECTED;
+
+	/* Don't free data - transport may be restarted for reconnection */
 	return 0;
 }
 
@@ -799,8 +1205,8 @@ int ninep_transport_l2cap_client_init(struct ninep_transport *transport,
 		return -EINVAL;
 	}
 
-	if (!config->target_addr && config->service_uuid == 0) {
-		LOG_ERR("Must provide either target_addr or service_uuid");
+	if (!config->target_addr && !config->service_uuid128 && config->service_uuid16 == 0) {
+		LOG_ERR("Must provide target_addr, service_uuid128, or service_uuid16");
 		return -EINVAL;
 	}
 
@@ -818,8 +1224,15 @@ int ninep_transport_l2cap_client_init(struct ninep_transport *transport,
 		data->has_target_addr = true;
 	}
 	data->psm = config->psm;
-	data->service_uuid = config->service_uuid;
+	if (config->service_uuid128) {
+		memcpy(data->service_uuid128, config->service_uuid128, 16);
+		data->has_uuid128 = true;
+	}
+	data->service_uuid16 = config->service_uuid16;
 	data->state_cb = config->state_cb;
+	data->state_cb_user_data = user_data;  /* Preserve for state callback (ninep_client_init overwrites transport->user_data) */
+	data->discover_9pis = config->discover_9pis;
+	data->required_features = config->required_features;
 	data->transport = transport;
 
 	/* Initialize channel */
@@ -840,8 +1253,19 @@ int ninep_transport_l2cap_client_init(struct ninep_transport *transport,
 	transport->user_data = user_data;
 	transport->priv_data = data;
 
-	LOG_INF("L2CAP client transport initialized (PSM: 0x%04x, RX buf: %zu bytes)",
-	        config->psm, config->rx_buf_size);
+	LOG_DBG("Transport init: transport=%p priv_data=%p state_cb_user_data=%p state_cb=%p",
+		transport, data, data->state_cb_user_data, data->state_cb);
+
+	if (data->has_uuid128) {
+		LOG_INF("L2CAP client transport initialized (PSM: 0x%04x, 128-bit UUID, 9PIS: %s, RX buf: %zu bytes)",
+		        config->psm, data->discover_9pis ? "yes" : "no", config->rx_buf_size);
+	} else if (data->service_uuid16) {
+		LOG_INF("L2CAP client transport initialized (PSM: 0x%04x, UUID16: 0x%04x, 9PIS: %s, RX buf: %zu bytes)",
+		        config->psm, config->service_uuid16, data->discover_9pis ? "yes" : "no", config->rx_buf_size);
+	} else {
+		LOG_INF("L2CAP client transport initialized (PSM: 0x%04x, direct addr, 9PIS: %s, RX buf: %zu bytes)",
+		        config->psm, data->discover_9pis ? "yes" : "no", config->rx_buf_size);
+	}
 
 	return 0;
 }
@@ -870,4 +1294,89 @@ struct bt_conn *ninep_transport_l2cap_client_get_conn(
 
 	data = transport->priv_data;
 	return data->conn;
+}
+
+int ninep_transport_l2cap_client_set_target(struct ninep_transport *transport,
+					    const bt_addr_le_t *addr)
+{
+	struct l2cap_client_data *data;
+
+	if (!transport || !transport->priv_data) {
+		return -EINVAL;
+	}
+
+	data = transport->priv_data;
+
+	/* Only allow target change when disconnected */
+	if (data->state != NINEP_L2CAP_CLIENT_DISCONNECTED) {
+		LOG_WRN("Cannot change target while connected/connecting");
+		return -EBUSY;
+	}
+
+	if (addr) {
+		bt_addr_le_copy(&data->target_addr, addr);
+		data->has_target_addr = true;
+		LOG_INF("Target address set for direct connect");
+	} else {
+		memset(&data->target_addr, 0, sizeof(data->target_addr));
+		data->has_target_addr = false;
+		LOG_INF("Target address cleared, will use UUID scanning");
+	}
+
+	return 0;
+}
+
+int ninep_transport_l2cap_client_set_filter(struct ninep_transport *transport,
+					    const bt_addr_le_t *addr)
+{
+	struct l2cap_client_data *data;
+
+	if (!transport || !transport->priv_data) {
+		return -EINVAL;
+	}
+
+	data = transport->priv_data;
+
+	/* Only allow filter change when disconnected */
+	if (data->state != NINEP_L2CAP_CLIENT_DISCONNECTED) {
+		LOG_WRN("Cannot change filter while connected/connecting");
+		return -EBUSY;
+	}
+
+	if (addr) {
+		char addr_str[BT_ADDR_LE_STR_LEN];
+		bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
+		bt_addr_le_copy(&data->filter_addr, addr);
+		data->has_filter_addr = true;
+		LOG_INF("Scan filter set: only connect to %s", addr_str);
+	} else {
+		memset(&data->filter_addr, 0, sizeof(data->filter_addr));
+		data->has_filter_addr = false;
+		LOG_INF("Scan filter cleared, will connect to any matching device");
+	}
+
+	return 0;
+}
+
+int ninep_transport_l2cap_client_set_accept_list(struct ninep_transport *transport,
+						 bool enable)
+{
+	struct l2cap_client_data *data;
+
+	if (!transport || !transport->priv_data) {
+		return -EINVAL;
+	}
+
+	data = transport->priv_data;
+
+	/* Only allow change when disconnected */
+	if (data->state != NINEP_L2CAP_CLIENT_DISCONNECTED) {
+		LOG_WRN("Cannot change accept list mode while connected/connecting");
+		return -EBUSY;
+	}
+
+	data->use_accept_list = enable;
+	LOG_INF("Accept list scanning %s", enable ? "enabled" : "disabled");
+
+	return 0;
 }
