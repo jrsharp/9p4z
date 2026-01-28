@@ -390,9 +390,24 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 	struct ninep_fs_node *node = sfid->node;
 	struct ninep_qid wqids[NINEP_MAX_WELEM];
 	size_t offset = 17;
+	int nwqid = 0;  /* Track actual number of successfully walked elements */
 
-	for (int i = 0; i < nwname && i < NINEP_MAX_WELEM; i++) {
+	/* Limit walk to NINEP_MAX_WELEM per 9P2000 spec */
+	int max_walk = (nwname > NINEP_MAX_WELEM) ? NINEP_MAX_WELEM : nwname;
+
+	for (int i = 0; i < max_walk; i++) {
+		/* Bounds check: need at least 2 bytes for name_len */
+		if (offset + 2 > len) {
+			send_error(server, tag, "malformed walk message");
+			return;
+		}
 		uint16_t name_len = msg[offset] | (msg[offset + 1] << 8);
+
+		/* Bounds check: name data must fit within message */
+		if (offset + 2 + name_len > len) {
+			send_error(server, tag, "malformed walk message");
+			return;
+		}
 		const char *name = (const char *)&msg[offset + 2];
 
 		offset += 2 + name_len;
@@ -406,6 +421,7 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 		}
 
 		wqids[i] = node->qid;
+		nwqid++;
 	}
 
 	/* Allocate new FID */
@@ -422,9 +438,9 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 		server->uname_refcount[sfid->uname_idx]++;
 	}
 
-	/* Send Rwalk */
+	/* Send Rwalk with actual walked count (per 9P2000 spec) */
 	int ret = ninep_build_rwalk(server->tx_buf, server->tx_buf_size,
-	                             tag, nwname, wqids);
+	                             tag, nwqid, wqids);
 	if (ret > 0) {
 		ninep_transport_send(server->transport, server->tx_buf, ret);
 	}
@@ -1007,21 +1023,26 @@ static void handle_tclunk(struct ninep_server *server, uint16_t tag,
 
 	struct ninep_server_fid *sfid = find_fid(server, fid);
 
-	if (!sfid) {
-		LOG_WRN("Tclunk: unknown fid %u", fid);
-		send_error(server, tag, "unknown fid");
-		return;
+	/*
+	 * Per 9P2000 spec: "The clunk request informs the file server that the
+	 * current file represented by fid is no longer needed by the client.
+	 * Its effect is to remove the association between the fid and any file."
+	 *
+	 * Clunk must always succeed, even for unknown FIDs.
+	 */
+	if (sfid) {
+		/* Call filesystem clunk handler if available */
+		if (server->config.fs_ops->clunk && sfid->node) {
+			server->config.fs_ops->clunk(sfid->node, server->config.fs_ctx);
+		}
+
+		/* Free FID */
+		free_fid(server, fid);
+	} else {
+		LOG_DBG("Tclunk: fid %u not found (already clunked or never allocated)", fid);
 	}
 
-	/* Call filesystem clunk handler if available */
-	if (server->config.fs_ops->clunk && sfid->node) {
-		server->config.fs_ops->clunk(sfid->node, server->config.fs_ctx);
-	}
-
-	/* Free FID */
-	free_fid(server, fid);
-
-	/* Send Rclunk */
+	/* Always send Rclunk per 9P2000 spec */
 	int ret = ninep_build_rclunk(server->tx_buf, server->tx_buf_size, tag);
 	if (ret > 0) {
 		int send_ret = ninep_transport_send(server->transport, server->tx_buf, ret);
