@@ -494,9 +494,11 @@ static int union_read(struct ninep_fs_node *node, uint64_t offset,
 						continue;
 					}
 
-					/* Extract mount point name (skip leading '/') */
-					const char *name = mount->path + 1;
-					uint16_t name_len = strlen(name);
+					/* Extract first path component only (skip leading '/', stop at next '/') */
+					const char *name_start = mount->path + 1;
+					const char *next_slash = strchr(name_start, '/');
+					uint16_t name_len = next_slash ? (uint16_t)(next_slash - name_start) : strlen(name_start);
+					const char *name = name_start;
 
 					/* Create a synthetic QID for this mount point */
 					struct ninep_qid mount_qid = {
@@ -543,16 +545,17 @@ static int union_read(struct ninep_fs_node *node, uint64_t offset,
 				continue;
 			}
 
-			/* Extract mount point name (skip leading '/') */
-			const char *name = mount->path + 1;
+			/* Extract first path component only (skip leading '/', stop at next '/') */
+			const char *name_start = mount->path + 1;
+			const char *next_slash = strchr(name_start, '/');
 
 			/* Simple name output (real implementation would use stat format) */
-			size_t name_len = strlen(name);
+			size_t name_len = next_slash ? (next_slash - name_start) : strlen(name_start);
 			if (pos + name_len + 1 > count) {
 				break;
 			}
 
-			memcpy(buf + pos, name, name_len);
+			memcpy(buf + pos, name_start, name_len);
 			pos += name_len;
 			buf[pos++] = '\n';
 		}
