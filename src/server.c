@@ -541,21 +541,12 @@ static void handle_tread(struct ninep_server *server, uint16_t tag,
 		auth_state->challenge_issued = true;
 		LOG_DBG("Auth read: returning %d bytes of challenge", bytes);
 
-		/* Build Rread header */
-		uint32_t msg_size = 11 + bytes;
-		server->tx_buf[0] = msg_size & 0xFF;
-		server->tx_buf[1] = (msg_size >> 8) & 0xFF;
-		server->tx_buf[2] = (msg_size >> 16) & 0xFF;
-		server->tx_buf[3] = (msg_size >> 24) & 0xFF;
-		server->tx_buf[4] = NINEP_RREAD;
-		server->tx_buf[5] = tag & 0xFF;
-		server->tx_buf[6] = (tag >> 8) & 0xFF;
-		server->tx_buf[7] = bytes & 0xFF;
-		server->tx_buf[8] = (bytes >> 8) & 0xFF;
-		server->tx_buf[9] = (bytes >> 16) & 0xFF;
-		server->tx_buf[10] = (bytes >> 24) & 0xFF;
-
-		ninep_transport_send(server->transport, server->tx_buf, msg_size);
+		/* Build and send Rread */
+		int msg_size = ninep_build_rread(server->tx_buf, server->tx_buf_size,
+		                                  tag, bytes);
+		if (msg_size > 0) {
+			ninep_transport_send(server->transport, server->tx_buf, msg_size);
+		}
 		return;
 	}
 
@@ -571,7 +562,7 @@ static void handle_tread(struct ninep_server *server, uint16_t tag,
 		count = max_data;
 	}
 
-	/* Read data */
+	/* Read data directly into tx_buf at offset 11 */
 	int bytes = server->config.fs_ops->read(sfid->node, offset,
 	                                          &server->tx_buf[11], count,
 	                                          uname_get(server, sfid->uname_idx),
@@ -581,22 +572,12 @@ static void handle_tread(struct ninep_server *server, uint16_t tag,
 		return;
 	}
 
-	/* Build Rread header */
-	uint32_t msg_size = 11 + bytes;
-
-	server->tx_buf[0] = msg_size & 0xFF;
-	server->tx_buf[1] = (msg_size >> 8) & 0xFF;
-	server->tx_buf[2] = (msg_size >> 16) & 0xFF;
-	server->tx_buf[3] = (msg_size >> 24) & 0xFF;
-	server->tx_buf[4] = NINEP_RREAD;
-	server->tx_buf[5] = tag & 0xFF;
-	server->tx_buf[6] = (tag >> 8) & 0xFF;
-	server->tx_buf[7] = bytes & 0xFF;
-	server->tx_buf[8] = (bytes >> 8) & 0xFF;
-	server->tx_buf[9] = (bytes >> 16) & 0xFF;
-	server->tx_buf[10] = (bytes >> 24) & 0xFF;
-
-	ninep_transport_send(server->transport, server->tx_buf, msg_size);
+	/* Build and send Rread */
+	int msg_size = ninep_build_rread(server->tx_buf, server->tx_buf_size,
+	                                  tag, bytes);
+	if (msg_size > 0) {
+		ninep_transport_send(server->transport, server->tx_buf, msg_size);
+	}
 }
 
 /* Handle Tstat */

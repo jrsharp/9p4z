@@ -726,6 +726,34 @@ int ninep_build_rwrite(uint8_t *buf, size_t buf_len, uint16_t tag, uint32_t coun
 	return offset;
 }
 
+int ninep_build_rread(uint8_t *buf, size_t buf_len, uint16_t tag, uint32_t count)
+{
+	/* Rread: size[4] + type[1] + tag[2] + count[4] + data[count] */
+	uint32_t msg_size = 11 + count;
+
+	if (!buf || buf_len < msg_size) {
+		return -EINVAL;
+	}
+
+	size_t offset = 0;
+	struct ninep_msg_header hdr = {
+		.size = msg_size,
+		.type = NINEP_RREAD,
+		.tag = tag,
+	};
+
+	int ret = ninep_write_header(buf, buf_len, &hdr);
+	if (ret < 0) {
+		return ret;
+	}
+	offset = 7;
+
+	write_u32_le(buf, &offset, count);
+
+	/* Data is assumed to already be at buf[11] */
+	return msg_size;
+}
+
 int ninep_build_rremove(uint8_t *buf, size_t buf_len, uint16_t tag)
 {
 	if (!buf || buf_len < 7) {

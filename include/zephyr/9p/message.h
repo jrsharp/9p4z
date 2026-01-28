@@ -303,6 +303,20 @@ int ninep_build_rcreate(uint8_t *buf, size_t buf_len, uint16_t tag,
 int ninep_build_rwrite(uint8_t *buf, size_t buf_len, uint16_t tag, uint32_t count);
 
 /**
+ * @brief Build an Rread message header
+ *
+ * Builds the Rread header around data already present in the buffer at offset 11.
+ * The data must be written to buf+11 before calling this function.
+ *
+ * @param buf Output buffer (data should already be at offset 11)
+ * @param buf_len Buffer length
+ * @param tag Message tag
+ * @param count Number of data bytes (already in buffer at offset 11)
+ * @return Total message size, or negative error code
+ */
+int ninep_build_rread(uint8_t *buf, size_t buf_len, uint16_t tag, uint32_t count);
+
+/**
  * @brief Build an Rremove message
  *
  * @param buf Output buffer
