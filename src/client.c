@@ -23,7 +23,7 @@ LOG_MODULE_REGISTER(ninep_client, CONFIG_NINEP_LOG_LEVEL);
 /* Allocate a tag (caller must hold client->lock) */
 static struct ninep_tag_entry *alloc_tag_locked(struct ninep_client *client, uint16_t *tag)
 {
-	for (int i = 0; i < CONFIG_NINEP_MAX_TAGS; i++) {
+	for (size_t i = 0; i < client->max_tags; i++) {
 		if (!client->tags[i].in_use) {
 			client->tags[i].in_use = true;
 			client->tags[i].complete = false;
@@ -40,7 +40,7 @@ static struct ninep_tag_entry *alloc_tag_locked(struct ninep_client *client, uin
 /* Find tag entry by tag number (caller must hold lock) */
 static struct ninep_tag_entry *find_tag_locked(struct ninep_client *client, uint16_t tag)
 {
-	for (int i = 0; i < CONFIG_NINEP_MAX_TAGS; i++) {
+	for (size_t i = 0; i < client->max_tags; i++) {
 		if (client->tags[i].in_use && client->tags[i].tag == tag) {
 			return &client->tags[i];
 		}
@@ -65,7 +65,7 @@ int ninep_client_alloc_fid(struct ninep_client *client, uint32_t *fid)
 {
 	k_mutex_lock(&client->lock, K_FOREVER);
 
-	for (int i = 0; i < CONFIG_NINEP_MAX_FIDS; i++) {
+	for (size_t i = 0; i < client->max_fids; i++) {
 		if (!client->fids[i].in_use) {
 			client->fids[i].in_use = true;
 			client->fids[i].fid = client->next_fid++;
@@ -83,7 +83,7 @@ void ninep_client_free_fid(struct ninep_client *client, uint32_t fid)
 {
 	k_mutex_lock(&client->lock, K_FOREVER);
 
-	for (int i = 0; i < CONFIG_NINEP_MAX_FIDS; i++) {
+	for (size_t i = 0; i < client->max_fids; i++) {
 		if (client->fids[i].in_use && client->fids[i].fid == fid) {
 			client->fids[i].in_use = false;
 			break;
@@ -95,7 +95,7 @@ void ninep_client_free_fid(struct ninep_client *client, uint32_t fid)
 
 static struct ninep_client_fid *find_fid_locked(struct ninep_client *client, uint32_t fid)
 {
-	for (int i = 0; i < CONFIG_NINEP_MAX_FIDS; i++) {
+	for (size_t i = 0; i < client->max_fids; i++) {
 		if (client->fids[i].in_use && client->fids[i].fid == fid) {
 			return &client->fids[i];
 		}
@@ -130,11 +130,11 @@ static void client_recv_callback(struct ninep_transport *transport,
 	}
 
 	/* Copy response to shared buffer */
-	if (len <= sizeof(client->resp_buf)) {
+	if (len <= client->buf_size) {
 		memcpy(client->resp_buf, buf, len);
 		client->resp_len = len;
 	} else {
-		LOG_ERR("Response too large: %zu > %zu", len, sizeof(client->resp_buf));
+		LOG_ERR("Response too large: %zu > %zu", len, client->buf_size);
 		entry->error = -ENOMEM;
 		entry->complete = true;
 		k_condvar_broadcast(&client->resp_cv);
@@ -192,6 +192,58 @@ static int wait_for_tag(struct ninep_client *client, struct ninep_tag_entry *ent
 }
 
 /*
+ * Send a T-message (already in tx_buf) and wait for its response,
+ * optionally retrying on timeout.
+ *
+ * Only idempotent operations (read, stat, version, write) should pass
+ * retries > 0.  Stateful operations (walk, open, attach, auth, create,
+ * clunk, remove) must NOT retry because the server may have already
+ * processed the request and changed state — a retry would hit a
+ * "fid already in use" / "already open" error.
+ *
+ * Caller must hold client->lock.  Lock is held on return.
+ * tx_buf must contain the built message of msg_len bytes.
+ */
+static int send_and_wait(struct ninep_client *client,
+                         struct ninep_tag_entry *entry,
+                         size_t msg_len,
+                         uint8_t retries)
+{
+	uint8_t retries_left = retries;
+	int ret;
+
+	for (;;) {
+		ret = ninep_transport_send(client->transport,
+					   client->tx_buf, msg_len);
+		if (ret < 0) {
+			return ret;
+		}
+
+		ret = wait_for_tag(client, entry, client->config->timeout_ms);
+		if (ret != -ETIMEDOUT || retries_left == 0) {
+			return ret;
+		}
+
+		retries_left--;
+
+		/* Release lock during backoff so a late response
+		 * can still be delivered by the recv callback. */
+		k_mutex_unlock(&client->lock);
+		k_msleep(500);
+		k_mutex_lock(&client->lock, K_FOREVER);
+
+		/* Late response arrived during sleep? */
+		if (entry->complete) {
+			return entry->error;
+		}
+
+		/* Reset tag for retry */
+		entry->complete = false;
+		entry->error = 0;
+	}
+}
+
+/*
  * Client initialization
  */
 
@@ -210,12 +262,35 @@ int ninep_client_init(struct ninep_client *client,
 	client->next_fid = 0;
 	client->next_tag = 0;
 
+	/* Set up pool pointers - use external pools if provided, else embedded */
+	if (config->pools != NULL) {
+		/* Caller-provided pools (can be in PSRAM, etc.) */
+		client->fids = config->pools->fids;
+		client->max_fids = config->pools->max_fids;
+		client->tags = config->pools->tags;
+		client->max_tags = config->pools->max_tags;
+		client->tx_buf = config->pools->tx_buf;
+		client->resp_buf = config->pools->rx_buf;
+		client->buf_size = config->pools->buf_size;
+		LOG_INF("Using caller-provided pools (%zu fids, %zu tags, %zu buf)",
+		        client->max_fids, client->max_tags, client->buf_size);
+	} else {
+		/* Fall back to embedded arrays (backward compatibility) */
+		client->fids = client->_embedded_fids;
+		client->max_fids = CONFIG_NINEP_MAX_FIDS;
+		client->tags = client->_embedded_tags;
+		client->max_tags = CONFIG_NINEP_MAX_TAGS;
+		client->tx_buf = client->_embedded_tx_buf;
+		client->resp_buf = client->_embedded_resp_buf;
+		client->buf_size = CONFIG_NINEP_MAX_MESSAGE_SIZE;
+	}
+
 	/* Initialize synchronization primitives */
 	k_mutex_init(&client->lock);
 	k_condvar_init(&client->resp_cv);
 
 	/* Initialize tag entries (all start free) */
-	for (int i = 0; i < CONFIG_NINEP_MAX_TAGS; i++) {
+	for (size_t i = 0; i < client->max_tags; i++) {
 		client->tags[i].in_use = false;
 	}
 
@@ -234,8 +309,8 @@ int ninep_client_init(struct ninep_client *client,
 		return ret;
 	}
 
-	LOG_INF("9P client initialized (max %d tags, %d fids)",
-	        CONFIG_NINEP_MAX_TAGS, CONFIG_NINEP_MAX_FIDS);
+	LOG_INF("9P client initialized (max %zu tags, %zu fids)",
+	        client->max_tags, client->max_fids);
 	return 0;
 }
 
@@ -257,7 +332,7 @@ int ninep_client_version(struct ninep_client *client)
 	}
 
 	/* Build Tversion */
-	int len = ninep_build_tversion(client->tx_buf, sizeof(client->tx_buf),
+	int len = ninep_build_tversion(client->tx_buf, client->buf_size,
 	                                NINEP_NOTAG, client->config->max_message_size,
 	                                client->config->version,
 	                                strlen(client->config->version));
@@ -270,16 +345,8 @@ int ninep_client_version(struct ninep_client *client)
 	/* Override tag to NOTAG for version */
 	entry->tag = NINEP_NOTAG;
 
-	/* Send request */
-	int ret = ninep_transport_send(client->transport, client->tx_buf, len);
-	if (ret < 0) {
-		free_tag_locked(client, tag);
-		k_mutex_unlock(&client->lock);
-		return ret;
-	}
-
-	/* Wait for response (lock held) */
-	ret = wait_for_tag(client, entry, client->config->timeout_ms);
+	/* Send and wait — version is idempotent, safe to retry */
+	int ret = send_and_wait(client, entry, len, client->max_retries);
 	if (ret < 0) {
 		LOG_ERR("Version request failed: %d", ret);
 		free_tag_locked(client, tag);
@@ -315,7 +382,7 @@ int ninep_client_auth(struct ninep_client *client, uint32_t *afid,
 	}
 
 	/* Allocate afid inline */
-	for (int i = 0; i < CONFIG_NINEP_MAX_FIDS; i++) {
+	for (size_t i = 0; i < client->max_fids; i++) {
 		if (!client->fids[i].in_use) {
 			client->fids[i].in_use = true;
 			client->fids[i].fid = client->next_fid++;
@@ -331,7 +398,7 @@ int ninep_client_auth(struct ninep_client *client, uint32_t *afid,
 afid_allocated:;
 
 	/* Build Tauth */
-	int len = ninep_build_tauth(client->tx_buf, sizeof(client->tx_buf),
+	int len = ninep_build_tauth(client->tx_buf, client->buf_size,
 	                            tag, allocated_afid,
 	                            uname, strlen(uname),
 	                            aname, strlen(aname));
@@ -343,18 +410,8 @@ afid_allocated:;
 		return len;
 	}
 
-	/* Send request */
-	int ret = ninep_transport_send(client->transport, client->tx_buf, len);
-	if (ret < 0) {
-		struct ninep_client_fid *cfid = find_fid_locked(client, allocated_afid);
-		if (cfid) cfid->in_use = false;
-		free_tag_locked(client, tag);
-		k_mutex_unlock(&client->lock);
-		return ret;
-	}
-
-	/* Wait for response */
-	ret = wait_for_tag(client, entry, client->config->timeout_ms);
+	/* Send and wait — auth is stateful (allocates afid), no retry */
+	int ret = send_and_wait(client, entry, len, 0);
 	if (ret < 0) {
 		LOG_ERR("Auth request failed: %d", ret);
 		struct ninep_client_fid *cfid = find_fid_locked(client, allocated_afid);
@@ -395,7 +452,7 @@ int ninep_client_attach(struct ninep_client *client, uint32_t *fid,
 	}
 
 	/* Allocate FID inline */
-	for (int i = 0; i < CONFIG_NINEP_MAX_FIDS; i++) {
+	for (size_t i = 0; i < client->max_fids; i++) {
 		if (!client->fids[i].in_use) {
 			client->fids[i].in_use = true;
 			client->fids[i].fid = client->next_fid++;
@@ -411,7 +468,7 @@ int ninep_client_attach(struct ninep_client *client, uint32_t *fid,
 fid_allocated:;
 
 	/* Build Tattach */
-	int len = ninep_build_tattach(client->tx_buf, sizeof(client->tx_buf),
+	int len = ninep_build_tattach(client->tx_buf, client->buf_size,
 	                               tag, allocated_fid, afid,
 	                               uname, strlen(uname),
 	                               aname, strlen(aname));
@@ -423,18 +480,8 @@ fid_allocated:;
 		return len;
 	}
 
-	/* Send request */
-	int ret = ninep_transport_send(client->transport, client->tx_buf, len);
-	if (ret < 0) {
-		struct ninep_client_fid *cfid = find_fid_locked(client, allocated_fid);
-		if (cfid) cfid->in_use = false;
-		free_tag_locked(client, tag);
-		k_mutex_unlock(&client->lock);
-		return ret;
-	}
-
-	/* Wait for response */
-	ret = wait_for_tag(client, entry, client->config->timeout_ms);
+	/* Send and wait — attach is stateful (allocates fid), no retry */
+	int ret = send_and_wait(client, entry, len, 0);
 	if (ret < 0) {
 		LOG_ERR("Attach request failed: %d", ret);
 		struct ninep_client_fid *cfid = find_fid_locked(client, allocated_fid);
@@ -472,7 +519,7 @@ int ninep_client_walk(struct ninep_client *client, uint32_t fid,
 	}
 
 	/* Allocate new FID */
-	for (int i = 0; i < CONFIG_NINEP_MAX_FIDS; i++) {
+	for (size_t i = 0; i < client->max_fids; i++) {
 		if (!client->fids[i].in_use) {
 			client->fids[i].in_use = true;
 			client->fids[i].fid = client->next_fid++;
@@ -506,7 +553,7 @@ fid_allocated:;
 	}
 
 	/* Build Twalk */
-	int len = ninep_build_twalk(client->tx_buf, sizeof(client->tx_buf),
+	int len = ninep_build_twalk(client->tx_buf, client->buf_size,
 	                             tag, fid, allocated_fid, nwname, wnames, wname_lens);
 	if (len < 0) {
 		struct ninep_client_fid *cfid = find_fid_locked(client, allocated_fid);
@@ -516,18 +563,8 @@ fid_allocated:;
 		return len;
 	}
 
-	/* Send request */
-	int ret = ninep_transport_send(client->transport, client->tx_buf, len);
-	if (ret < 0) {
-		struct ninep_client_fid *cfid = find_fid_locked(client, allocated_fid);
-		if (cfid) cfid->in_use = false;
-		free_tag_locked(client, tag);
-		k_mutex_unlock(&client->lock);
-		return ret;
-	}
-
-	/* Wait for response */
-	ret = wait_for_tag(client, entry, client->config->timeout_ms);
+	/* Send and wait — walk is stateful (allocates newfid), no retry */
+	int ret = send_and_wait(client, entry, len, 0);
 	if (ret < 0) {
 		LOG_ERR("Walk request failed: %d", ret);
 		struct ninep_client_fid *cfid = find_fid_locked(client, allocated_fid);
@@ -566,7 +603,7 @@ int ninep_client_open(struct ninep_client *client, uint32_t fid, uint8_t mode)
 	}
 
 	/* Build Topen */
-	int len = ninep_build_topen(client->tx_buf, sizeof(client->tx_buf),
+	int len = ninep_build_topen(client->tx_buf, client->buf_size,
 	                             tag, fid, mode);
 	if (len < 0) {
 		free_tag_locked(client, tag);
@@ -574,16 +611,8 @@ int ninep_client_open(struct ninep_client *client, uint32_t fid, uint8_t mode)
 		return len;
 	}
 
-	/* Send request */
-	int ret = ninep_transport_send(client->transport, client->tx_buf, len);
-	if (ret < 0) {
-		free_tag_locked(client, tag);
-		k_mutex_unlock(&client->lock);
-		return ret;
-	}
-
-	/* Wait for response */
-	ret = wait_for_tag(client, entry, client->config->timeout_ms);
+	/* Send and wait — open is stateful (changes fid mode), no retry */
+	int ret = send_and_wait(client, entry, len, 0);
 	if (ret < 0) {
 		LOG_ERR("Open request failed: %d", ret);
 		free_tag_locked(client, tag);
@@ -619,7 +648,7 @@ int ninep_client_read(struct ninep_client *client, uint32_t fid,
 	}
 
 	/* Build Tread */
-	int len = ninep_build_tread(client->tx_buf, sizeof(client->tx_buf),
+	int len = ninep_build_tread(client->tx_buf, client->buf_size,
 	                             tag, fid, offset, count);
 	if (len < 0) {
 		free_tag_locked(client, tag);
@@ -627,16 +656,8 @@ int ninep_client_read(struct ninep_client *client, uint32_t fid,
 		return len;
 	}
 
-	/* Send request */
-	int ret = ninep_transport_send(client->transport, client->tx_buf, len);
-	if (ret < 0) {
-		free_tag_locked(client, tag);
-		k_mutex_unlock(&client->lock);
-		return ret;
-	}
-
-	/* Wait for response */
-	ret = wait_for_tag(client, entry, client->config->timeout_ms);
+	/* Send and wait — read is idempotent, safe to retry */
+	int ret = send_and_wait(client, entry, len, client->max_retries);
 	if (ret < 0) {
 		LOG_ERR("Read request failed: %d", ret);
 		free_tag_locked(client, tag);
@@ -680,7 +701,7 @@ int ninep_client_write(struct ninep_client *client, uint32_t fid,
 	}
 
 	/* Build Twrite */
-	int len = ninep_build_twrite(client->tx_buf, sizeof(client->tx_buf),
+	int len = ninep_build_twrite(client->tx_buf, client->buf_size,
 	                              tag, fid, offset, count, buf);
 	if (len < 0) {
 		free_tag_locked(client, tag);
@@ -688,16 +709,8 @@ int ninep_client_write(struct ninep_client *client, uint32_t fid,
 		return len;
 	}
 
-	/* Send request */
-	int ret = ninep_transport_send(client->transport, client->tx_buf, len);
-	if (ret < 0) {
-		free_tag_locked(client, tag);
-		k_mutex_unlock(&client->lock);
-		return ret;
-	}
-
-	/* Wait for response */
-	ret = wait_for_tag(client, entry, client->config->timeout_ms);
+	/* Send and wait — write is idempotent (same offset), safe to retry */
+	int ret = send_and_wait(client, entry, len, client->max_retries);
 	if (ret < 0) {
 		LOG_ERR("Write request failed: %d", ret);
 		free_tag_locked(client, tag);
@@ -733,7 +746,7 @@ int ninep_client_stat(struct ninep_client *client, uint32_t fid,
 	}
 
 	/* Build Tstat */
-	int len = ninep_build_tstat(client->tx_buf, sizeof(client->tx_buf),
+	int len = ninep_build_tstat(client->tx_buf, client->buf_size,
 	                             tag, fid);
 	if (len < 0) {
 		free_tag_locked(client, tag);
@@ -741,16 +754,8 @@ int ninep_client_stat(struct ninep_client *client, uint32_t fid,
 		return len;
 	}
 
-	/* Send request */
-	int ret = ninep_transport_send(client->transport, client->tx_buf, len);
-	if (ret < 0) {
-		free_tag_locked(client, tag);
-		k_mutex_unlock(&client->lock);
-		return ret;
-	}
-
-	/* Wait for response */
-	ret = wait_for_tag(client, entry, client->config->timeout_ms);
+	/* Send and wait — stat is idempotent, safe to retry */
+	int ret = send_and_wait(client, entry, len, client->max_retries);
 	if (ret < 0) {
 		LOG_ERR("Stat request failed: %d", ret);
 		free_tag_locked(client, tag);
@@ -781,7 +786,7 @@ int ninep_client_create(struct ninep_client *client, uint32_t fid,
 	}
 
 	/* Build Tcreate */
-	int len = ninep_build_tcreate(client->tx_buf, sizeof(client->tx_buf),
+	int len = ninep_build_tcreate(client->tx_buf, client->buf_size,
 	                               tag, fid, name, strlen(name), perm, mode);
 	if (len < 0) {
 		free_tag_locked(client, tag);
@@ -789,16 +794,8 @@ int ninep_client_create(struct ninep_client *client, uint32_t fid,
 		return len;
 	}
 
-	/* Send request */
-	int ret = ninep_transport_send(client->transport, client->tx_buf, len);
-	if (ret < 0) {
-		free_tag_locked(client, tag);
-		k_mutex_unlock(&client->lock);
-		return ret;
-	}
-
-	/* Wait for response */
-	ret = wait_for_tag(client, entry, client->config->timeout_ms);
+	/* Send and wait — create is stateful, no retry */
+	int ret = send_and_wait(client, entry, len, 0);
 
 	free_tag_locked(client, tag);
 	k_mutex_unlock(&client->lock);
@@ -819,7 +816,7 @@ int ninep_client_remove(struct ninep_client *client, uint32_t fid)
 	}
 
 	/* Build Tremove */
-	int len = ninep_build_tremove(client->tx_buf, sizeof(client->tx_buf),
+	int len = ninep_build_tremove(client->tx_buf, client->buf_size,
 	                               tag, fid);
 	if (len < 0) {
 		free_tag_locked(client, tag);
@@ -827,16 +824,8 @@ int ninep_client_remove(struct ninep_client *client, uint32_t fid)
 		return len;
 	}
 
-	/* Send request */
-	int ret = ninep_transport_send(client->transport, client->tx_buf, len);
-	if (ret < 0) {
-		free_tag_locked(client, tag);
-		k_mutex_unlock(&client->lock);
-		return ret;
-	}
-
-	/* Wait for response */
-	ret = wait_for_tag(client, entry, client->config->timeout_ms);
+	/* Send and wait — remove is stateful, no retry */
+	int ret = send_and_wait(client, entry, len, 0);
 	if (ret == 0) {
 		/* Free FID on success */
 		struct ninep_client_fid *cfid = find_fid_locked(client, fid);
@@ -862,7 +851,7 @@ int ninep_client_clunk(struct ninep_client *client, uint32_t fid)
 	}
 
 	/* Build Tclunk */
-	int len = ninep_build_tclunk(client->tx_buf, sizeof(client->tx_buf),
+	int len = ninep_build_tclunk(client->tx_buf, client->buf_size,
 	                              tag, fid);
 	if (len < 0) {
 		free_tag_locked(client, tag);
@@ -870,16 +859,8 @@ int ninep_client_clunk(struct ninep_client *client, uint32_t fid)
 		return len;
 	}
 
-	/* Send request */
-	int ret = ninep_transport_send(client->transport, client->tx_buf, len);
-	if (ret < 0) {
-		free_tag_locked(client, tag);
-		k_mutex_unlock(&client->lock);
-		return ret;
-	}
-
-	/* Wait for response */
-	ret = wait_for_tag(client, entry, client->config->timeout_ms);
+	/* Send and wait — clunk is stateful, no retry */
+	int ret = send_and_wait(client, entry, len, 0);
 	if (ret == 0) {
 		/* Free FID on success */
 		struct ninep_client_fid *cfid = find_fid_locked(client, fid);

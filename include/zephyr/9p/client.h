@@ -55,12 +55,49 @@ struct ninep_tag_entry {
 };
 
 /**
+ * @brief Memory pool configuration for 9P client
+ *
+ * All memory pools are provided by the caller. The library never allocates.
+ * This allows platforms to place pools in appropriate memory regions
+ * (PSRAM, SRAM, heap, etc.) without library changes.
+ *
+ * If pools is NULL in ninep_client_config, the client falls back to
+ * embedded arrays (backward compatibility with existing code).
+ */
+struct ninep_client_pools {
+	/** FID tracking pool - one entry per open file/directory */
+	struct ninep_client_fid *fids;
+	size_t max_fids;
+
+	/** Tag tracking pool - one entry per concurrent request */
+	struct ninep_tag_entry *tags;
+	size_t max_tags;
+
+	/** Transmit buffer - sized for max message */
+	uint8_t *tx_buf;
+
+	/** Receive/response buffer - sized for max message */
+	uint8_t *rx_buf;
+
+	/** Buffer size (same for tx and rx) */
+	size_t buf_size;
+};
+
+/**
  * @brief 9P client configuration
  */
 struct ninep_client_config {
 	uint32_t max_message_size;
 	const char *version;
 	uint32_t timeout_ms;  /* Request timeout in milliseconds */
+
+	/**
+	 * Optional: caller-provided memory pools.
+	 * If NULL, the client uses embedded arrays (backward compatible).
+	 * If non-NULL, the client uses the provided pools instead,
+	 * allowing placement in PSRAM or other memory regions.
+	 */
+	const struct ninep_client_pools *pools;
 };
 
 /**
@@ -76,28 +113,35 @@ struct ninep_client_config {
  * - Single condvar for all waiters (broadcast on response arrival)
  *
  * This allows 64+ concurrent tags in ~2KB vs the old ~20KB.
+ *
+ * Pool support: If config->pools is provided, the client uses caller-provided
+ * memory pools (can be in PSRAM, etc.). Otherwise falls back to embedded arrays.
  */
 struct ninep_client {
 	const struct ninep_client_config *config;
 	struct ninep_transport *transport;
 
-	/* FID table */
-	struct ninep_client_fid fids[CONFIG_NINEP_MAX_FIDS];
+	/* Pool pointers - point to either embedded arrays or external pools */
+	struct ninep_client_fid *fids;
+	size_t max_fids;
+	struct ninep_tag_entry *tags;
+	size_t max_tags;
+	uint8_t *tx_buf;
+	uint8_t *resp_buf;
+	size_t buf_size;
 
-	/* Lightweight tag tracking - no per-tag buffers! */
-	struct ninep_tag_entry tags[CONFIG_NINEP_MAX_TAGS];
+	/* Embedded arrays - used when config->pools is NULL (backward compat) */
+	struct ninep_client_fid _embedded_fids[CONFIG_NINEP_MAX_FIDS];
+	struct ninep_tag_entry _embedded_tags[CONFIG_NINEP_MAX_TAGS];
+	uint8_t _embedded_tx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
+	uint8_t _embedded_resp_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
 
-	/* TX buffer - protected by lock during build+send */
-	uint8_t tx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
-
-	/* Single shared response buffer - responses arrive serially */
-	uint8_t resp_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
+	/* Runtime state */
 	size_t resp_len;
-
-	/* State */
 	uint32_t msize;  /* Negotiated max message size */
 	uint32_t next_fid;
 	uint16_t next_tag;
+	uint8_t max_retries;  /* Retry count on timeout (0=no retry) */
 
 	/* Synchronization */
 	struct k_mutex lock;       /* Protects TX and tag table */
@@ -243,6 +287,22 @@ int ninep_client_remove(struct ninep_client *client, uint32_t fid);
  * @return 0 on success, negative error code on failure
  */
 int ninep_client_clunk(struct ninep_client *client, uint32_t fid);
+
+/**
+ * @brief Set max retries on timeout
+ *
+ * When a request times out, the client re-sends the same T-message
+ * up to max_retries additional times.  Useful for unreliable transports
+ * like LoRa.  Default is 0 (no retry).
+ *
+ * @param client Client instance
+ * @param retries Max retry count (0 = no retry)
+ */
+static inline void ninep_client_set_retries(struct ninep_client *client,
+					    uint8_t retries)
+{
+	client->max_retries = retries;
+}
 
 /**
  * @brief Allocate a new FID
