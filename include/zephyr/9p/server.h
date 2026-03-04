@@ -10,6 +10,7 @@
 #include <zephyr/9p/transport.h>
 #include <zephyr/9p/fid.h>
 #include <zephyr/9p/tag.h>
+#include <zephyr/kernel.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -313,6 +314,8 @@ struct ninep_server {
 	size_t rx_buf_size;  /* Allocated size for validation */
 	size_t tx_buf_size;  /* Allocated size for validation */
 	size_t rx_len;
+
+	struct k_mutex tx_buf_mutex;
 };
 
 /**

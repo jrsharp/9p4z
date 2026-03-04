@@ -386,7 +386,11 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 		return;
 	}
 
-	/* Walk path elements */
+	/* Walk path elements.
+	 *
+	 * Each fs_ops->walk() call may allocate resources (e.g., adapter
+	 * nodes). For multi-element walks, intermediate nodes must be
+	 * freed via fs_ops->clunk() — only the final result is kept. */
 	struct ninep_fs_node *node = sfid->node;
 	struct ninep_qid wqids[NINEP_MAX_WELEM];
 	size_t offset = 17;
@@ -398,6 +402,10 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 	for (int i = 0; i < max_walk; i++) {
 		/* Bounds check: need at least 2 bytes for name_len */
 		if (offset + 2 > len) {
+			if (node != sfid->node && server->config.fs_ops->clunk) {
+				server->config.fs_ops->clunk(node,
+				                             server->config.fs_ctx);
+			}
 			send_error(server, tag, "malformed walk message");
 			return;
 		}
@@ -405,6 +413,10 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 
 		/* Bounds check: name data must fit within message */
 		if (offset + 2 + name_len > len) {
+			if (node != sfid->node && server->config.fs_ops->clunk) {
+				server->config.fs_ops->clunk(node,
+				                             server->config.fs_ctx);
+			}
 			send_error(server, tag, "malformed walk message");
 			return;
 		}
@@ -413,13 +425,24 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 		offset += 2 + name_len;
 
 		/* Walk to child */
-		node = server->config.fs_ops->walk(node, name, name_len,
-		                                     server->config.fs_ctx);
-		if (!node) {
+		struct ninep_fs_node *next =
+			server->config.fs_ops->walk(node, name, name_len,
+			                            server->config.fs_ctx);
+
+		/* Free intermediate node from previous iteration.
+		 * The starting node (sfid->node) is still referenced
+		 * by the original fid — don't free it. */
+		if (node != sfid->node && server->config.fs_ops->clunk) {
+			server->config.fs_ops->clunk(node,
+			                             server->config.fs_ctx);
+		}
+
+		if (!next) {
 			send_error(server, tag, "file not found");
 			return;
 		}
 
+		node = next;
 		wqids[i] = node->qid;
 		nwqid++;
 	}
@@ -428,6 +451,11 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 	struct ninep_server_fid *new_sfid = alloc_fid(server, newfid);
 
 	if (!new_sfid) {
+		/* Free the final walk result if it's not the starting node */
+		if (node != sfid->node && server->config.fs_ops->clunk) {
+			server->config.fs_ops->clunk(node,
+			                             server->config.fs_ctx);
+		}
 		send_error(server, tag, "cannot allocate newfid");
 		return;
 	}
@@ -1049,6 +1077,8 @@ void ninep_server_process_message(struct ninep_server *server,
 
 	LOG_INF("Received 9P message: type=%u, tag=%u, size=%u", hdr.type, hdr.tag, hdr.size);
 
+	k_mutex_lock(&server->tx_buf_mutex, K_FOREVER);
+
 	switch (hdr.type) {
 	case NINEP_TVERSION:
 		handle_tversion(server, msg, len);
@@ -1094,6 +1124,8 @@ void ninep_server_process_message(struct ninep_server *server,
 		send_error(server, hdr.tag, "operation not supported");
 		break;
 	}
+
+	k_mutex_unlock(&server->tx_buf_mutex);
 }
 
 /* Transport callback */
@@ -1114,6 +1146,7 @@ int ninep_server_init(struct ninep_server *server,
 	}
 
 	memset(server, 0, sizeof(*server));
+	k_mutex_init(&server->tx_buf_mutex);
 	/* Copy config by value instead of storing pointer */
 	memcpy(&server->config, config, sizeof(server->config));
 	server->transport = transport;

@@ -131,13 +131,13 @@ NET_BUF_POOL_DEFINE(l2cap_client_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
  * Min interval: 6 × 1.25ms = 7.5ms (BLE minimum)
  * Max interval: 9 × 1.25ms = 11.25ms
  * Latency: 0 (respond to every event)
- * Timeout: 100 × 10ms = 1000ms
+ * Timeout: 400 × 10ms = 4000ms (increased from 1s to handle CPU load)
  */
 static const struct bt_le_conn_param conn_param_low_latency = {
 	.interval_min = 6,
 	.interval_max = 9,
 	.latency = 0,
-	.timeout = 100,
+	.timeout = 400,
 };
 
 /* Forward declarations */
