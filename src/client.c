@@ -763,8 +763,62 @@ int ninep_client_stat(struct ninep_client *client, uint32_t fid,
 		return ret;
 	}
 
-	/* Parse Rstat - simplified for now */
-	int result = (client->resp_len >= 9) ? 0 : -EIO;
+	/* Parse Rstat response.
+	 * Wire format: header[7] nstat[2] stat[nstat]
+	 * stat: size[2] type[2] dev[4] qid[13] mode[4] atime[4] mtime[4]
+	 *       length[8] name[s] uid[s] gid[s] muid[s]
+	 * Minimum stat size: 2+2+4+13+4+4+4+8 + 4×2(empty strings) = 49
+	 */
+	int result = -EIO;
+
+	if (stat && client->resp_len >= 9 + 2 + 41) {
+		const uint8_t *b = client->resp_buf;
+		size_t off = 7;  /* skip header */
+
+		/* uint16_t nstat = b[off] | (b[off+1] << 8); */
+		off += 2;  /* skip nstat */
+
+		/* uint16_t stat_size = b[off] | (b[off+1] << 8); */
+		off += 2;  /* skip stat size */
+
+		stat->type = b[off] | (b[off+1] << 8);
+		off += 2;
+
+		stat->dev = b[off] | (b[off+1] << 8) |
+		            (b[off+2] << 16) | (b[off+3] << 24);
+		off += 4;
+
+		/* Parse qid (13 bytes) */
+		ninep_parse_qid(b, client->resp_len, &off, &stat->qid);
+
+		stat->mode = b[off] | (b[off+1] << 8) |
+		             (b[off+2] << 16) | (b[off+3] << 24);
+		off += 4;
+
+		stat->atime = b[off] | (b[off+1] << 8) |
+		              (b[off+2] << 16) | (b[off+3] << 24);
+		off += 4;
+
+		stat->mtime = b[off] | (b[off+1] << 8) |
+		              (b[off+2] << 16) | (b[off+3] << 24);
+		off += 4;
+
+		stat->length = (uint64_t)(b[off] | (b[off+1] << 8) |
+		               (b[off+2] << 16) | (b[off+3] << 24)) |
+		               ((uint64_t)(b[off+4] | (b[off+5] << 8) |
+		               (b[off+6] << 16) | (b[off+7] << 24)) << 32);
+		off += 8;
+
+		/* Name/uid/gid/muid are variable-length strings — skip for now,
+		 * set pointers to NULL.  The stat struct fields that matter for
+		 * test -d / test -f are mode and length. */
+		stat->name = NULL;
+		stat->uid = NULL;
+		stat->gid = NULL;
+		stat->muid = NULL;
+
+		result = 0;
+	}
 
 	free_tag_locked(client, tag);
 	k_mutex_unlock(&client->lock);
