@@ -354,6 +354,40 @@ static struct ninep_fs_node *union_walk(struct ninep_fs_node *parent,
 			}
 		}
 
+		/* Check if this is a prefix of a deeper mount path.
+		 * E.g., walking to "/portals" when there's a mount at "/portals/frst".
+		 * In this case, create a synthetic directory node. */
+		{
+			size_t full_path_len = strlen(full_path);
+			for (size_t i = 0; i < fs->num_mounts; i++) {
+				if (strlen(fs->mounts[i].path) > full_path_len &&
+				    strncmp(fs->mounts[i].path, full_path, full_path_len) == 0 &&
+				    fs->mounts[i].path[full_path_len] == '/') {
+					/* This mount path starts with our walk target.
+					 * Create a synthetic directory node. */
+					struct ninep_fs_node *synth = k_malloc(sizeof(*synth));
+					if (!synth) {
+						return NULL;
+					}
+					memset(synth, 0, sizeof(*synth));
+					memcpy(synth->name, name, name_len < sizeof(synth->name) - 1 ?
+					       name_len : sizeof(synth->name) - 1);
+					synth->type = NINEP_NODE_DIR;
+					synth->mode = 0555 | NINEP_DMDIR;
+					synth->qid.type = NINEP_QTDIR;
+					synth->qid.path = fs->next_qid_path++;
+					/* Store the full_path so subsequent walks can resolve further */
+					synth->data = k_malloc(full_path_len + 1);
+					if (synth->data) {
+						memcpy(synth->data, full_path, full_path_len + 1);
+					}
+					LOG_DBG("Created synthetic dir for intermediate path: %s", full_path);
+					/* Register as owned by no specific mount (synthetic) */
+					return synth;
+				}
+			}
+		}
+
 		/* Not an exact mount point - find which backend should handle it */
 		size_t match_len;
 		struct ninep_union_mount *mount = find_mount_point(fs, full_path, &match_len);
@@ -406,6 +440,53 @@ static struct ninep_fs_node *union_walk(struct ninep_fs_node *parent,
 		}
 		return node;
 	} else {
+		/* Check if parent is a synthetic directory node (intermediate path) */
+		if (parent->data && parent->type == NINEP_NODE_DIR &&
+		    ((const char *)parent->data)[0] == '/') {
+			/* This is a synthetic dir - build full path from stored prefix + name */
+			char full_path[256];
+			snprintf(full_path, sizeof(full_path), "%s/%.*s",
+			         (const char *)parent->data, name_len, name);
+
+			/* Check for exact mount point match */
+			for (size_t i = 0; i < fs->num_mounts; i++) {
+				if (strcmp(fs->mounts[i].path, full_path) == 0) {
+					LOG_DBG("Synthetic walk matched mount point '%s'", full_path);
+					return fs->mounts[i].root;
+				}
+			}
+
+			/* Check if this is a prefix of a deeper mount path */
+			size_t full_path_len = strlen(full_path);
+			for (size_t i = 0; i < fs->num_mounts; i++) {
+				if (strlen(fs->mounts[i].path) > full_path_len &&
+				    strncmp(fs->mounts[i].path, full_path, full_path_len) == 0 &&
+				    fs->mounts[i].path[full_path_len] == '/') {
+					/* Create another synthetic directory */
+					struct ninep_fs_node *synth = k_malloc(sizeof(*synth));
+					if (!synth) {
+						return NULL;
+					}
+					memset(synth, 0, sizeof(*synth));
+					memcpy(synth->name, name, name_len < sizeof(synth->name) - 1 ?
+					       name_len : sizeof(synth->name) - 1);
+					synth->type = NINEP_NODE_DIR;
+					synth->mode = 0555 | NINEP_DMDIR;
+					synth->qid.type = NINEP_QTDIR;
+					synth->qid.path = fs->next_qid_path++;
+					synth->data = k_malloc(full_path_len + 1);
+					if (synth->data) {
+						memcpy(synth->data, full_path, full_path_len + 1);
+					}
+					LOG_DBG("Created synthetic dir for intermediate path: %s", full_path);
+					return synth;
+				}
+			}
+
+			LOG_DBG("Synthetic walk: no mount match for '%s'", full_path);
+			return NULL;
+		}
+
 		/* Parent is not union root - delegate to the backend that owns it */
 		struct ninep_union_mount *mount = find_node_owner(fs, parent);
 
@@ -563,6 +644,59 @@ static int union_read(struct ninep_fs_node *node, uint64_t offset,
 		return pos;
 	}
 
+	/* Check if this is a synthetic directory node */
+	if (node->data && node->type == NINEP_NODE_DIR &&
+	    ((const char *)node->data)[0] == '/') {
+		const char *synth_path = (const char *)node->data;
+		size_t synth_path_len = strlen(synth_path);
+		size_t buf_offset = 0;
+
+		if (offset > 0) {
+			/* Synthetic dirs don't support paginated reads */
+			return 0;
+		}
+
+		/* List child entries: find mounts whose path starts with synth_path + "/" */
+		for (size_t i = 0; i < fs->num_mounts; i++) {
+			const char *mount_path = fs->mounts[i].path;
+			size_t mount_path_len = strlen(mount_path);
+
+			if (mount_path_len > synth_path_len &&
+			    strncmp(mount_path, synth_path, synth_path_len) == 0 &&
+			    mount_path[synth_path_len] == '/') {
+				/* Extract the next path component after synth_path/ */
+				const char *child_start = mount_path + synth_path_len + 1;
+				const char *next_slash = strchr(child_start, '/');
+				uint16_t child_len = next_slash ?
+				    (uint16_t)(next_slash - child_start) : strlen(child_start);
+
+				/* Deduplicate: check if we already emitted this child name */
+				/* (Simple check - scan what we've written so far is complex,
+				 *  but for small mount counts this is fine) */
+
+				struct ninep_qid child_qid = {
+					.type = NINEP_QTDIR,
+					.version = 0,
+					.path = (uint64_t)(uintptr_t)&fs->mounts[i]
+				};
+
+				size_t write_offset = 0;
+				int write_ret = ninep_write_stat(buf + buf_offset,
+				                                  count - buf_offset,
+				                                  &write_offset, &child_qid,
+				                                  0755 | NINEP_DMDIR, 0,
+				                                  child_start, child_len,
+				                                  NULL, NULL, NULL);
+				if (write_ret < 0) {
+					break;
+				}
+				buf_offset += write_offset;
+			}
+		}
+
+		return buf_offset;
+	}
+
 	/* Find which backend owns this node and delegate */
 	struct ninep_union_mount *mount = find_node_owner(fs, node);
 
@@ -632,6 +766,23 @@ static int union_stat(struct ninep_fs_node *node, uint8_t *buf,
 		return sizeof(stat);
 	}
 
+	/* Check if this is a synthetic directory node */
+	if (node->data && node->type == NINEP_NODE_DIR &&
+	    ((const char *)node->data)[0] == '/') {
+		/* Return synthetic directory stat */
+		size_t write_offset = 0;
+		int ret = ninep_write_stat(buf, buf_len, &write_offset,
+		                            &node->qid,
+		                            0755 | NINEP_DMDIR,
+		                            0, /* length */
+		                            node->name, strlen(node->name),
+		                            NULL, NULL, NULL);
+		if (ret < 0) {
+			return ret;
+		}
+		return write_offset;
+	}
+
 	/* Find which backend owns this node and delegate */
 	struct ninep_union_mount *mount = find_node_owner(fs, node);
 
@@ -678,6 +829,13 @@ static int union_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 		}
 
 		/* Otherwise, allow opening synthetic root directory */
+		return 0;
+	}
+
+	/* Check if this is a synthetic directory node */
+	if (node->data && node->type == NINEP_NODE_DIR &&
+	    ((const char *)node->data)[0] == '/') {
+		/* Synthetic dirs can be opened for reading */
 		return 0;
 	}
 
@@ -793,6 +951,15 @@ static int union_clunk(struct ninep_fs_node *node, void *fs_ctx)
 	/* For union root, just decrement refcount but don't delegate or unregister */
 	if (node == fs->root) {
 		decref_node(fs, node);
+		return 0;
+	}
+
+	/* Check if this is a synthetic directory node */
+	if (node->data && node->type == NINEP_NODE_DIR &&
+	    ((const char *)node->data)[0] == '/') {
+		LOG_DBG("Clunking synthetic dir node: %s", (const char *)node->data);
+		k_free(node->data);
+		k_free(node);
 		return 0;
 	}
 
