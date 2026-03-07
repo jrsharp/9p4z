@@ -337,6 +337,79 @@ static void handle_tattach(struct ninep_server *server, uint16_t tag,
 		return;
 	}
 
+	/* Parse aname from Tattach message.
+	 * In Plan 9, the aname field specifies which file tree the client
+	 * wants to access — e.g., exportfs uses it to serve a subtree as
+	 * the root of the connection.  If aname is non-empty, walk from
+	 * root to that path so the attached fid points to the subtree. */
+	size_t aname_offset = 17 + uname_len;  /* after uname string data */
+	uint16_t aname_len = 0;
+	const char *aname = NULL;
+
+	if (aname_offset + 2 <= len) {
+		aname_len = msg[aname_offset] | (msg[aname_offset + 1] << 8);
+		if (aname_len > 0 && aname_offset + 2 + aname_len <= len) {
+			aname = (const char *)&msg[aname_offset + 2];
+		}
+	}
+
+	if (aname && aname_len > 0 && server->config.fs_ops->walk) {
+		LOG_INF("Tattach: aname='%.*s'", aname_len, aname);
+
+		/* Walk each path component of aname (split on '/') */
+		const char *p = aname;
+		const char *end = aname + aname_len;
+		struct ninep_fs_node *node = sfid->node;
+
+		/* Skip leading slash */
+		if (p < end && *p == '/') {
+			p++;
+		}
+
+		while (p < end) {
+			/* Find next component */
+			const char *slash = p;
+			while (slash < end && *slash != '/') {
+				slash++;
+			}
+			uint16_t comp_len = slash - p;
+
+			if (comp_len > 0) {
+				struct ninep_fs_node *child =
+					server->config.fs_ops->walk(
+						node, p, comp_len,
+						server->config.fs_ctx);
+				if (!child) {
+					LOG_WRN("Tattach: aname walk failed "
+						"at '%.*s'", comp_len, p);
+					/* Clunk intermediate if not root */
+					if (node != sfid->node &&
+					    server->config.fs_ops->clunk) {
+						server->config.fs_ops->clunk(
+							node,
+							server->config.fs_ctx);
+					}
+					free_fid(server, fid);
+					send_error(server, tag,
+						   "aname not found");
+					return;
+				}
+				/* Clunk intermediate (not root, not final) */
+				if (node != sfid->node &&
+				    server->config.fs_ops->clunk) {
+					server->config.fs_ops->clunk(
+						node,
+						server->config.fs_ctx);
+				}
+				node = child;
+			}
+
+			p = (slash < end) ? slash + 1 : end;
+		}
+
+		sfid->node = node;
+	}
+
 	/* Send Rattach */
 	int ret = ninep_build_rattach(server->tx_buf, server->tx_buf_size,
 	                                tag, &sfid->node->qid);
