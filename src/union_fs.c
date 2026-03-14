@@ -13,6 +13,14 @@
 
 LOG_MODULE_REGISTER(ninep_union_fs, CONFIG_NINEP_LOG_LEVEL);
 
+/* Synthetic directory nodes are tagged by setting parent to the union_fs pointer.
+ * This distinguishes them from real backend nodes that may also have path strings
+ * in their data field. */
+#define IS_SYNTHETIC_DIR(fs, node) \
+	((node)->parent == (struct ninep_fs_node *)(fs))
+#define MARK_SYNTHETIC(fs, node) \
+	do { (node)->parent = (struct ninep_fs_node *)(fs); } while (0)
+
 /**
  * @brief Find mount point for a given path
  *
@@ -381,8 +389,8 @@ static struct ninep_fs_node *union_walk(struct ninep_fs_node *parent,
 					if (synth->data) {
 						memcpy(synth->data, full_path, full_path_len + 1);
 					}
+					MARK_SYNTHETIC(fs, synth);
 					LOG_DBG("Created synthetic dir for intermediate path: %s", full_path);
-					/* Register as owned by no specific mount (synthetic) */
 					return synth;
 				}
 			}
@@ -441,8 +449,7 @@ static struct ninep_fs_node *union_walk(struct ninep_fs_node *parent,
 		return node;
 	} else {
 		/* Check if parent is a synthetic directory node (intermediate path) */
-		if (parent->data && parent->type == NINEP_NODE_DIR &&
-		    ((const char *)parent->data)[0] == '/') {
+		if (IS_SYNTHETIC_DIR(fs, parent)) {
 			/* This is a synthetic dir - build full path from stored prefix + name */
 			char full_path[256];
 			snprintf(full_path, sizeof(full_path), "%s/%.*s",
@@ -478,6 +485,7 @@ static struct ninep_fs_node *union_walk(struct ninep_fs_node *parent,
 					if (synth->data) {
 						memcpy(synth->data, full_path, full_path_len + 1);
 					}
+					MARK_SYNTHETIC(fs, synth);
 					LOG_DBG("Created synthetic dir for intermediate path: %s", full_path);
 					return synth;
 				}
@@ -645,8 +653,7 @@ static int union_read(struct ninep_fs_node *node, uint64_t offset,
 	}
 
 	/* Check if this is a synthetic directory node */
-	if (node->data && node->type == NINEP_NODE_DIR &&
-	    ((const char *)node->data)[0] == '/') {
+	if (IS_SYNTHETIC_DIR(fs, node)) {
 		const char *synth_path = (const char *)node->data;
 		size_t synth_path_len = strlen(synth_path);
 		size_t buf_offset = 0;
@@ -767,8 +774,7 @@ static int union_stat(struct ninep_fs_node *node, uint8_t *buf,
 	}
 
 	/* Check if this is a synthetic directory node */
-	if (node->data && node->type == NINEP_NODE_DIR &&
-	    ((const char *)node->data)[0] == '/') {
+	if (IS_SYNTHETIC_DIR(fs, node)) {
 		/* Return synthetic directory stat */
 		size_t write_offset = 0;
 		int ret = ninep_write_stat(buf, buf_len, &write_offset,
@@ -833,8 +839,7 @@ static int union_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 	}
 
 	/* Check if this is a synthetic directory node */
-	if (node->data && node->type == NINEP_NODE_DIR &&
-	    ((const char *)node->data)[0] == '/') {
+	if (IS_SYNTHETIC_DIR(fs, node)) {
 		/* Synthetic dirs can be opened for reading */
 		return 0;
 	}
@@ -955,8 +960,7 @@ static int union_clunk(struct ninep_fs_node *node, void *fs_ctx)
 	}
 
 	/* Check if this is a synthetic directory node */
-	if (node->data && node->type == NINEP_NODE_DIR &&
-	    ((const char *)node->data)[0] == '/') {
+	if (IS_SYNTHETIC_DIR(fs, node)) {
 		LOG_DBG("Clunking synthetic dir node: %s", (const char *)node->data);
 		k_free(node->data);
 		k_free(node);
