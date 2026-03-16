@@ -362,47 +362,14 @@ static struct ninep_fs_node *union_walk(struct ninep_fs_node *parent,
 			}
 		}
 
-		/* Check if this is a prefix of a deeper mount path.
-		 * E.g., walking to "/portals" when there's a mount at "/portals/frst".
-		 * In this case, create a synthetic directory node. */
-		{
-			size_t full_path_len = strlen(full_path);
-			for (size_t i = 0; i < fs->num_mounts; i++) {
-				if (strlen(fs->mounts[i].path) > full_path_len &&
-				    strncmp(fs->mounts[i].path, full_path, full_path_len) == 0 &&
-				    fs->mounts[i].path[full_path_len] == '/') {
-					/* This mount path starts with our walk target.
-					 * Create a synthetic directory node. */
-					struct ninep_fs_node *synth = k_malloc(sizeof(*synth));
-					if (!synth) {
-						return NULL;
-					}
-					memset(synth, 0, sizeof(*synth));
-					memcpy(synth->name, name, name_len < sizeof(synth->name) - 1 ?
-					       name_len : sizeof(synth->name) - 1);
-					synth->type = NINEP_NODE_DIR;
-					synth->mode = 0555 | NINEP_DMDIR;
-					synth->qid.type = NINEP_QTDIR;
-					synth->qid.path = fs->next_qid_path++;
-					/* Store the full_path so subsequent walks can resolve further */
-					synth->data = k_malloc(full_path_len + 1);
-					if (synth->data) {
-						memcpy(synth->data, full_path, full_path_len + 1);
-					}
-					MARK_SYNTHETIC(fs, synth);
-					LOG_DBG("Created synthetic dir for intermediate path: %s", full_path);
-					return synth;
-				}
-			}
-		}
-
 		/* Not an exact mount point - find which backend should handle it */
 		size_t match_len;
 		struct ninep_union_mount *mount = find_mount_point(fs, full_path, &match_len);
 
 		if (!mount) {
-			LOG_DBG("No mount point found for path: %s", full_path);
-			return NULL;
+			/* No backend handles this path. Check if it's a prefix of a
+			 * deeper mount (e.g., "/portals" when mount is at "/portals/frst") */
+			goto try_synthetic;
 		}
 
 		/* If matched the "/" mount, delegate to it */
@@ -412,14 +379,19 @@ static struct ninep_fs_node *union_walk(struct ninep_fs_node *parent,
 			if (node) {
 				if (!register_node_owner(fs, node, mount)) {
 					LOG_ERR("Failed to register node - node table full");
-					/* Backend may need to clunk the node we just walked */
 					if (mount->fs_ops->clunk) {
 						mount->fs_ops->clunk(node, mount->fs_ctx);
 					}
 					return NULL;
 				}
+				return node;
 			}
-			return node;
+			/* Backend doesn't have this path — fall through to synthetic check.
+			 * This handles the case where sysfs has /net (with /net/bt) but
+			 * /net/tcp is a separate union mount. Walking to /net returns
+			 * sysfs's node, but walking to a path sysfs doesn't know should
+			 * still check for deeper mount prefixes. */
+			goto try_synthetic;
 		}
 
 		/* For other mounts, get relative path */
@@ -447,6 +419,40 @@ static struct ninep_fs_node *union_walk(struct ninep_fs_node *parent,
 			}
 		}
 		return node;
+
+try_synthetic:
+		/* Check if this is a prefix of a deeper mount path.
+		 * E.g., walking to "/portals" when there's a mount at "/portals/frst".
+		 * Only reached when no backend handled the path. */
+		{
+			size_t full_path_len = strlen(full_path);
+			for (size_t i = 0; i < fs->num_mounts; i++) {
+				if (strlen(fs->mounts[i].path) > full_path_len &&
+				    strncmp(fs->mounts[i].path, full_path, full_path_len) == 0 &&
+				    fs->mounts[i].path[full_path_len] == '/') {
+					struct ninep_fs_node *synth = k_malloc(sizeof(*synth));
+					if (!synth) {
+						return NULL;
+					}
+					memset(synth, 0, sizeof(*synth));
+					memcpy(synth->name, name, name_len < sizeof(synth->name) - 1 ?
+					       name_len : sizeof(synth->name) - 1);
+					synth->type = NINEP_NODE_DIR;
+					synth->mode = 0555 | NINEP_DMDIR;
+					synth->qid.type = NINEP_QTDIR;
+					synth->qid.path = fs->next_qid_path++;
+					synth->data = k_malloc(full_path_len + 1);
+					if (synth->data) {
+						memcpy(synth->data, full_path, full_path_len + 1);
+					}
+					MARK_SYNTHETIC(fs, synth);
+					LOG_DBG("Created synthetic dir for intermediate path: %s", full_path);
+					return synth;
+				}
+			}
+		}
+		LOG_DBG("No match for path: %s", full_path);
+		return NULL;
 	} else {
 		/* Check if parent is a synthetic directory node (intermediate path) */
 		if (IS_SYNTHETIC_DIR(fs, parent)) {
