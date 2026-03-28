@@ -30,6 +30,22 @@ LOG_MODULE_REGISTER(ninep_session_pool_l2cap, CONFIG_NINEP_LOG_LEVEL);
 NET_BUF_POOL_DEFINE(l2cap_session_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
                     CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
 
+/*
+ * Dedicated work queue for 9P message processing.
+ * This decouples 9P processing from the BT RX thread, preventing:
+ * - BT RX thread starvation during long filesystem operations
+ * - Deadlock when bt_l2cap_chan_send() blocks on TX credits
+ * - Stack overflow from deep 9P → union_fs → aetherd → LittleFS chains
+ */
+#ifndef CONFIG_NINEP_SESSION_PROC_STACK_SIZE
+#define CONFIG_NINEP_SESSION_PROC_STACK_SIZE 4096
+#endif
+static K_THREAD_STACK_DEFINE(ninep_proc_stack, CONFIG_NINEP_SESSION_PROC_STACK_SIZE);
+static struct k_work_q ninep_proc_wq;
+static bool ninep_proc_wq_started;
+
+static void session_process_work_handler(struct k_work *work);
+
 /* Forward declarations */
 static int l2cap_session_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
                                  struct bt_l2cap_chan **chan);
@@ -96,6 +112,30 @@ static void l2cap_session_disconnected(struct bt_l2cap_chan *chan)
 	LOG_INF("Session freed - check pool for available slots");
 }
 
+/*
+ * Work handler: processes a complete 9P message on the dedicated work queue
+ * thread, keeping the BT RX thread free for other BLE operations.
+ */
+static void session_process_work_handler(struct k_work *work)
+{
+	struct l2cap_session_chan *ch = CONTAINER_OF(work, struct l2cap_session_chan, process_work);
+	struct ninep_transport *transport = &ch->session->transport;
+
+	LOG_DBG("Processing 9P message: %u bytes on session %d",
+	        ch->process_len, ch->session->session_id);
+
+	/* Deliver to 9P server (this may do filesystem I/O, send response, etc.) */
+	if (transport->recv_cb) {
+		transport->recv_cb(transport, ch->rx_buf,
+		                   ch->process_len, transport->user_data);
+	}
+
+	/* Reset RX state machine — ready for next message from BT RX thread */
+	ch->rx_len = 0;
+	ch->rx_expected = 0;
+	ch->rx_state = RX_WAIT_SIZE;
+}
+
 static int l2cap_session_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 {
 #if NINEP_NCS_BUILD
@@ -104,12 +144,19 @@ static int l2cap_session_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 #else
 	struct l2cap_session_chan *ch = CONTAINER_OF(chan, struct l2cap_session_chan, le.chan);
 #endif
-	struct ninep_transport *transport = &ch->session->transport;
 
 	LOG_DBG("L2CAP session recv: %u bytes for session %d", buf->len, ch->session->session_id);
 
 	/* Process all data in the buffer */
 	while (buf->len > 0) {
+		if (ch->rx_state == RX_PROCESSING) {
+			/* Previous message still being processed on work queue.
+			 * L2CAP flow control should prevent this, but guard anyway. */
+			LOG_WRN("Session %d: data arrived while processing, dropping %u bytes",
+			        ch->session->session_id, buf->len);
+			return -EBUSY;
+		}
+
 		if (ch->rx_state == RX_WAIT_SIZE) {
 			/* Reading 4-byte size field */
 			size_t need = 4 - ch->rx_len;
@@ -132,17 +179,15 @@ static int l2cap_session_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 				if (ch->rx_expected < 7 || ch->rx_expected > ch->rx_buf_size) {
 					LOG_ERR("Invalid message size: %u (max: %zu)",
 					        ch->rx_expected, ch->rx_buf_size);
-					/* Reset and skip this message */
 					ch->rx_len = 0;
 					ch->rx_state = RX_WAIT_SIZE;
 					return -EINVAL;
 				}
 
-				/* Transition to message body state */
 				ch->rx_state = RX_WAIT_DATA;
 			}
 		} else {
-			/* Reading message body */
+			/* Reading message body (RX_WAIT_DATA) */
 			size_t need = ch->rx_expected - ch->rx_len;
 			size_t copy = MIN(need, buf->len);
 
@@ -151,19 +196,17 @@ static int l2cap_session_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 			ch->rx_len += copy;
 
 			if (ch->rx_len == ch->rx_expected) {
-				/* Complete message received */
+				/* Complete message — hand off to processing thread */
 				LOG_DBG("Complete message received: %u bytes", ch->rx_len);
+				ch->process_len = ch->rx_len;
+				ch->rx_state = RX_PROCESSING;
+				k_work_submit_to_queue(&ninep_proc_wq, &ch->process_work);
 
-				/* Deliver to 9P layer */
-				if (transport->recv_cb) {
-					transport->recv_cb(transport, ch->rx_buf,
-					                   ch->rx_len, transport->user_data);
-				}
-
-				/* Reset for next message */
-				ch->rx_len = 0;
-				ch->rx_expected = 0;
-				ch->rx_state = RX_WAIT_SIZE;
+				/* Don't process more data from this SDU — the rx_buf
+				 * is now owned by the work handler until it resets state.
+				 * Any remaining bytes in buf are for the next message
+				 * which can't start until processing completes. */
+				break;
 			}
 		}
 	}
@@ -204,6 +247,7 @@ static int l2cap_session_accept(struct bt_conn *conn, struct bt_l2cap_server *se
 	l2cap_chan->rx_len = 0;
 	l2cap_chan->rx_expected = 0;
 	l2cap_chan->rx_state = RX_WAIT_SIZE;
+	k_work_init(&l2cap_chan->process_work, session_process_work_handler);
 
 	/* Initialize transport for this session */
 	session->transport.ops = &l2cap_session_transport_ops;
@@ -439,6 +483,19 @@ int ninep_session_pool_l2cap_start(struct ninep_session_pool_l2cap *pool)
 
 	if (!pool) {
 		return -EINVAL;
+	}
+
+	/* Start the 9P processing work queue (once, shared across all pools) */
+	if (!ninep_proc_wq_started) {
+		struct k_work_queue_config wq_cfg = {
+			.name = "9p_proc",
+		};
+		k_work_queue_start(&ninep_proc_wq, ninep_proc_stack,
+		                   K_THREAD_STACK_SIZEOF(ninep_proc_stack),
+		                   K_PRIO_PREEMPT(8), &wq_cfg);
+		ninep_proc_wq_started = true;
+		LOG_INF("9P processing work queue started (stack=%d, prio=%d)",
+		        CONFIG_NINEP_SESSION_PROC_STACK_SIZE, 8);
 	}
 
 	/* Register L2CAP server */

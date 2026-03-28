@@ -125,7 +125,9 @@ struct l2cap_session_chan {
 	size_t rx_buf_size;
 	size_t rx_len;
 	uint32_t rx_expected;
-	enum { RX_WAIT_SIZE, RX_WAIT_DATA } rx_state;
+	enum { RX_WAIT_SIZE, RX_WAIT_DATA, RX_PROCESSING } rx_state;
+	struct k_work process_work;  /* Async 9P processing off BT RX thread */
+	uint32_t process_len;        /* Length of message to process */
 };
 
 /**

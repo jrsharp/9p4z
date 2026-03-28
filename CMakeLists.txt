@@ -45,11 +45,12 @@ if(CONFIG_NINEP_TRANSPORT_TCP)
 endif()
 
 if(CONFIG_NINEP_TRANSPORT_L2CAP)
-  zephyr_library_sources(src/transport_l2cap.c)
-
-  # L2CAP session pool for multi-client servers
+  # L2CAP session pool for multi-client servers (preferred path)
   if(CONFIG_NINEP_SERVER)
     zephyr_library_sources(src/session_pool_l2cap.c)
+  else()
+    # Single-session transport only when session pool is not available
+    zephyr_library_sources(src/transport_l2cap.c)
   endif()
 endif()
 
