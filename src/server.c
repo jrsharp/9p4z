@@ -227,6 +227,9 @@ static void handle_tversion(struct ninep_server *server, const uint8_t *msg, siz
 		return;
 	}
 
+	/* Store negotiated msize for read/write capping */
+	server->msize = msize;
+
 	/* Send Rversion */
 	int ret = ninep_build_rversion(server->tx_buf, server->tx_buf_size,
 	                                 NINEP_NOTAG, msize, "9P2000", 6);
@@ -656,9 +659,11 @@ static void handle_tread(struct ninep_server *server, uint16_t tag,
 		return;
 	}
 
-	/* Limit count to available buffer space */
-	uint32_t max_data = server->tx_buf_size - 11; /* Header + count field */
-
+	/* Limit count to fit within negotiated msize (Rread header = 11 bytes) */
+	uint32_t max_data = server->tx_buf_size - 11;
+	if (server->msize > 11 && (server->msize - 11) < max_data) {
+		max_data = server->msize - 11;
+	}
 	if (count > max_data) {
 		count = max_data;
 	}
@@ -1223,6 +1228,7 @@ int ninep_server_init(struct ninep_server *server,
 	/* Copy config by value instead of storing pointer */
 	memcpy(&server->config, config, sizeof(server->config));
 	server->transport = transport;
+	server->msize = CONFIG_NINEP_MAX_MESSAGE_SIZE; /* Default until Tversion */
 
 	/* Dynamically allocate RX/TX buffers (may use PSRAM on ESP32) */
 	size_t buf_size = CONFIG_NINEP_MAX_MESSAGE_SIZE;

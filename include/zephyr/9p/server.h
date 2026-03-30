@@ -296,6 +296,7 @@ struct ninep_server_fid {
 struct ninep_server {
 	struct ninep_server_config config;  /* Store by value, not pointer */
 	struct ninep_transport *transport;
+	uint32_t msize;  /* Negotiated max message size from Tversion */
 
 	/* Lightweight FID table */
 	struct ninep_server_fid fids[CONFIG_NINEP_SERVER_MAX_FIDS];

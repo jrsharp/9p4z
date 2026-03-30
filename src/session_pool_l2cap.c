@@ -38,7 +38,7 @@ NET_BUF_POOL_DEFINE(l2cap_session_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
  * - Stack overflow from deep 9P → union_fs → aetherd → LittleFS chains
  */
 #ifndef CONFIG_NINEP_SESSION_PROC_STACK_SIZE
-#define CONFIG_NINEP_SESSION_PROC_STACK_SIZE 4096
+#define CONFIG_NINEP_SESSION_PROC_STACK_SIZE 8192
 #endif
 static K_THREAD_STACK_DEFINE(ninep_proc_stack, CONFIG_NINEP_SESSION_PROC_STACK_SIZE);
 static struct k_work_q ninep_proc_wq;
