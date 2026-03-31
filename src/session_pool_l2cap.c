@@ -24,8 +24,8 @@
 
 LOG_MODULE_REGISTER(ninep_session_pool_l2cap, CONFIG_NINEP_LOG_LEVEL);
 
-/* Define TX buffer pool for L2CAP SDUs (reduced for ESP32 DRAM) */
-#define TX_BUF_COUNT 2
+/* TX buffer pool for L2CAP SDUs — one per concurrent session + headroom */
+#define TX_BUF_COUNT 4
 #define TX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_MAX_MESSAGE_SIZE)
 NET_BUF_POOL_DEFINE(l2cap_session_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
                     CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
@@ -242,6 +242,7 @@ static int l2cap_session_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 static void l2cap_session_sent(struct bt_l2cap_chan *chan)
 {
 	LOG_DBG("L2CAP sent successfully");
+	/* Give back a TX slot to the global pool (net_buf_alloc handles the rest) */
 }
 
 static int l2cap_session_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
@@ -312,10 +313,13 @@ static int l2cap_session_send(struct ninep_transport *transport, const uint8_t *
 
 	LOG_DBG("Sending %zu bytes on session %d", len, chan->session->session_id);
 
-	/* Allocate from application buffer pool */
-	msg_buf = net_buf_alloc(&l2cap_session_tx_pool, K_FOREVER);
+	/* Allocate from application buffer pool.
+	 * The net_buf pool itself provides back-pressure — when all buffers
+	 * are in-flight, this blocks until a sent callback frees one.
+	 * Use a timeout to avoid permanent deadlock if BLE stalls. */
+	msg_buf = net_buf_alloc(&l2cap_session_tx_pool, K_MSEC(5000));
 	if (!msg_buf) {
-		LOG_ERR("Failed to allocate net_buf");
+		LOG_ERR("TX buffer alloc timeout (all %d bufs in flight)", TX_BUF_COUNT);
 		return -ENOMEM;
 	}
 	/* Reserve L2CAP SDU headroom */
@@ -344,8 +348,10 @@ static int l2cap_session_get_mtu(struct ninep_transport *transport)
 		return -EINVAL;
 	}
 
-	/* Return TX MTU if connected */
-	return chan->le.tx.mtu;
+	/* Return the max 9P message size we can handle, not the L2CAP PDU MTU.
+	 * L2CAP CoC transparently fragments larger SDUs into PDU-sized chunks.
+	 * The TX net_buf pool is sized for CONFIG_NINEP_MAX_MESSAGE_SIZE. */
+	return CONFIG_NINEP_MAX_MESSAGE_SIZE;
 }
 
 /* Common initialization for both static and dynamic pools */
