@@ -105,11 +105,25 @@ static void l2cap_session_disconnected(struct bt_l2cap_chan *chan)
 
 	LOG_INF("L2CAP session channel disconnected for session %d", ch->session->session_id);
 
-	/* Free the session back to the pool */
+	/* Mark RX as not accepting new data */
+	ch->rx_state = RX_PROCESSING;
+
+	/* Try to cancel pending work. If the work handler is currently
+	 * running (e.g., blocked on a TCP recv), we can't wait for it
+	 * synchronously — that would deadlock the BT thread.
+	 * Use k_work_cancel (non-blocking): if work is queued but not
+	 * running, it's removed. If it's running, we proceed anyway —
+	 * the session_free will clean up server state, and the work
+	 * handler will find a zeroed transport and exit gracefully. */
+	(void)k_work_cancel(&ch->process_work);
+
+	/* Free the session back to the pool.
+	 * This clunks all open fids (closing TCP connections, which
+	 * unblocks any recv() in the work handler) and frees server
+	 * RX/TX buffers. */
 	ninep_session_free(ch->session);
 
-	/* Log pool status after free */
-	LOG_INF("Session freed - check pool for available slots");
+	LOG_INF("Session %d cleanup complete", ch->session->session_id);
 }
 
 /*
@@ -119,10 +133,18 @@ static void l2cap_session_disconnected(struct bt_l2cap_chan *chan)
 static void session_process_work_handler(struct k_work *work)
 {
 	struct l2cap_session_chan *ch = CONTAINER_OF(work, struct l2cap_session_chan, process_work);
-	struct ninep_transport *transport = &ch->session->transport;
+	struct ninep_session *session = ch->session;
+
+	/* Check if session was freed while this work was queued */
+	if (!session || session->state != NINEP_SESSION_CONNECTED) {
+		LOG_WRN("9P work handler: session no longer connected, skipping");
+		return;
+	}
+
+	struct ninep_transport *transport = &session->transport;
 
 	LOG_DBG("Processing 9P message: %u bytes on session %d",
-	        ch->process_len, ch->session->session_id);
+	        ch->process_len, session->session_id);
 
 	/* Deliver to 9P server (this may do filesystem I/O, send response, etc.) */
 	if (transport->recv_cb) {
@@ -130,10 +152,13 @@ static void session_process_work_handler(struct k_work *work)
 		                   ch->process_len, transport->user_data);
 	}
 
-	/* Reset RX state machine — ready for next message from BT RX thread */
-	ch->rx_len = 0;
-	ch->rx_expected = 0;
-	ch->rx_state = RX_WAIT_SIZE;
+	/* Reset RX state machine — ready for next message from BT RX thread.
+	 * Check state again in case disconnect happened during processing. */
+	if (ch->rx_state == RX_PROCESSING) {
+		ch->rx_len = 0;
+		ch->rx_expected = 0;
+		ch->rx_state = RX_WAIT_SIZE;
+	}
 }
 
 static int l2cap_session_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
@@ -281,7 +306,7 @@ static int l2cap_session_send(struct ninep_transport *transport, const uint8_t *
 	struct net_buf *msg_buf;
 	int ret;
 
-	if (!chan) {
+	if (!chan || !chan->session || chan->session->state != NINEP_SESSION_CONNECTED) {
 		return -ENOTCONN;
 	}
 
