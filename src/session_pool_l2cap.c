@@ -241,8 +241,7 @@ static int l2cap_session_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 
 static void l2cap_session_sent(struct bt_l2cap_chan *chan)
 {
-	LOG_DBG("L2CAP sent successfully");
-	/* Give back a TX slot to the global pool (net_buf_alloc handles the rest) */
+	LOG_INF("TX sent callback fired");
 }
 
 static int l2cap_session_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
@@ -311,7 +310,7 @@ static int l2cap_session_send(struct ninep_transport *transport, const uint8_t *
 		return -ENOTCONN;
 	}
 
-	LOG_DBG("Sending %zu bytes on session %d", len, chan->session->session_id);
+	LOG_INF("TX send: %zu bytes, session %d", len, chan->session->session_id);
 
 	/* Allocate from application buffer pool.
 	 * The net_buf pool itself provides back-pressure — when all buffers
@@ -348,10 +347,10 @@ static int l2cap_session_get_mtu(struct ninep_transport *transport)
 		return -EINVAL;
 	}
 
-	/* Return the max 9P message size we can handle, not the L2CAP PDU MTU.
-	 * L2CAP CoC transparently fragments larger SDUs into PDU-sized chunks.
-	 * The TX net_buf pool is sized for CONFIG_NINEP_MAX_MESSAGE_SIZE. */
-	return CONFIG_NINEP_MAX_MESSAGE_SIZE;
+	/* Return L2CAP TX MTU — this is the max SDU size the peer can receive.
+	 * bt_l2cap_chan_send() enforces this limit; SDUs larger than tx.mtu
+	 * are rejected with -EMSGSIZE. The 9P msize must respect this. */
+	return chan->le.tx.mtu;
 }
 
 /* Common initialization for both static and dynamic pools */

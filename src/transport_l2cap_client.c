@@ -49,12 +49,64 @@ static struct bt_uuid_128 uuid_9pis_transport = BT_UUID_INIT_128(BT_UUID_9PIS_TR
 static struct bt_uuid_128 uuid_9pis_features = BT_UUID_INIT_128(BT_UUID_9PIS_FEATURES_VAL);
 #endif /* CONFIG_BT_GATT_CLIENT */
 
-/* Forward declarations for global state tracking.
- * g_connecting_data is set during connection establishment.
- * g_active_data persists after connection for disconnect handling.
+/* Connection registry — maps bt_conn pointers to transport instances.
+ * Replaces the old singleton g_active_data which only supported one
+ * L2CAP client at a time.  Sized to CONFIG_BT_MAX_CONN. */
+#ifndef CONFIG_BT_MAX_CONN
+#define CONFIG_BT_MAX_CONN 2
+#endif
+
+struct conn_entry {
+	struct bt_conn *conn;
+	struct l2cap_client_data *data;
+};
+static struct conn_entry conn_registry[CONFIG_BT_MAX_CONN];
+
+static void conn_registry_set(struct bt_conn *conn, struct l2cap_client_data *data)
+{
+	/* Update existing entry first */
+	for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
+		if (conn_registry[i].conn == conn) {
+			conn_registry[i].data = data;
+			return;
+		}
+	}
+	/* Find empty slot */
+	for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
+		if (!conn_registry[i].conn) {
+			conn_registry[i].conn = conn;
+			conn_registry[i].data = data;
+			return;
+		}
+	}
+	LOG_ERR("conn_registry full!");
+}
+
+static struct l2cap_client_data *conn_registry_find(struct bt_conn *conn)
+{
+	for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
+		if (conn_registry[i].conn == conn) {
+			return conn_registry[i].data;
+		}
+	}
+	return NULL;
+}
+
+static void conn_registry_remove(struct bt_conn *conn)
+{
+	for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
+		if (conn_registry[i].conn == conn) {
+			conn_registry[i].conn = NULL;
+			conn_registry[i].data = NULL;
+			return;
+		}
+	}
+}
+
+/* g_connecting_data tracks the in-flight connection attempt (only one
+ * connection attempt at a time, serialized by the BLE stack).
  * g_scan_data tracks the client during BLE scanning. */
 static struct l2cap_client_data *g_connecting_data;
-static struct l2cap_client_data *g_active_data;
 static struct l2cap_client_data *g_scan_data;
 
 /* RX state machine states */
@@ -204,8 +256,6 @@ static void l2cap_disconnected(struct bt_l2cap_chan *chan)
 	 * If we unref here, ble_disconnected() won't be able to properly clean up
 	 * and the connection will remain in the BT stack's internal list. */
 
-	/* DON'T clear g_active_data - ble_disconnected() needs it */
-
 	set_state(data, NINEP_L2CAP_CLIENT_DISCONNECTED);
 }
 
@@ -219,7 +269,7 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 #endif
 	struct ninep_transport *transport = ch->transport;
 
-	LOG_DBG("L2CAP recv: %u bytes", buf->len);
+	LOG_INF("L2CAP[%04x] recv: %u bytes", ch->le.tx.cid, buf->len);
 
 	/* Process all data in the buffer */
 	while (buf->len > 0) {
@@ -282,11 +332,15 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 	}
 
 	/*
-	 * Grant a credit back to the server after processing received data.
-	 * This is needed on mainline Zephyr for credit-based flow control.
-	 * ESP32 and NCS may handle credits differently.
+	 * Credit management: On mainline Zephyr (including ESP32),
+	 * l2cap_chan_le_recv_sdu() automatically calls
+	 * l2cap_chan_send_credits(1) and net_buf_unref(buf) after our
+	 * recv callback returns 0.  Calling bt_l2cap_chan_recv_complete()
+	 * here would double-free the buffer and double-grant credits.
+	 *
+	 * NCS uses a different model where the app must call recv_complete.
 	 */
-#if !NINEP_NCS_BUILD && !NINEP_ESP32_BUILD
+#if NINEP_NCS_BUILD
 	bt_l2cap_chan_recv_complete(chan, buf);
 #endif
 
@@ -297,16 +351,17 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 /* NCS and ESP32: .sent callback has no status parameter */
 static void l2cap_sent(struct bt_l2cap_chan *chan)
 {
-	LOG_DBG("L2CAP data transmitted");
+	struct bt_l2cap_le_chan *le = BT_L2CAP_LE_CHAN(chan);
+	LOG_INF("L2CAP[%04x] TX complete", le->tx.cid);
 }
 #else
 /* Mainline Zephyr: .sent callback has status parameter */
 static void l2cap_sent(struct bt_l2cap_chan *chan, int status)
 {
 	if (status < 0) {
-		LOG_ERR("L2CAP send failed: %d", status);
+		LOG_ERR("L2CAP TX failed: %d", status);
 	} else {
-		LOG_DBG("L2CAP sent successfully");
+		LOG_INF("L2CAP TX complete (status=%d)", status);
 	}
 }
 #endif
@@ -366,10 +421,10 @@ static uint8_t features_read_cb(struct bt_conn *conn, uint8_t err,
 				struct bt_gatt_read_params *params,
 				const void *data, uint16_t length)
 {
-	struct l2cap_client_data *client_data = g_active_data;
+	struct l2cap_client_data *client_data = conn_registry_find(conn);
 
 	if (!client_data) {
-		LOG_ERR("No active client data in features callback");
+		LOG_ERR("No client data for conn %p in features callback", conn);
 		return BT_GATT_ITER_STOP;
 	}
 
@@ -418,10 +473,10 @@ static uint8_t transport_info_read_cb(struct bt_conn *conn, uint8_t err,
 				      struct bt_gatt_read_params *params,
 				      const void *data, uint16_t length)
 {
-	struct l2cap_client_data *client_data = g_active_data;
+	struct l2cap_client_data *client_data = conn_registry_find(conn);
 
 	if (!client_data) {
-		LOG_ERR("No active client data in GATT callback");
+		LOG_ERR("No client data for conn %p in GATT callback", conn);
 		return BT_GATT_ITER_STOP;
 	}
 
@@ -617,9 +672,9 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
 		return;
 	}
 
-	/* Store the connection reference and track active data for disconnect handling */
+	/* Store the connection reference and register for disconnect handling */
 	data->conn = bt_conn_ref(conn);
-	g_active_data = data;
+	conn_registry_set(conn, data);
 	LOG_INF("BLE connected successfully to %s", addr_str);
 
 #if defined(CONFIG_BT_GATT_CLIENT)
@@ -643,28 +698,26 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
 
 static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
 {
-	/* Try g_connecting_data first (for disconnects during connection),
-	 * then g_active_data (for disconnects after successful connection) */
+	/* Look up transport by connection — try in-flight first, then registry */
 	struct l2cap_client_data *data = g_connecting_data;
-	if (!data) {
-		data = g_active_data;
+	if (data && data->conn == conn) {
+		g_connecting_data = NULL;
+	} else {
+		data = conn_registry_find(conn);
 	}
 
 	LOG_INF("BLE disconnected (reason: 0x%02x, data=%p)", reason, data);
 
-	/* Clean up connection reference if it matches ours.
-	 * This handles cases where BLE disconnects before L2CAP is established,
-	 * or after L2CAP has already cleaned up. */
 	if (data && data->conn == conn) {
 		LOG_INF("Cleaning up BLE connection reference");
 		bt_conn_unref(data->conn);
 		data->conn = NULL;
-		g_active_data = NULL;
+		conn_registry_remove(conn);
 		set_state(data, NINEP_L2CAP_CLIENT_DISCONNECTED);
 	} else if (data && data->conn == NULL) {
-		/* L2CAP already cleaned up, just clear active data */
+		/* L2CAP already cleaned up */
 		LOG_INF("BLE disconnected after L2CAP cleanup");
-		g_active_data = NULL;
+		conn_registry_remove(conn);
 	}
 }
 
@@ -1043,23 +1096,24 @@ static int l2cap_client_send(struct ninep_transport *transport,
 	struct net_buf *msg_buf;
 	int ret;
 
-	LOG_DBG("L2CAP send: %zu bytes (type=%u)", len, len >= 5 ? buf[4] : 0);
+	LOG_INF("L2CAP[%04x] send: %zu bytes (type=%u) credits=%d",
+	        data->channel.le.tx.cid, len,
+	        len >= 5 ? buf[4] : 0,
+	        (int)atomic_get(&data->channel.le.tx.credits));
 
 	if (!data || data->state != NINEP_L2CAP_CLIENT_CONNECTED) {
 		LOG_ERR("L2CAP send: not connected (state=%d)", data ? data->state : -1);
 		return -ENOTCONN;
 	}
 
-	/* Log channel state for debugging */
-	LOG_DBG("L2CAP TX state: mtu=%u, mps=%u, credits=%d",
-	        data->channel.le.tx.mtu,
-	        data->channel.le.tx.mps,
-	        (int)atomic_get(&data->channel.le.tx.credits));
-
-	/* HACK: If no credits, grant ourselves some to test sending */
+	/* Wait briefly if the server hasn't granted TX credits yet */
 	if (atomic_get(&data->channel.le.tx.credits) == 0) {
-		LOG_WRN("No credits received! Forcing 10 credits for testing...");
-		atomic_set(&data->channel.le.tx.credits, 10);
+		LOG_WRN("No TX credits, waiting for server to grant...");
+		k_sleep(K_MSEC(100));
+		if (atomic_get(&data->channel.le.tx.credits) == 0) {
+			LOG_ERR("TX credit timeout — server not granting credits");
+			return -EAGAIN;
+		}
 	}
 
 	/* Allocate buffer */
@@ -1146,8 +1200,8 @@ static int l2cap_client_stop(struct ninep_transport *transport)
 	if (g_connecting_data == data) {
 		g_connecting_data = NULL;
 	}
-	if (g_active_data == data) {
-		g_active_data = NULL;
+	if (data->conn) {
+		conn_registry_remove(data->conn);
 	}
 
 	/* Disconnect L2CAP channel */

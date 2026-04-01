@@ -93,6 +93,27 @@ void ninep_client_free_fid(struct ninep_client *client, uint32_t fid)
 	k_mutex_unlock(&client->lock);
 }
 
+void ninep_client_dump_fids(struct ninep_client *client)
+{
+	k_mutex_lock(&client->lock, K_FOREVER);
+	int used = 0;
+	for (size_t i = 0; i < client->max_fids; i++) {
+		if (client->fids[i].in_use) {
+			used++;
+			LOG_INF("  fid[%zu]: fid=%u in_use", i, client->fids[i].fid);
+		}
+	}
+	LOG_INF("9P fids: %d/%zu used, next_fid=%u", used, client->max_fids,
+	        client->next_fid);
+	int tags_used = 0;
+	for (size_t i = 0; i < client->max_tags; i++) {
+		if (client->tags[i].in_use) tags_used++;
+	}
+	LOG_INF("9P tags: %d/%zu used, next_tag=%u", tags_used, client->max_tags,
+	        client->next_tag);
+	k_mutex_unlock(&client->lock);
+}
+
 static struct ninep_client_fid *find_fid_locked(struct ninep_client *client, uint32_t fid)
 {
 	for (size_t i = 0; i < client->max_fids; i++) {
@@ -565,7 +586,19 @@ fid_allocated:;
 
 	/* Send and wait — walk is stateful (allocates newfid), no retry */
 	int ret = send_and_wait(client, entry, len, 0);
-	if (ret < 0) {
+	if (ret == -ETIMEDOUT) {
+		LOG_ERR("Walk TIMEOUT: tag=%u fid=%u->%u nwname=%u first='%.*s'",
+		        entry->tag, fid, allocated_fid, nwname,
+		        nwname > 0 ? (int)wname_lens[0] : 0,
+		        nwname > 0 ? wnames[0] : "");
+		/* Free fid locally — server state is unknown but we can't
+		 * leak client-side fids on every timeout */
+		struct ninep_client_fid *cfid = find_fid_locked(client, allocated_fid);
+		if (cfid) cfid->in_use = false;
+		free_tag_locked(client, tag);
+		k_mutex_unlock(&client->lock);
+		return ret;
+	} else if (ret < 0) {
 		LOG_ERR("Walk request failed: %d", ret);
 		struct ninep_client_fid *cfid = find_fid_locked(client, allocated_fid);
 		if (cfid) cfid->in_use = false;
@@ -880,8 +913,8 @@ int ninep_client_remove(struct ninep_client *client, uint32_t fid)
 
 	/* Send and wait — remove is stateful, no retry */
 	int ret = send_and_wait(client, entry, len, 0);
-	if (ret == 0) {
-		/* Free FID on success */
+	/* Free FID regardless — remove consumes the fid even on error */
+	{
 		struct ninep_client_fid *cfid = find_fid_locked(client, fid);
 		if (cfid) cfid->in_use = false;
 	}
@@ -915,8 +948,9 @@ int ninep_client_clunk(struct ninep_client *client, uint32_t fid)
 
 	/* Send and wait — clunk is stateful, no retry */
 	int ret = send_and_wait(client, entry, len, 0);
-	if (ret == 0) {
-		/* Free FID on success */
+	/* Free FID regardless of outcome — on timeout the server state is
+	 * unknown, but leaking client fids guarantees eventual exhaustion */
+	{
 		struct ninep_client_fid *cfid = find_fid_locked(client, fid);
 		if (cfid) cfid->in_use = false;
 	}

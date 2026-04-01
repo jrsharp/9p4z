@@ -321,6 +321,11 @@ int ninep_client_alloc_fid(struct ninep_client *client, uint32_t *fid);
  */
 void ninep_client_free_fid(struct ninep_client *client, uint32_t fid);
 
+/**
+ * @brief Dump fid and tag usage to log (diagnostic)
+ */
+void ninep_client_dump_fids(struct ninep_client *client);
+
 /** @} */
 
 #ifdef __cplusplus
