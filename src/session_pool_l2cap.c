@@ -24,8 +24,8 @@
 
 LOG_MODULE_REGISTER(ninep_session_pool_l2cap, CONFIG_NINEP_LOG_LEVEL);
 
-/* TX buffer pool for L2CAP SDUs — one per concurrent session + headroom */
-#define TX_BUF_COUNT 4
+/* TX buffer pool for L2CAP SDUs — generous to survive transient TX stalls */
+#define TX_BUF_COUNT 8
 #define TX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_MAX_MESSAGE_SIZE)
 NET_BUF_POOL_DEFINE(l2cap_session_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
                     CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
@@ -319,7 +319,7 @@ static int l2cap_session_send(struct ninep_transport *transport, const uint8_t *
 	msg_buf = net_buf_alloc(&l2cap_session_tx_pool, K_MSEC(5000));
 	if (!msg_buf) {
 		LOG_ERR("TX buffer alloc timeout (all %d bufs in flight)", TX_BUF_COUNT);
-		return -ENOMEM;
+		return -EAGAIN;
 	}
 	/* Reserve L2CAP SDU headroom */
 	net_buf_reserve(msg_buf, BT_L2CAP_SDU_CHAN_SEND_RESERVE);
