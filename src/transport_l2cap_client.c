@@ -127,6 +127,11 @@ struct l2cap_client_chan {
 };
 
 /* Transport private data */
+/* Max per-transport cache of devices that have been inspected and found
+ * to not match required_features (e.g. a data crystal showing up while
+ * scanning for a keyboard).  Reset by l2cap_client_clear_rejected(). */
+#define L2CAP_CLIENT_MAX_REJECTED 8
+
 struct l2cap_client_data {
 	struct l2cap_client_chan channel;
 	struct bt_conn *conn;
@@ -145,6 +150,12 @@ struct l2cap_client_data {
 	uint16_t service_uuid16;       /* fallback 16-bit UUID */
 	ninep_l2cap_client_state_cb_t state_cb;
 	void *state_cb_user_data;      /* user_data for state callback (preserved from init) */
+
+	/* Session-lifetime blacklist of devices we connected to and learned
+	 * did not match required_features.  Prevents re-thrashing the same
+	 * non-keyboard 9PIS peripheral. */
+	bt_addr_le_t rejected_addrs[L2CAP_CLIENT_MAX_REJECTED];
+	int rejected_count;
 
 	/* 9PIS GATT discovery (requires CONFIG_BT_GATT_CLIENT) */
 	bool discover_9pis;            /* true to read PSM from 9PIS GATT */
@@ -198,6 +209,39 @@ static void set_state(struct l2cap_client_data *data,
 static int start_scan(struct l2cap_client_data *data);
 static int connect_to_device(struct l2cap_client_data *data,
                              const bt_addr_le_t *addr);
+
+/* Rejected-address helpers — see rejected_addrs in l2cap_client_data.
+ * Used to keep the scan callback from re-targeting a device we already
+ * learned is the wrong type of 9PIS peripheral. */
+static bool rejected_contains(const struct l2cap_client_data *data,
+                              const bt_addr_le_t *addr)
+{
+	for (int i = 0; i < data->rejected_count; i++) {
+		if (bt_addr_le_cmp(&data->rejected_addrs[i], addr) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void rejected_add(struct l2cap_client_data *data,
+                         const bt_addr_le_t *addr)
+{
+	if (!addr || rejected_contains(data, addr)) {
+		return;
+	}
+	if (data->rejected_count < L2CAP_CLIENT_MAX_REJECTED) {
+		bt_addr_le_copy(&data->rejected_addrs[data->rejected_count++], addr);
+	} else {
+		/* Ring-buffer: drop the oldest entry to make room */
+		for (int i = 1; i < L2CAP_CLIENT_MAX_REJECTED; i++) {
+			bt_addr_le_copy(&data->rejected_addrs[i - 1],
+					&data->rejected_addrs[i]);
+		}
+		bt_addr_le_copy(&data->rejected_addrs[L2CAP_CLIENT_MAX_REJECTED - 1],
+				addr);
+	}
+}
 
 /* L2CAP channel callbacks */
 static void l2cap_connected(struct bt_l2cap_chan *chan)
@@ -451,6 +495,16 @@ static uint8_t features_read_cb(struct bt_conn *conn, uint8_t err,
 		if (strstr(client_data->features_buf, client_data->required_features) == NULL) {
 			LOG_WRN("Device features '%s' don't include required '%s' - disconnecting",
 				client_data->features_buf, client_data->required_features);
+			/* Remember this address so scan_cb skips it next time —
+			 * otherwise the next scan cycle will rediscover the same
+			 * peripheral and we'll keep thrashing it. */
+			const bt_addr_le_t *bad_addr = bt_conn_get_dst(client_data->conn);
+			if (bad_addr) {
+				char bad_str[BT_ADDR_LE_STR_LEN];
+				bt_addr_le_to_str(bad_addr, bad_str, sizeof(bad_str));
+				LOG_INF("Blacklisting %s for this session", bad_str);
+				rejected_add(client_data, bad_addr);
+			}
 			/* Disconnect and resume scanning */
 			bt_conn_disconnect(client_data->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 			return BT_GATT_ITER_STOP;
@@ -938,9 +992,16 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 
 	bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
 
-	/* Only process connectable advertisements */
+	/* Accept connectable advertisements AND scan responses.
+	 * A common advertising pattern is for a device to publish only
+	 * short identifying data (name, flags, tx power) in the primary
+	 * ADV_IND packet to stay under 31 bytes, and put larger payload
+	 * (like a 128-bit service UUID) in the SCAN_RSP that follows an
+	 * active scan request.  If we only look at ADV_IND packets we
+	 * miss those peers entirely. */
 	if (type != BT_GAP_ADV_TYPE_ADV_IND &&
-	    type != BT_GAP_ADV_TYPE_ADV_DIRECT_IND) {
+	    type != BT_GAP_ADV_TYPE_ADV_DIRECT_IND &&
+	    type != BT_GAP_ADV_TYPE_SCAN_RSP) {
 		return;
 	}
 
@@ -964,7 +1025,7 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			/* Check each 128-bit UUID in the list */
 			for (int i = 0; i + 15 < len; i += 16) {
 				if (memcmp(&ad->data[i], data->service_uuid128, 16) == 0) {
-					LOG_INF("Found 9PIS service at %s", addr_str);
+					LOG_DBG("9PIS advert from %s", addr_str);
 					found = true;
 					break;
 				}
@@ -978,7 +1039,7 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			for (int i = 0; i + 1 < len; i += 2) {
 				uint16_t uuid = sys_get_le16(&ad->data[i]);
 				if (uuid == data->service_uuid16) {
-					LOG_INF("Found service 0x%04x at %s",
+					LOG_DBG("Service 0x%04x advert from %s",
 					        uuid, addr_str);
 					found = true;
 					break;
@@ -1006,6 +1067,14 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			LOG_INF("Found paired device %s", addr_str);
 		}
 
+		/* Skip devices we've already inspected and found to not match
+		 * required_features (e.g. a data crystal when scanning for a
+		 * keyboard).  Cleared by l2cap_client_clear_rejected(). */
+		if (rejected_contains(data, addr)) {
+			LOG_DBG("Skipping %s (previously rejected)", addr_str);
+			return;
+		}
+
 		/* Check if we're already connected to this device */
 		struct bt_conn *existing = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr);
 		if (existing) {
@@ -1013,6 +1082,8 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			bt_conn_unref(existing);
 			return;  /* Continue scanning for other devices */
 		}
+
+		LOG_INF("Found 9PIS candidate at %s, initiating connect", addr_str);
 
 		/* Mark that we found the target - the work handler will stop scan.
 		 * Don't call bt_le_scan_stop() from scan callback context as it
@@ -1432,5 +1503,21 @@ int ninep_transport_l2cap_client_set_accept_list(struct ninep_transport *transpo
 	data->use_accept_list = enable;
 	LOG_INF("Accept list scanning %s", enable ? "enabled" : "disabled");
 
+	return 0;
+}
+
+int ninep_transport_l2cap_client_clear_rejected(struct ninep_transport *transport)
+{
+	struct l2cap_client_data *data;
+
+	if (!transport || !transport->priv_data) {
+		return -EINVAL;
+	}
+
+	data = transport->priv_data;
+	int cleared = data->rejected_count;
+	data->rejected_count = 0;
+	memset(data->rejected_addrs, 0, sizeof(data->rejected_addrs));
+	LOG_INF("Cleared %d rejected device(s) from blacklist", cleared);
 	return 0;
 }

@@ -164,6 +164,20 @@ int ninep_transport_l2cap_client_set_filter(struct ninep_transport *transport,
 int ninep_transport_l2cap_client_set_accept_list(struct ninep_transport *transport,
 						 bool enable);
 
+/**
+ * @brief Clear the in-session blacklist of rejected peripherals
+ *
+ * When `required_features` is configured and the client connects to a
+ * 9PIS peripheral that does not advertise those features, the address
+ * is cached so scan_cb will skip it for the remainder of the session.
+ * Call this function to forget those rejections — e.g. when the user
+ * asks for a rescan from the shell.
+ *
+ * @param transport Transport instance
+ * @return 0 on success, negative error code on failure
+ */
+int ninep_transport_l2cap_client_clear_rejected(struct ninep_transport *transport);
+
 /** @} */
 
 #ifdef __cplusplus
