@@ -130,7 +130,7 @@ struct l2cap_client_chan {
 /* Max per-transport cache of devices that have been inspected and found
  * to not match required_features (e.g. a data crystal showing up while
  * scanning for a keyboard).  Reset by l2cap_client_clear_rejected(). */
-#define L2CAP_CLIENT_MAX_REJECTED 8
+#define L2CAP_CLIENT_MAX_REJECTED 4
 
 struct l2cap_client_data {
 	struct l2cap_client_chan channel;

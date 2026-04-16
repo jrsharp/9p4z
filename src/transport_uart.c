@@ -102,6 +102,8 @@ static void uart_polling_thread_fn(void *arg1, void *arg2, void *arg3)
 		/* Poll for received data */
 		int ret = uart_poll_in(data->uart_dev, &byte);
 		if (ret == 0) {
+			LOG_DBG("RX byte: 0x%02x (offset=%zu)",
+				byte, data->rx_offset);
 			/* Process received byte (same logic as IRQ handler) */
 			if (data->rx_offset < data->rx_buf_size) {
 				data->rx_buf[data->rx_offset++] = byte;
@@ -119,8 +121,12 @@ static void uart_polling_thread_fn(void *arg1, void *arg2, void *arg3)
 				if (ninep_parse_header(data->rx_buf, data->rx_offset, &hdr) == 0) {
 					data->expected_size = hdr.size;
 					data->header_received = true;
+					LOG_DBG("UART RX header: size=%u type=%u tag=%u",
+						hdr.size, hdr.type, hdr.tag);
 				} else {
 					/* Invalid header - reset */
+					LOG_WRN("UART RX invalid header after %zu bytes",
+						data->rx_offset);
 					data->rx_offset = 0;
 					continue;
 				}
@@ -128,6 +134,7 @@ static void uart_polling_thread_fn(void *arg1, void *arg2, void *arg3)
 
 			/* Check if complete message received */
 			if (data->header_received && data->rx_offset >= data->expected_size) {
+				LOG_DBG("UART RX %zu bytes", data->rx_offset);
 				if (transport->recv_cb) {
 					transport->recv_cb(transport, data->rx_buf,
 					                  data->rx_offset,
@@ -155,6 +162,8 @@ static int uart_send(struct ninep_transport *transport, const uint8_t *buf,
 	if (!data || !data->uart_dev) {
 		return -EINVAL;
 	}
+
+	LOG_DBG("UART TX %zu bytes", len);
 
 	/* Send data via UART polling mode */
 	for (size_t i = 0; i < len; i++) {
