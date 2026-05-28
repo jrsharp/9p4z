@@ -7,6 +7,7 @@
 #define ZEPHYR_INCLUDE_9P_UNION_FS_H_
 
 #include <zephyr/9p/server.h>
+#include <zephyr/kernel.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -63,6 +64,12 @@ struct ninep_union_fs {
 	/* Node ownership tracking (for non-root nodes) - LRU cache */
 	struct ninep_node_owner node_owners[256];  /* LRU cache for multi-client usage (4 clients × ~64 fids) */
 	size_t num_node_owners;
+
+	/* Protects node_owners[] and num_node_owners against concurrent
+	 * register/unregister/incref/decref/find from multiple per-session
+	 * threads. Held only inside the static tracking helpers; never held
+	 * across calls into backend fs_ops. */
+	struct k_mutex track_lock;
 };
 
 /**

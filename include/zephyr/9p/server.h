@@ -173,6 +173,31 @@ struct ninep_fs_ops {
 	 * @return 0 on success, negative error code on failure
 	 */
 	int (*clunk)(struct ninep_fs_node *node, void *fs_ctx);
+
+	/**
+	 * @brief Resolve a node to its policy-relevant path
+	 *
+	 * Used by the server to feed `auth_config->check_perm(identity, path,
+	 * mode)` at the start of access-mutating operations (Topen for write,
+	 * Tcreate, Tremove). The path string only needs to be precise enough
+	 * for the application's permission policy to decide — for prefix-based
+	 * policies the top-level directory is sufficient (e.g. "/admin",
+	 * "/etc/boardname", "/rooms/lobby"). NUL-terminated.
+	 *
+	 * OPTIONAL: a filesystem may set this to NULL, in which case the
+	 * server skips check_perm for that fs (permissions are then the
+	 * responsibility of the filesystem's own handlers). New deployments
+	 * should implement it.
+	 *
+	 * @param node Node to describe
+	 * @param buf Output buffer
+	 * @param buf_size Size of output buffer (recommend NINEP_MAX_PATH)
+	 * @param fs_ctx Filesystem context
+	 * @return Number of bytes written (excluding NUL) on success;
+	 *         negative error on failure.
+	 */
+	int (*get_path)(struct ninep_fs_node *node, char *buf, size_t buf_size,
+	                void *fs_ctx);
 };
 
 /**
@@ -280,6 +305,9 @@ struct ninep_server_fid {
 	uint8_t auth_idx;     /**< Index into auth pool, or NINEP_POOL_NONE */
 	bool in_use;
 	bool is_auth_fid;     /**< True if this is an auth fid from Tauth */
+	bool authenticated;   /**< True if Tattach used a verified afid (uname
+	                       *   is then a CGA validated via P-256 over a
+	                       *   challenge); false if uname was merely claimed */
 };
 
 /**

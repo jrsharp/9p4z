@@ -179,6 +179,82 @@ static void send_error(struct ninep_server *server, uint16_t tag, const char *er
 	}
 }
 
+/*
+ * Resolve the identity to surface to fs_ops / check_perm callbacks.
+ *
+ * For a fid that completed Tauth challenge-response (sfid->authenticated
+ * is true), this returns the verified uname — which per the spec IS the
+ * client's CGA, cryptographically proven via verify_auth(). For any other
+ * fid (unauthenticated Tattach), this returns "" so application-level
+ * admin checks can't be spoofed by a client claiming any uname they like.
+ *
+ * Application handlers that take a const char *uname argument should
+ * receive the result of this function, not the raw interned uname.
+ */
+static const char *fid_identity(struct ninep_server *server,
+                                 struct ninep_server_fid *sfid)
+{
+	if (!sfid || !sfid->authenticated ||
+	    sfid->uname_idx == NINEP_POOL_NONE) {
+		return "";
+	}
+	return uname_get(server, sfid->uname_idx);
+}
+
+/*
+ * Per-operation permission check.
+ *
+ * Calls auth_config->check_perm(identity, path, mode) if all the
+ * required pieces are wired (callback set + fs_ops->get_path set on the
+ * fs serving the node). If any piece is missing, allows the operation —
+ * matches the Phase 1 "auth optional" behavior in CGA_AUTH_SPEC.md.
+ *
+ * Identity is the per-fid uname (interned). For a fid attached via a
+ * verified afid this is the validated CGA. For an unauthenticated
+ * Tattach it's whatever the client claimed, which aetherd's check_perm
+ * treats as a guest unless the uname matches a known CGA.
+ *
+ * Returns 0 if allowed (or no policy configured), -EPERM if denied. On
+ * denial, sends an Rerror to the client; callers should just return.
+ */
+static int check_perm_or_deny(struct ninep_server *server, uint16_t tag,
+                               struct ninep_server_fid *sfid, uint8_t mode)
+{
+	const struct ninep_auth_config *auth = server->config.auth_config;
+	if (!auth || !auth->check_perm) {
+		return 0;
+	}
+	const struct ninep_fs_ops *ops = server->config.fs_ops;
+	if (!ops || !ops->get_path) {
+		/* Filesystem can't describe paths — can't enforce policy. */
+		return 0;
+	}
+
+	char path[256];
+	int n = ops->get_path(sfid->node, path, sizeof(path),
+	                       server->config.fs_ctx);
+	if (n < 0) {
+		/* Filesystem couldn't resolve the path. Fail closed when a
+		 * policy IS configured — better than silently allowing. */
+		LOG_WRN("check_perm: get_path failed (%d), denying", n);
+		send_error(server, tag, "permission denied");
+		return -EPERM;
+	}
+
+	/* Pass the verified identity, or empty string for unauthenticated
+	 * sessions. Matches the spec's intent that uname is the *validated*
+	 * CGA, not a self-claimed string. */
+	const char *uname = fid_identity(server, sfid);
+	int ret = auth->check_perm(uname, path, mode, auth->auth_ctx);
+	if (ret < 0) {
+		LOG_DBG("check_perm denied: uname='%s' path='%s' mode=0x%02x",
+		        uname ? uname : "(null)", path, mode);
+		send_error(server, tag, "permission denied");
+		return -EPERM;
+	}
+	return 0;
+}
+
 /* Handle Tversion */
 static void handle_tversion(struct ninep_server *server, const uint8_t *msg, size_t len)
 {
@@ -330,7 +406,15 @@ static void handle_tattach(struct ninep_server *server, uint16_t tag,
 	/* Intern uname in pool */
 	sfid->uname_idx = uname_intern(server, uname, uname_len);
 
-	LOG_INF("Tattach: fid=%u, uname='%s'", fid, uname_get(server, sfid->uname_idx));
+	/* Mark this fid's identity as verified if (and only if) the attach
+	 * went through a valid Tauth challenge-response. When auth_cfg->required
+	 * is false and the client doesn't present an afid, the uname is just
+	 * a claim — the per-op check_perm should treat it as "guest". */
+	sfid->authenticated = (afid != NINEP_NOFID);
+
+	LOG_INF("Tattach: fid=%u, uname='%s'%s", fid,
+	        uname_get(server, sfid->uname_idx),
+	        sfid->authenticated ? " [authenticated]" : "");
 
 	/* Get root node */
 	sfid->node = server->config.fs_ops->get_root(server->config.fs_ctx);
@@ -452,6 +536,8 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 			new_sfid->uname_idx = sfid->uname_idx;
 			server->uname_refcount[sfid->uname_idx]++;
 		}
+		/* Inherit authentication status from the parent fid */
+		new_sfid->authenticated = sfid->authenticated;
 
 		/* Send Rwalk with 0 qids */
 		int ret = ninep_build_rwalk(server->tx_buf, server->tx_buf_size,
@@ -541,6 +627,8 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 		new_sfid->uname_idx = sfid->uname_idx;
 		server->uname_refcount[sfid->uname_idx]++;
 	}
+	/* Inherit authentication status from the parent fid */
+	new_sfid->authenticated = sfid->authenticated;
 
 	/* Send Rwalk with actual walked count (per 9P2000 spec) */
 	int ret = ninep_build_rwalk(server->tx_buf, server->tx_buf_size,
@@ -563,6 +651,11 @@ static void handle_topen(struct ninep_server *server, uint16_t tag,
 
 	if (!sfid || !sfid->node) {
 		send_error(server, tag, "unknown fid");
+		return;
+	}
+
+	/* Per-operation permission check. Sends Rerror itself on denial. */
+	if (check_perm_or_deny(server, tag, sfid, mode) < 0) {
 		return;
 	}
 
@@ -671,7 +764,7 @@ static void handle_tread(struct ninep_server *server, uint16_t tag,
 	/* Read data directly into tx_buf at offset 11 */
 	int bytes = server->config.fs_ops->read(sfid->node, offset,
 	                                          &server->tx_buf[11], count,
-	                                          uname_get(server, sfid->uname_idx),
+	                                          fid_identity(server, sfid),
 	                                          server->config.fs_ctx);
 	if (bytes < 0) {
 		send_error(server, tag, "read failed");
@@ -871,9 +964,15 @@ static void handle_tcreate(struct ninep_server *server, uint16_t tag,
 		return;
 	}
 
+	/* Permission check: creating a child in the parent dir requires
+	 * write permission on the parent's path. */
+	if (check_perm_or_deny(server, tag, sfid, NINEP_OWRITE) < 0) {
+		return;
+	}
+
 	/* Create new file/directory */
 	struct ninep_fs_node *new_node = NULL;
-	const char *uname = uname_get(server, sfid->uname_idx);
+	const char *uname = fid_identity(server, sfid);
 	int ret = server->config.fs_ops->create(
 		sfid->node, name, name_len, perm, mode, uname, &new_node, server->config.fs_ctx);
 
@@ -1027,7 +1126,7 @@ static void handle_twrite(struct ninep_server *server, uint16_t tag,
 	}
 
 	/* Write data */
-	const char *uname = uname_get(server, sfid->uname_idx);
+	const char *uname = fid_identity(server, sfid);
 	int bytes = server->config.fs_ops->write(sfid->node, offset, data, count,
 	                                           uname, server->config.fs_ctx);
 	if (bytes < 0) {
@@ -1062,6 +1161,11 @@ static void handle_tremove(struct ninep_server *server, uint16_t tag,
 	/* Check if filesystem supports remove */
 	if (!server->config.fs_ops->remove) {
 		send_error(server, tag, "remove not supported");
+		return;
+	}
+
+	/* Permission check: removing requires write permission on the path. */
+	if (check_perm_or_deny(server, tag, sfid, NINEP_OWRITE) < 0) {
 		return;
 	}
 

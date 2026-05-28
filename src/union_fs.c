@@ -120,6 +120,7 @@ static const char *get_relative_path(const char *path, const char *mount_path)
 static void unregister_node_owner(struct ninep_union_fs *fs,
                                    struct ninep_fs_node *node)
 {
+	k_mutex_lock(&fs->track_lock, K_FOREVER);
 	/* Find and remove the node from tracking */
 	for (size_t i = 0; i < fs->num_node_owners; i++) {
 		if (fs->node_owners[i].node == node) {
@@ -131,28 +132,34 @@ static void unregister_node_owner(struct ninep_union_fs *fs,
 				fs->node_owners[j] = fs->node_owners[j + 1];
 			}
 			fs->num_node_owners--;
+			k_mutex_unlock(&fs->track_lock);
 			return;
 		}
 	}
+	k_mutex_unlock(&fs->track_lock);
 }
 
 static void incref_node(struct ninep_union_fs *fs, struct ninep_fs_node *node)
 {
+	k_mutex_lock(&fs->track_lock, K_FOREVER);
 	/* Find the node in tracking table and increment refcount */
 	for (size_t i = 0; i < fs->num_node_owners; i++) {
 		if (fs->node_owners[i].node == node) {
 			fs->node_owners[i].refcount++;
 			LOG_DBG("incref: node=%p name='%s' refcount=%u",
 			        node, node->name, fs->node_owners[i].refcount);
+			k_mutex_unlock(&fs->track_lock);
 			return;
 		}
 	}
+	k_mutex_unlock(&fs->track_lock);
 	LOG_DBG("incref: node=%p name='%s' not in tracking table (mount root or union root)",
 	        node, node->name);
 }
 
 static void decref_node(struct ninep_union_fs *fs, struct ninep_fs_node *node)
 {
+	k_mutex_lock(&fs->track_lock, K_FOREVER);
 	/* Find the node in tracking table and decrement refcount */
 	for (size_t i = 0; i < fs->num_node_owners; i++) {
 		if (fs->node_owners[i].node == node) {
@@ -164,9 +171,11 @@ static void decref_node(struct ninep_union_fs *fs, struct ninep_fs_node *node)
 				LOG_WRN("decref: node=%p name='%s' already has refcount=0!",
 				        node, node->name);
 			}
+			k_mutex_unlock(&fs->track_lock);
 			return;
 		}
 	}
+	k_mutex_unlock(&fs->track_lock);
 	LOG_DBG("decref: node=%p name='%s' not in tracking table (mount root or union root)",
 	        node, node->name);
 }
@@ -176,6 +185,9 @@ static bool register_node_owner(struct ninep_union_fs *fs,
                                  struct ninep_union_mount *mount)
 {
 	uint32_t now = k_uptime_get_32();
+	bool result;
+
+	k_mutex_lock(&fs->track_lock, K_FOREVER);
 
 	/* Check if already registered */
 	for (size_t i = 0; i < fs->num_node_owners; i++) {
@@ -202,7 +214,8 @@ static bool register_node_owner(struct ninep_union_fs *fs,
 				LOG_DBG("Re-registered node=%p name='%s', refcount=%u (unchanged)",
 				        node, node->name, fs->node_owners[i].refcount);
 			}
-			return true;
+			result = true;
+			goto out;
 		}
 	}
 
@@ -215,7 +228,8 @@ static bool register_node_owner(struct ninep_union_fs *fs,
 		fs->num_node_owners++;
 		LOG_DBG("Registered node=%p name='%s' -> mount '%s' (total=%zu, refcount=1)",
 		        node, node->name, mount->path, fs->num_node_owners);
-		return true;
+		result = true;
+		goto out;
 	}
 
 	/* Table is full - evict LRU entry
@@ -272,7 +286,8 @@ static bool register_node_owner(struct ninep_union_fs *fs,
 			        now - fs->node_owners[i].last_access);
 		}
 
-		return false;
+		result = false;
+		goto out;
 	}
 
 	LOG_INF("Node table full (%zu entries) - evicting LRU entry: node=%p name='%s' (age=%u ms, refcount=%u)",
@@ -287,7 +302,11 @@ static bool register_node_owner(struct ninep_union_fs *fs,
 	fs->node_owners[lru_idx].mount = mount;
 	fs->node_owners[lru_idx].last_access = now;
 	fs->node_owners[lru_idx].refcount = 1;  /* Start at 1 since walk created a fid */
-	return true;
+	result = true;
+
+out:
+	k_mutex_unlock(&fs->track_lock);
+	return result;
 }
 
 static struct ninep_union_mount *find_node_owner(struct ninep_union_fs *fs,
@@ -307,16 +326,21 @@ static struct ninep_union_mount *find_node_owner(struct ninep_union_fs *fs,
 		return NULL;
 	}
 
-	/* First check the ownership tracking table */
+	/* First check the ownership tracking table. fs->mounts[] and fs->root
+	 * are init-time-only and don't need the lock; the tracking table
+	 * (node_owners[] / num_node_owners) is mutated concurrently and does. */
+	k_mutex_lock(&fs->track_lock, K_FOREVER);
 	for (size_t i = 0; i < fs->num_node_owners; i++) {
 		if (fs->node_owners[i].node == node) {
 			/* Update access timestamp (LRU touch) */
 			fs->node_owners[i].last_access = k_uptime_get_32();
-			LOG_DBG("  Found in tracking table -> mount '%s'",
-			        fs->node_owners[i].mount->path);
-			return fs->node_owners[i].mount;
+			struct ninep_union_mount *m = fs->node_owners[i].mount;
+			k_mutex_unlock(&fs->track_lock);
+			LOG_DBG("  Found in tracking table -> mount '%s'", m->path);
+			return m;
 		}
 	}
+	k_mutex_unlock(&fs->track_lock);
 
 	/* Check each mount to see if this node is a mount root */
 	for (size_t i = 0; i < fs->num_mounts; i++) {
@@ -1051,6 +1075,82 @@ static int union_clunk(struct ninep_fs_node *node, void *fs_ctx)
 	return 0;
 }
 
+/*
+ * Resolve a node to its policy-relevant path by delegating to the owning
+ * mount's get_path (and prefixing with the mount's path).
+ *
+ * Returns:
+ *   - n > 0  : bytes written (excluding NUL)
+ *   - -ENOSYS: owning mount doesn't implement get_path (server treats as
+ *              "no check_perm available" for this op)
+ *   - -ENOENT: node not tracked / has no known mount
+ *   - -ENAMETOOLONG: result didn't fit in buf
+ *
+ * The mount root case ("/" union root, or a node that IS a mount's root)
+ * returns the mount's path verbatim.
+ */
+static int union_get_path(struct ninep_fs_node *node, char *buf,
+                           size_t buf_size, void *fs_ctx)
+{
+	struct ninep_union_fs *fs = (struct ninep_union_fs *)fs_ctx;
+	if (!node || !buf || buf_size < 2) {
+		return -EINVAL;
+	}
+
+	/* Union root has no path of its own. */
+	if (node == fs->root) {
+		if (buf_size < 2) return -ENAMETOOLONG;
+		buf[0] = '/'; buf[1] = '\0';
+		return 1;
+	}
+
+	/* Synthetic intermediate directories (e.g., "/portals" when only deeper
+	 * paths like "/portals/peer" are mounted) live inside union_fs itself
+	 * and don't have an owning backend. The path is stored in node->data
+	 * by the union_fs walk code. Return it verbatim. */
+	if (IS_SYNTHETIC_DIR(fs, node) && node->data) {
+		int n = snprintf(buf, buf_size, "%s", (const char *)node->data);
+		if (n < 0 || (size_t)n >= buf_size) return -ENAMETOOLONG;
+		return n;
+	}
+
+	/* Find owning mount via the tracking table. */
+	struct ninep_union_mount *mount = find_node_owner(fs, node);
+	if (!mount) {
+		return -ENOENT;
+	}
+
+	/* If the backend implements get_path, ask it. We prepend the mount's
+	 * path so policy decisions see the full namespace position. */
+	if (mount->fs_ops && mount->fs_ops->get_path) {
+		char sub[256];
+		int n = mount->fs_ops->get_path(node, sub, sizeof(sub),
+		                                 mount->fs_ctx);
+		if (n < 0) return n;
+
+		/* Mount path is something like "/" or "/qwk". Combine. */
+		const char *mp = mount->path ? mount->path : "/";
+		int total;
+		if (strcmp(mp, "/") == 0) {
+			total = snprintf(buf, buf_size, "%s", sub);
+		} else if (sub[0] == '/' && sub[1] == '\0') {
+			total = snprintf(buf, buf_size, "%s", mp);
+		} else {
+			total = snprintf(buf, buf_size, "%s%s", mp, sub);
+		}
+		if (total < 0 || (size_t)total >= buf_size) {
+			return -ENAMETOOLONG;
+		}
+		return total;
+	}
+
+	/* Backend has no get_path — best we can do is return the mount path. */
+	const char *mp = mount->path ? mount->path : "/";
+	int n = snprintf(buf, buf_size, "%s", mp);
+	if (n < 0 || (size_t)n >= buf_size) return -ENAMETOOLONG;
+	return n;
+}
+
 /* Union filesystem operations table */
 static const struct ninep_fs_ops union_fs_ops = {
 	.get_root = union_get_root,
@@ -1062,6 +1162,7 @@ static const struct ninep_fs_ops union_fs_ops = {
 	.create = union_create,
 	.remove = union_remove,
 	.clunk = union_clunk,
+	.get_path = union_get_path,
 };
 
 /* Public API */
@@ -1079,6 +1180,7 @@ int ninep_union_fs_init(struct ninep_union_fs *fs,
 	fs->max_mounts = max_mounts;
 	fs->num_mounts = 0;
 	fs->next_qid_path = 1;
+	k_mutex_init(&fs->track_lock);
 
 	/* Create synthetic root node */
 	fs->root = k_malloc(sizeof(struct ninep_fs_node));
