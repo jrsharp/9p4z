@@ -313,6 +313,8 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 #endif
 	struct ninep_transport *transport = ch->transport;
 
+	LOG_DBG("rx %u bytes (state=%d rx_len=%u exp=%u)",
+	        buf->len, ch->rx_state, ch->rx_len, ch->rx_expected);
 	LOG_INF("L2CAP[%04x] recv: %u bytes", ch->le.tx.cid, buf->len);
 
 	/* Process all data in the buffer */
@@ -337,6 +339,8 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 
 				/* Validate size */
 				if (ch->rx_expected < 7 || ch->rx_expected > ch->rx_buf_size) {
+					LOG_DBG("REJECT size=%u max=%zu",
+					        ch->rx_expected, ch->rx_buf_size);
 					LOG_ERR("Invalid message size: %u (max: %zu)",
 					        ch->rx_expected, ch->rx_buf_size);
 					ch->rx_len = 0;
@@ -358,6 +362,8 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 
 			if (ch->rx_len == ch->rx_expected) {
 				/* Complete message received */
+				LOG_DBG("deliver %u bytes type=%u",
+				        ch->rx_len, ch->rx_buf[4]);
 				LOG_DBG("Complete message received: %u bytes (type=%u)",
 				        ch->rx_len, ch->rx_buf[4]);
 
