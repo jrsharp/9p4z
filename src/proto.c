@@ -42,8 +42,19 @@ int ninep_parse_header(const uint8_t *buf, size_t len,
 	hdr->type = GET_U8(buf + 4);
 	hdr->tag = GET_U16(buf + 5);
 
-	/* Validate message size */
-	if (hdr->size < 7 || hdr->size > CONFIG_NINEP_MAX_MESSAGE_SIZE) {
+	/* Sanity-check the size field — do NOT compare against
+	 * CONFIG_NINEP_MAX_MESSAGE_SIZE.  That knob sizes the embedded
+	 * fallback buffers in struct ninep_client, but a connection
+	 * using external pools (struct ninep_client_pools) can negotiate
+	 * a larger msize than the embedded fallback.  Rejecting headers
+	 * above the fallback size makes any pool-using transport (e.g.
+	 * conn_tcp + transport_tcp_client over WiFi, where the embedded
+	 * fallback stays at 245 for L2CAP compatibility while pools
+	 * carry the real 2-8 KB msize) desync the moment a reply bigger
+	 * than the fallback arrives.  Per-connection size limits belong
+	 * in the caller; here we only sanity-check against an absurd
+	 * value (64 KB is the practical 9P2000 frame ceiling). */
+	if (hdr->size < 7 || hdr->size > 65536) {
 		return -EINVAL;
 	}
 
