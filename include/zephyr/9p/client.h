@@ -326,6 +326,21 @@ void ninep_client_free_fid(struct ninep_client *client, uint32_t fid);
  */
 void ninep_client_dump_fids(struct ninep_client *client);
 
+/**
+ * @brief Fid / tag pool statistics
+ *
+ * Snapshot the per-client fid and tag counts so callers (e.g.,
+ * /dev/stats/9p) can surface them.  Any out-parameter may be NULL.
+ */
+struct ninep_client_stats {
+	uint32_t fids_used;
+	uint32_t fids_max;
+	uint32_t tags_used;
+	uint32_t tags_max;
+};
+void ninep_client_get_stats(struct ninep_client *client,
+			    struct ninep_client_stats *out);
+
 /** @} */
 
 #ifdef __cplusplus

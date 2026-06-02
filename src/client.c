@@ -114,6 +114,28 @@ void ninep_client_dump_fids(struct ninep_client *client)
 	k_mutex_unlock(&client->lock);
 }
 
+void ninep_client_get_stats(struct ninep_client *client,
+			    struct ninep_client_stats *out)
+{
+	if (!out) return;
+	out->fids_used = 0;
+	out->fids_max  = 0;
+	out->tags_used = 0;
+	out->tags_max  = 0;
+	if (!client) return;
+
+	k_mutex_lock(&client->lock, K_FOREVER);
+	for (size_t i = 0; i < client->max_fids; i++) {
+		if (client->fids[i].in_use) out->fids_used++;
+	}
+	out->fids_max = (uint32_t)client->max_fids;
+	for (size_t i = 0; i < client->max_tags; i++) {
+		if (client->tags[i].in_use) out->tags_used++;
+	}
+	out->tags_max = (uint32_t)client->max_tags;
+	k_mutex_unlock(&client->lock);
+}
+
 static struct ninep_client_fid *find_fid_locked(struct ninep_client *client, uint32_t fid)
 {
 	for (size_t i = 0; i < client->max_fids; i++) {
