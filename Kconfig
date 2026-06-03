@@ -136,6 +136,29 @@ config NINEP_UART_POLLING_MODE
 
 endif # NINEP_TRANSPORT_UART
 
+config NINEP_SESSION_POOL_UART
+	bool "DTR-gated session pool for UART / USB CDC-ACM"
+	depends on NINEP_SERVER && SERIAL && UART_INTERRUPT_DRIVEN && UART_LINE_CTRL
+	help
+	  Multi-client-style 9P session pool over a UART / USB CDC-ACM byte
+	  stream. Uses the CDC-ACM DTR modem line as a connect/disconnect signal
+	  (host opens the port -> DTR asserts; host closes -> DTR deasserts),
+	  allocating a fresh session (RX state + fid namespace) on each rising
+	  edge and freeing it on each falling edge. This avoids the wedge a
+	  single long-lived server hits when a stream client reconnects. The
+	  same fs_ops can be shared with NINEP_TRANSPORT_L2CAP's session pool
+	  for a multi-transport re-export server.
+
+config NINEP_SESSION_PROC_STACK_SIZE
+	int "9P session processing work-queue stack size"
+	default 8192
+	depends on NINEP_SESSION_POOL_UART || NINEP_TRANSPORT_L2CAP
+	help
+	  Stack size (bytes) for the dedicated work queue that processes
+	  complete 9P messages off the transport receive path (UART ISR or BT
+	  RX thread). Must be deep enough for the worst-case
+	  9P -> union_fs -> backend -> filesystem call chain.
+
 config NINEP_TRANSPORT_TCP
 	bool "TCP Transport"
 	depends on NETWORKING

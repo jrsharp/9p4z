@@ -30,6 +30,11 @@ if(CONFIG_NINEP_SERVER)
   if(CONFIG_NINEP_DFU)
     zephyr_library_sources(src/dfu.c)
   endif()
+
+  if(CONFIG_NINEP_SESSION_POOL_UART)
+    # DTR-gated session pool for UART / USB CDC-ACM streams
+    zephyr_library_sources(src/session_pool_uart.c)
+  endif()
 endif()
 
 if(CONFIG_NINEP_CLIENT)

@@ -84,7 +84,11 @@ static void uart_irq_handler(const struct device *dev, void *user_data)
 
 #ifdef CONFIG_NINEP_UART_POLLING_MODE
 #define UART_POLLING_STACK_SIZE 1024
-#define UART_POLLING_PRIORITY 5
+/* Lowest application priority: the loop must busy-poll (k_yield, no sleep) to
+ * keep up with the line rate, so it must sit *below* the shell/log threads or
+ * it starves them. It still gets the CPU whenever they are idle.
+ */
+#define UART_POLLING_PRIORITY (CONFIG_NUM_PREEMPT_PRIORITIES - 1)
 
 static struct k_thread uart_polling_thread;
 static K_THREAD_STACK_DEFINE(uart_polling_stack, UART_POLLING_STACK_SIZE);
