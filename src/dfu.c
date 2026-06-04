@@ -13,6 +13,25 @@
 
 LOG_MODULE_REGISTER(ninep_dfu, CONFIG_NINEP_LOG_LEVEL);
 
+/*
+ * Flash-area IDs for the MCUboot primary (running) and secondary (upgrade) slots.
+ *
+ * On NCS with the partition manager, the DTS `slotN_partition` labels do NOT
+ * reliably map to the real MCUboot slots: flash_img's default upload area
+ * (FIXED_PARTITION_ID(slot1_partition)) can resolve to the PRIMARY slot, so a
+ * DFU would erase/write the running image -> on a single-bank SoC (e.g. nRF53)
+ * that's an instruction-fetch fault mid-erase -> CPU lockup. Use the PM-generated
+ * IDs, which are the authoritative slot IDs the bootloader swaps.
+ */
+#if defined(CONFIG_PARTITION_MANAGER_ENABLED)
+#include <pm_config.h>
+#define DFU_PRIMARY_AREA_ID   PM_MCUBOOT_PRIMARY_ID
+#define DFU_SECONDARY_AREA_ID PM_MCUBOOT_SECONDARY_ID
+#else
+#define DFU_PRIMARY_AREA_ID   FIXED_PARTITION_ID(slot0_partition)
+#define DFU_SECONDARY_AREA_ID FIXED_PARTITION_ID(slot1_partition)
+#endif
+
 /* Progress logging interval in bytes */
 #define DFU_PROGRESS_LOG_INTERVAL (50 * 1024)
 
@@ -48,8 +67,15 @@ static void set_state(struct ninep_dfu *dfu, enum ninep_dfu_state state, int err
 /**
  * @brief Start a new firmware upload
  *
- * Pre-erases the secondary slot to avoid heap fragmentation from
- * progressive erase during writes.
+ * With CONFIG_IMG_ERASE_PROGRESSIVELY (strongly recommended, and implied by
+ * NINEP_DFU), flash_img erases each page lazily as data streams in. We then do
+ * NO up-front erase here. This matters on targets where a flash erase stalls
+ * instruction fetch (e.g. nRF53): a single up-front erase of the whole
+ * secondary slot is a multi-second synchronous block that starves USB/BLE and
+ * can trip a watchdog, dropping the device into the bootloader mid-transfer.
+ * Progressive erase spreads the work one page per write chunk, interleaved with
+ * the transport's request/response, and guarantees the erase hits the same
+ * MCUboot secondary area that flash_img writes to (no DTS-vs-PM mismatch).
  */
 static int dfu_start_upload(struct ninep_dfu *dfu)
 {
@@ -59,19 +85,22 @@ static int dfu_start_upload(struct ninep_dfu *dfu)
 		LOG_WRN("DFU already in progress, resetting");
 	}
 
+#if !defined(CONFIG_IMG_ERASE_PROGRESSIVELY)
+	/* Legacy path: pre-erase the entire secondary slot up front. This is a
+	 * long synchronous operation; prefer CONFIG_IMG_ERASE_PROGRESSIVELY on
+	 * any USB/BLE/watchdog-equipped target. */
 	set_state(dfu, NINEP_DFU_ERASING, 0);
-
-	/* Pre-erase secondary slot to avoid heap fragmentation during writes */
 	LOG_INF("DFU: erasing secondary slot (this may take a moment)...");
-	ret = boot_erase_img_bank(FIXED_PARTITION_ID(slot1_partition));
+	ret = boot_erase_img_bank(DFU_SECONDARY_AREA_ID);
 	if (ret < 0) {
 		LOG_ERR("Failed to erase secondary slot: %d", ret);
 		set_state(dfu, NINEP_DFU_ERROR, ret);
 		return ret;
 	}
 	LOG_INF("DFU: secondary slot erased");
+#endif
 
-	ret = flash_img_init(&dfu->flash_ctx);
+	ret = flash_img_init_id(&dfu->flash_ctx, DFU_SECONDARY_AREA_ID);
 	if (ret < 0) {
 		LOG_ERR("Failed to init flash_img context: %d", ret);
 		set_state(dfu, NINEP_DFU_ERROR, ret);
@@ -81,7 +110,8 @@ static int dfu_start_upload(struct ninep_dfu *dfu)
 	dfu->bytes_written = 0;
 	dfu->last_progress_log = 0;
 	set_state(dfu, NINEP_DFU_RECEIVING, 0);
-	LOG_INF("DFU: ready to receive firmware");
+	LOG_INF("DFU: ready to receive firmware (progressive erase: %s)",
+	        IS_ENABLED(CONFIG_IMG_ERASE_PROGRESSIVELY) ? "on" : "off");
 
 	return 0;
 }
@@ -113,7 +143,7 @@ static int dfu_read(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx)
 
 	/* Current image version (slot0) */
 	struct mcuboot_img_header hdr;
-	int ret = boot_read_bank_header(FIXED_PARTITION_ID(slot0_partition),
+	int ret = boot_read_bank_header(DFU_PRIMARY_AREA_ID,
 	                                &hdr, sizeof(hdr));
 	if (ret == 0 && hdr.mcuboot_version == 1) {
 		len += snprintf(status + len, sizeof(status) - len,
@@ -125,7 +155,7 @@ static int dfu_read(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx)
 	}
 
 	/* Pending image version (slot1) */
-	ret = boot_read_bank_header(FIXED_PARTITION_ID(slot1_partition),
+	ret = boot_read_bank_header(DFU_SECONDARY_AREA_ID,
 	                            &hdr, sizeof(hdr));
 	if (ret == 0 && hdr.mcuboot_version == 1) {
 		len += snprintf(status + len, sizeof(status) - len,
@@ -217,7 +247,7 @@ static int dfu_clunk(void *ctx)
 
 	/* Validate image header */
 	struct mcuboot_img_header hdr;
-	ret = boot_read_bank_header(FIXED_PARTITION_ID(slot1_partition),
+	ret = boot_read_bank_header(DFU_SECONDARY_AREA_ID,
 	                            &hdr, sizeof(hdr));
 	if (ret < 0) {
 		LOG_ERR("Failed to read image header: %d", ret);

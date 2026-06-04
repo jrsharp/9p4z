@@ -93,15 +93,21 @@ config NINEP_DFU
 	bool "9P DFU (Device Firmware Update)"
 	depends on IMG_MANAGER
 	depends on FLASH_MAP
+	imply IMG_ERASE_PROGRESSIVELY
 	help
 	  Enable firmware update via 9P filesystem.
 
 	  Exposes /dev/firmware (or custom path) as a sysfs file that
 	  accepts MCUboot firmware images. The module handles:
-	  - Pre-erasing secondary slot on first write
-	  - Buffered streaming writes to flash
+	  - Streaming writes to the MCUboot secondary slot
 	  - Image validation on file close
 	  - Marking image for test upgrade
+
+	  IMG_ERASE_PROGRESSIVELY is implied: flash is erased a page at a time
+	  as data streams in, rather than one long up-front erase of the whole
+	  slot. This is important on USB/BLE/watchdog targets (e.g. nRF53) where
+	  a multi-second synchronous erase starves USB and trips watchdogs, and
+	  it ensures the erase targets the same secondary area flash_img writes.
 
 	  Usage from a 9P client:
 	    cat firmware.bin | 9p write /dev/firmware
