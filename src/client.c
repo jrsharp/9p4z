@@ -58,6 +58,21 @@ static void free_tag_locked(struct ninep_client *client, uint16_t tag)
 }
 
 /*
+ * Free a tag entry by pointer (caller must hold lock). Required when the wire
+ * tag differs from the allocated tag number -- version overrides entry->tag to
+ * NINEP_NOTAG so the Rversion (which echoes NOTAG) matches, which would make a
+ * free-by-original-tag-number lookup miss and LEAK the entry. A leaked NOTAG
+ * entry is fatal on re-attach: the next Rversion matches the stale entry, so the
+ * live version call never completes and times out.
+ */
+static void free_tag_entry_locked(struct ninep_tag_entry *entry)
+{
+	if (entry) {
+		entry->in_use = false;
+	}
+}
+
+/*
  * FID management
  */
 
@@ -380,7 +395,7 @@ int ninep_client_version(struct ninep_client *client)
 	                                client->config->version,
 	                                strlen(client->config->version));
 	if (len < 0) {
-		free_tag_locked(client, tag);
+		free_tag_entry_locked(entry);
 		k_mutex_unlock(&client->lock);
 		return len;
 	}
@@ -392,7 +407,7 @@ int ninep_client_version(struct ninep_client *client)
 	int ret = send_and_wait(client, entry, len, client->max_retries);
 	if (ret < 0) {
 		LOG_ERR("Version request failed: %d", ret);
-		free_tag_locked(client, tag);
+		free_tag_entry_locked(entry);
 		k_mutex_unlock(&client->lock);
 		return ret;
 	}
@@ -404,7 +419,7 @@ int ninep_client_version(struct ninep_client *client)
 		LOG_INF("Negotiated msize: %u", client->msize);
 	}
 
-	free_tag_locked(client, tag);
+	free_tag_entry_locked(entry);
 	k_mutex_unlock(&client->lock);
 	return 0;
 }
