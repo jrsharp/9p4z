@@ -41,6 +41,12 @@ if(CONFIG_NINEP_CLIENT)
   zephyr_library_sources(src/client.c)
 endif()
 
+if(CONFIG_NINEP_REMOTE_FS)
+  # Transparent proxy backend: re-export a remote 9P server's subtree as a
+  # local fs_ops (needs both the server fs_ops/union_fs and a client link).
+  zephyr_library_sources(src/remote_fs.c)
+endif()
+
 if(CONFIG_NINEP_TRANSPORT_UART)
   zephyr_library_sources(src/transport_uart.c)
 endif()

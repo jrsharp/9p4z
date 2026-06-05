@@ -318,6 +318,23 @@ static inline void ninep_client_set_retries(struct ninep_client *client,
 }
 
 /**
+ * @brief Get the cached QID for an allocated FID
+ *
+ * Returns the QID recorded for @p fid by the last attach/walk that produced
+ * it (a walk stores the final element's QID). Lets a caller learn whether a
+ * freshly-walked node is a directory or a file (qid.type & NINEP_QTDIR)
+ * without an extra Tstat -- used by the remote_fs proxy to populate the
+ * server-side node it hands back from a forwarded walk.
+ *
+ * @param client Client instance
+ * @param fid FID to look up
+ * @param qid Output: cached QID
+ * @return 0 on success, -ENOENT if the fid isn't allocated
+ */
+int ninep_client_get_qid(struct ninep_client *client, uint32_t fid,
+                         struct ninep_qid *qid);
+
+/**
  * @brief Allocate a new FID
  *
  * @param client Client instance

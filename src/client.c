@@ -166,6 +166,21 @@ static struct ninep_client_fid *find_fid_locked(struct ninep_client *client, uin
 	return NULL;
 }
 
+int ninep_client_get_qid(struct ninep_client *client, uint32_t fid,
+                         struct ninep_qid *qid)
+{
+	if (!client || !qid) {
+		return -EINVAL;
+	}
+	k_mutex_lock(&client->lock, K_FOREVER);
+	struct ninep_client_fid *cfid = find_fid_locked(client, fid);
+	if (cfid) {
+		*qid = cfid->qid;
+	}
+	k_mutex_unlock(&client->lock);
+	return cfid ? 0 : -ENOENT;
+}
+
 /*
  * Response handling - single shared buffer, broadcast to all waiters
  */

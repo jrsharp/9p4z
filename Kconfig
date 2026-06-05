@@ -124,6 +124,16 @@ config NINEP_CLIENT
 	help
 	  Enable 9P client functionality.
 
+config NINEP_REMOTE_FS
+	bool "9P remote-mount filesystem (transparent proxy)"
+	depends on NINEP_SERVER && NINEP_CLIENT
+	help
+	  An fs_ops backend that transparently forwards 9P operations to another
+	  9P server over a ninep_client, re-exporting a subtree of that server's
+	  namespace into the local tree (mount it under a union_fs). Carries
+	  dynamic upstream trees (e.g. a Plan 9 /net clone/conversation interface)
+	  by keeping a persistent 1:1 local-fid to upstream-fid mapping.
+
 config NINEP_TRANSPORT_UART
 	bool "UART Transport"
 	depends on SERIAL
