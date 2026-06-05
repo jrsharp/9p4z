@@ -256,6 +256,16 @@ static int rmount_stat(struct ninep_fs_node *node, uint8_t *buf, size_t buf_len,
 	return ret < 0 ? ret : (int)off;
 }
 
+/* The mount-root dir listing is a quick transient walk+read; any child read
+ * forwards to the upstream over the client and may block (e.g. a datagram data
+ * read), so let the server dispatch those to a worker thread. */
+static int rmount_read_will_block(struct ninep_fs_node *node, void *ctx)
+{
+	struct ninep_remote_fs *rfs = ctx;
+
+	return node == &rfs->root ? 0 : 1;
+}
+
 static int rmount_clunk(struct ninep_fs_node *node, void *ctx)
 {
 	struct ninep_remote_fs *rfs = ctx;
@@ -289,6 +299,7 @@ static const struct ninep_fs_ops remote_fs_ops = {
 	.write = rmount_write,
 	.stat = rmount_stat,
 	.clunk = rmount_clunk,
+	.read_will_block = rmount_read_will_block,
 };
 
 const struct ninep_fs_ops *ninep_remote_fs_get_ops(void)

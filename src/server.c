@@ -13,6 +13,7 @@
 
 #ifdef __ZEPHYR__
 #include <zephyr/kernel.h>       /* For k_uptime_get */
+#include <zephyr/init.h>         /* For SYS_INIT (async read worker pool) */
 #include <zephyr/random/random.h> /* For sys_rand_get */
 #else
 #include <time.h>  /* For clock_gettime on Unix */
@@ -690,6 +691,138 @@ static void handle_topen(struct ninep_server *server, uint16_t tag,
 	}
 }
 
+#ifdef CONFIG_NINEP_SERVER_ASYNC_READ
+/*
+ * Async read worker pool. A blocking fs_ops->read (e.g. a Plan 9 /net data read
+ * waiting for a datagram) would otherwise stall the single message-processing
+ * thread -- which also holds tx_buf_mutex for the whole handler -- and freeze
+ * the server for every other request. When the fs reports a node may block,
+ * handle_tread hands the request to a worker here and returns; the worker runs
+ * the (blocking) read on its own buffer, then sends the Rread under the owning
+ * server's tx_buf_mutex (so it never races the processing thread's tx_buf use).
+ *
+ * The pool is global (shared by all servers/sessions on the device); each
+ * request carries its server, so a worker serves whichever session deferred it.
+ */
+#define ASYNC_NWORK CONFIG_NINEP_SERVER_ASYNC_READ_WORKERS
+
+struct ninep_async_read {
+	struct ninep_server *server;
+	struct ninep_fs_node *node;
+	const char *uname;
+	uint64_t offset;
+	uint32_t count;
+	uint16_t tag;
+	bool in_use;
+	uint8_t data[CONFIG_NINEP_SERVER_ASYNC_READ_BUFSZ];
+};
+
+static struct ninep_async_read async_slots[ASYNC_NWORK];
+K_MUTEX_DEFINE(async_pool_lock);
+K_MSGQ_DEFINE(async_q, sizeof(struct ninep_async_read *), ASYNC_NWORK, sizeof(void *));
+static K_THREAD_STACK_ARRAY_DEFINE(async_stacks, ASYNC_NWORK,
+				   CONFIG_NINEP_SERVER_ASYNC_READ_STACK);
+static struct k_thread async_threads[ASYNC_NWORK];
+
+static void async_worker_fn(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+	for (;;) {
+		struct ninep_async_read *r;
+
+		if (k_msgq_get(&async_q, &r, K_FOREVER) != 0) {
+			continue;
+		}
+
+		int bytes = r->server->config.fs_ops->read(r->node, r->offset, r->data,
+				r->count, r->uname, r->server->config.fs_ctx);
+
+		k_mutex_lock(&r->server->tx_buf_mutex, K_FOREVER);
+		if (bytes < 0) {
+			int n = ninep_build_rerror(r->server->tx_buf,
+						   r->server->tx_buf_size, r->tag,
+						   "read failed", strlen("read failed"));
+			if (n > 0) {
+				ninep_transport_send(r->server->transport,
+						     r->server->tx_buf, n);
+			}
+		} else {
+			if ((uint32_t)bytes > r->count) {
+				bytes = r->count;
+			}
+			memcpy(&r->server->tx_buf[11], r->data, bytes);
+			int n = ninep_build_rread(r->server->tx_buf,
+						  r->server->tx_buf_size, r->tag, bytes);
+			if (n > 0) {
+				ninep_transport_send(r->server->transport,
+						     r->server->tx_buf, n);
+			}
+		}
+		k_mutex_unlock(&r->server->tx_buf_mutex);
+
+		k_mutex_lock(&async_pool_lock, K_FOREVER);
+		r->in_use = false;
+		k_mutex_unlock(&async_pool_lock);
+	}
+}
+
+static int async_pool_init(void)
+{
+	for (int i = 0; i < ASYNC_NWORK; i++) {
+		async_slots[i].in_use = false;
+		k_thread_create(&async_threads[i], async_stacks[i],
+				CONFIG_NINEP_SERVER_ASYNC_READ_STACK,
+				async_worker_fn, NULL, NULL, NULL,
+				K_PRIO_PREEMPT(7), 0, K_NO_WAIT);
+		k_thread_name_set(&async_threads[i], "9p_aread");
+	}
+	return 0;
+}
+SYS_INIT(async_pool_init, APPLICATION, 90);
+
+/* Defer a (possibly blocking) read to a worker. Returns true if deferred (the
+ * caller must NOT reply -- the worker will); false to fall back to inline read
+ * (all workers busy). Clamps count to the worker buffer. */
+static bool async_dispatch_read(struct ninep_server *server, uint16_t tag,
+				struct ninep_server_fid *sfid, uint64_t offset,
+				uint32_t count)
+{
+	if (count > CONFIG_NINEP_SERVER_ASYNC_READ_BUFSZ) {
+		count = CONFIG_NINEP_SERVER_ASYNC_READ_BUFSZ;
+	}
+
+	struct ninep_async_read *r = NULL;
+
+	k_mutex_lock(&async_pool_lock, K_FOREVER);
+	for (int i = 0; i < ASYNC_NWORK; i++) {
+		if (!async_slots[i].in_use) {
+			r = &async_slots[i];
+			r->in_use = true;
+			break;
+		}
+	}
+	k_mutex_unlock(&async_pool_lock);
+	if (!r) {
+		return false;
+	}
+
+	r->server = server;
+	r->tag = tag;
+	r->node = sfid->node;
+	r->offset = offset;
+	r->count = count;
+	r->uname = fid_identity(server, sfid);
+	if (k_msgq_put(&async_q, &r, K_NO_WAIT) == 0) {
+		return true;
+	}
+
+	k_mutex_lock(&async_pool_lock, K_FOREVER);
+	r->in_use = false;
+	k_mutex_unlock(&async_pool_lock);
+	return false;
+}
+#endif /* CONFIG_NINEP_SERVER_ASYNC_READ */
+
 /* Handle Tread */
 static void handle_tread(struct ninep_server *server, uint16_t tag,
                          const uint8_t *msg, size_t len)
@@ -760,6 +893,19 @@ static void handle_tread(struct ninep_server *server, uint16_t tag,
 	if (count > max_data) {
 		count = max_data;
 	}
+
+#ifdef CONFIG_NINEP_SERVER_ASYNC_READ
+	/* If this node's read may block, hand it to a worker so the processing
+	 * thread (and tx_buf_mutex) stay free for other requests. The worker
+	 * sends the Rread when it completes. */
+	if (server->config.fs_ops->read_will_block &&
+	    server->config.fs_ops->read_will_block(sfid->node, server->config.fs_ctx)) {
+		if (async_dispatch_read(server, tag, sfid, offset, count)) {
+			return;
+		}
+		/* all workers busy -> fall through to the inline (stalling) read */
+	}
+#endif
 
 	/* Read data directly into tx_buf at offset 11 */
 	int bytes = server->config.fs_ops->read(sfid->node, offset,

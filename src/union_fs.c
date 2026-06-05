@@ -843,6 +843,24 @@ static struct ninep_fs_node *union_get_root(void *ctx)
 	return fs->root;
 }
 
+/* Delegate the "may a read block?" predicate to the owning backend so the
+ * server's async-read dispatch composes through the union. */
+static int union_read_will_block(struct ninep_fs_node *node, void *fs_ctx)
+{
+	struct ninep_union_fs *fs = (struct ninep_union_fs *)fs_ctx;
+
+	if (node == fs->root || IS_SYNTHETIC_DIR(fs, node)) {
+		return 0;
+	}
+
+	struct ninep_union_mount *mount = find_node_owner(fs, node);
+
+	if (mount && mount->fs_ops->read_will_block) {
+		return mount->fs_ops->read_will_block(node, mount->fs_ctx);
+	}
+	return 0;
+}
+
 static int union_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 {
 	struct ninep_union_fs *fs = (struct ninep_union_fs *)fs_ctx;
@@ -1163,6 +1181,7 @@ static const struct ninep_fs_ops union_fs_ops = {
 	.remove = union_remove,
 	.clunk = union_clunk,
 	.get_path = union_get_path,
+	.read_will_block = union_read_will_block,
 };
 
 /* Public API */

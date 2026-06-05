@@ -53,6 +53,45 @@ config NINEP_SERVER_MAX_FIDS
 	  Server FIDs are lightweight (~20 bytes each) since auth state
 	  and usernames are pooled separately.
 
+config NINEP_SERVER_ASYNC_READ
+	bool "Async (worker-dispatched) blocking reads"
+	depends on NINEP_SERVER && MULTITHREADING
+	help
+	  Dispatch a Tread to a worker thread when the filesystem reports (via
+	  fs_ops->read_will_block) that the read may block. Without this, a
+	  blocking read (e.g. a Plan 9 /net data read waiting for a datagram)
+	  stalls the single message-processing thread and freezes the whole
+	  server for every other request. With it, the processing thread defers
+	  the read to a worker and stays responsive; the worker sends the Rread
+	  when the read completes. Needed to serve many concurrent
+	  conversations whose reads block independently.
+
+config NINEP_SERVER_ASYNC_READ_WORKERS
+	int "Async read worker threads"
+	default 4
+	depends on NINEP_SERVER_ASYNC_READ
+	help
+	  Number of worker threads, i.e. the max number of concurrently-blocked
+	  reads served without stalling. Excess concurrent blocking reads fall
+	  back to the inline (stalling) path until a worker frees.
+
+config NINEP_SERVER_ASYNC_READ_STACK
+	int "Async read worker stack size"
+	default 2048
+	depends on NINEP_SERVER_ASYNC_READ
+	help
+	  Per-worker stack. Must cover the deepest fs_ops->read path (e.g. a
+	  remote_fs proxy read forwarding over a ninep_client).
+
+config NINEP_SERVER_ASYNC_READ_BUFSZ
+	int "Async read worker buffer size"
+	default 1024
+	depends on NINEP_SERVER_ASYNC_READ
+	help
+	  Per-worker scratch buffer the deferred read fills before the reply is
+	  copied into the (mutex-held) tx buffer. Caps the count of an async
+	  read; sized for the largest blocking record (e.g. a datagram).
+
 config NINEP_SERVER_AUTH_POOL
 	int "Authentication state pool size"
 	default 4

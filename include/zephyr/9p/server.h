@@ -198,6 +198,23 @@ struct ninep_fs_ops {
 	 */
 	int (*get_path)(struct ninep_fs_node *node, char *buf, size_t buf_size,
 	                void *fs_ctx);
+
+	/**
+	 * @brief May a read on this node block?
+	 *
+	 * OPTIONAL. If provided and it returns non-zero for @p node, and the
+	 * server is built with CONFIG_NINEP_SERVER_ASYNC_READ, the server
+	 * dispatches the Tread to a worker thread instead of calling read()
+	 * inline -- so a long/blocking read (e.g. a Plan 9 /net data read that
+	 * waits for a datagram) does not stall the single message-processing
+	 * thread and freeze the whole server for other requests. The worker
+	 * calls the normal read() and sends the Rread when it completes.
+	 *
+	 * Return 1 if a read may block, 0 if it always returns promptly. A
+	 * filesystem with no blocking files may leave this NULL (all reads run
+	 * inline as before).
+	 */
+	int (*read_will_block)(struct ninep_fs_node *node, void *fs_ctx);
 };
 
 /**
