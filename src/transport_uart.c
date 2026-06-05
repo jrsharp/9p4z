@@ -24,6 +24,13 @@ struct uart_transport_data {
 	k_tid_t polling_tid;
 	bool polling_active;
 #endif
+#ifdef CONFIG_NINEP_UART_DEFERRED_RX
+	struct k_sem msg_sem;       /* ISR -> processing thread: a message is ready */
+	uint32_t proc_len;          /* length of the ready message in rx_buf */
+	volatile bool processing;   /* a message is being handed up; ISR holds off RX */
+	bool proc_active;
+	k_tid_t proc_tid;
+#endif
 };
 
 static void uart_irq_handler(const struct device *dev, void *user_data)
@@ -40,6 +47,15 @@ static void uart_irq_handler(const struct device *dev, void *user_data)
 		if (uart_fifo_read(dev, &byte, 1) != 1) {
 			break;
 		}
+
+#ifdef CONFIG_NINEP_UART_DEFERRED_RX
+		/* The processing thread still holds the last message in rx_buf;
+		 * drop new bytes (request/response: nothing new is expected until
+		 * the reply has been sent). */
+		if (data->processing) {
+			continue;
+		}
+#endif
 
 		/* Store received byte */
 		if (data->rx_offset < data->rx_buf_size) {
@@ -67,7 +83,15 @@ static void uart_irq_handler(const struct device *dev, void *user_data)
 
 		/* Check if we have a complete message */
 		if (data->header_received && data->rx_offset >= data->expected_size) {
-			/* Deliver complete message */
+#ifdef CONFIG_NINEP_UART_DEFERRED_RX
+			/* Hand off to the processing thread; it runs recv_cb (the
+			 * server handlers, incl. stack-heavy flash work) off-ISR and
+			 * resets the accumulator when done. */
+			data->proc_len = data->expected_size;
+			data->processing = true;
+			k_sem_give(&data->msg_sem);
+#else
+			/* Deliver complete message (inline in ISR) */
 			if (transport->recv_cb) {
 				transport->recv_cb(transport, data->rx_buf,
 				                   data->expected_size,
@@ -78,12 +102,13 @@ static void uart_irq_handler(const struct device *dev, void *user_data)
 			data->rx_offset = 0;
 			data->header_received = false;
 			data->expected_size = 0;
+#endif
 		}
 	}
 }
 
 #ifdef CONFIG_NINEP_UART_POLLING_MODE
-#define UART_POLLING_STACK_SIZE 1024
+#define UART_POLLING_STACK_SIZE CONFIG_NINEP_UART_POLLING_STACK_SIZE
 /* Lowest application priority: the loop must busy-poll (k_yield, no sleep) to
  * keep up with the line rate, so it must sit *below* the shell/log threads or
  * it starves them. It still gets the CPU whenever they are idle.
@@ -158,6 +183,51 @@ static void uart_polling_thread_fn(void *arg1, void *arg2, void *arg3)
 }
 #endif /* CONFIG_NINEP_UART_POLLING_MODE */
 
+#ifdef CONFIG_NINEP_UART_DEFERRED_RX
+#define UART_PROC_STACK_SIZE CONFIG_NINEP_UART_POLLING_STACK_SIZE
+/* Sane default: responsive enough to answer 9P promptly, but the thread blocks
+ * on msg_sem between messages so it never busy-starves real-time peers. */
+#define UART_PROC_PRIORITY   K_PRIO_PREEMPT(6)
+
+static struct k_thread uart_proc_thread;
+static K_THREAD_STACK_DEFINE(uart_proc_stack, UART_PROC_STACK_SIZE);
+
+static void uart_proc_thread_fn(void *arg1, void *arg2, void *arg3)
+{
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
+
+	struct ninep_transport *transport = arg1;
+	struct uart_transport_data *data = transport->priv_data;
+
+	while (data->proc_active) {
+		if (k_sem_take(&data->msg_sem, K_FOREVER) != 0) {
+			continue;
+		}
+		if (!data->proc_active) {
+			break;
+		}
+
+		/* Run the server handlers off-ISR. The ISR left the complete
+		 * message in rx_buf and set processing=true (so it won't touch
+		 * rx_buf meanwhile). */
+		if (transport->recv_cb) {
+			transport->recv_cb(transport, data->rx_buf, data->proc_len,
+			                   transport->user_data);
+		}
+
+		/* Reset the accumulator and let the ISR resume RX. */
+		unsigned int key = irq_lock();
+
+		data->rx_offset = 0;
+		data->header_received = false;
+		data->expected_size = 0;
+		data->processing = false;
+		irq_unlock(key);
+	}
+}
+#endif /* CONFIG_NINEP_UART_DEFERRED_RX */
+
 static int uart_send(struct ninep_transport *transport, const uint8_t *buf,
                      size_t len)
 {
@@ -185,7 +255,21 @@ static int uart_start(struct ninep_transport *transport)
 		return -EINVAL;
 	}
 
-#ifdef CONFIG_NINEP_UART_POLLING_MODE
+#if defined(CONFIG_NINEP_UART_DEFERRED_RX)
+	/* Interrupt RX (ISR accumulates) + a dedicated off-ISR processing thread. */
+	k_sem_init(&data->msg_sem, 0, 1);
+	data->processing = false;
+	data->proc_active = true;
+	uart_irq_callback_user_data_set(data->uart_dev, uart_irq_handler,
+	                                transport);
+	uart_irq_rx_enable(data->uart_dev);
+	data->proc_tid = k_thread_create(&uart_proc_thread, uart_proc_stack,
+	                                 K_THREAD_STACK_SIZEOF(uart_proc_stack),
+	                                 uart_proc_thread_fn,
+	                                 transport, NULL, NULL,
+	                                 UART_PROC_PRIORITY, 0, K_NO_WAIT);
+	k_thread_name_set(data->proc_tid, "uart_9p_proc");
+#elif defined(CONFIG_NINEP_UART_POLLING_MODE)
 	/* Start polling thread */
 	data->polling_active = true;
 	data->polling_tid = k_thread_create(&uart_polling_thread,
@@ -196,7 +280,7 @@ static int uart_start(struct ninep_transport *transport)
 	                                    UART_POLLING_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(data->polling_tid, "uart_poll");
 #else
-	/* Enable UART interrupts */
+	/* Enable UART interrupts (recv_cb runs inline in the ISR) */
 	uart_irq_callback_user_data_set(data->uart_dev, uart_irq_handler,
 	                                transport);
 	uart_irq_rx_enable(data->uart_dev);
@@ -213,7 +297,13 @@ static int uart_stop(struct ninep_transport *transport)
 		return -EINVAL;
 	}
 
-#ifdef CONFIG_NINEP_UART_POLLING_MODE
+#if defined(CONFIG_NINEP_UART_DEFERRED_RX)
+	/* Stop processing thread + disable UART interrupts */
+	uart_irq_rx_disable(data->uart_dev);
+	data->proc_active = false;
+	k_sem_give(&data->msg_sem);   /* wake it so it can exit */
+	k_thread_join(data->proc_tid, K_FOREVER);
+#elif defined(CONFIG_NINEP_UART_POLLING_MODE)
 	/* Stop polling thread */
 	data->polling_active = false;
 	k_thread_join(data->polling_tid, K_FOREVER);

@@ -140,6 +140,31 @@ config NINEP_UART_POLLING_MODE
 	  Polling mode is less efficient but works on platforms where
 	  UART interrupts are not properly configured.
 
+config NINEP_UART_POLLING_STACK_SIZE
+	int "transport_uart polling/RX server thread stack size"
+	default 4096
+	help
+	  Stack for the transport_uart RX thread (polling thread, or the deferred-RX
+	  processing thread), which runs the 9P server's message handlers inline.
+	  The old 1024 default overflows when a handler does stack-heavy work --
+	  e.g. ninep_dfu's flash_img_init / boot_read_bank_header reading the
+	  MCUboot slots (especially an external-QSPI secondary): the overflow faults
+	  (UFSR.STKOF) and resets the CPU. Raise this on the server-side node that
+	  exposes /dev/firmware.
+
+config NINEP_UART_DEFERRED_RX
+	bool "transport_uart: interrupt RX + deferred processing thread"
+	depends on !NINEP_UART_POLLING_MODE
+	help
+	  Receive in the UART ISR (so RX is never starved), but run the 9P server's
+	  message handlers on a dedicated thread at a fair priority -- NOT inline in
+	  the ISR (which would block real-time work during a stack-heavy handler) and
+	  NOT a lowest-priority busy-poll (which a busy peer thread starves). Use this
+	  on a node whose 9P server shares the CPU with real-time activity (e.g. a
+	  DECT mesh) that would otherwise leave the server unresponsive. The
+	  processing thread runs at a fixed sane preemptible priority (it blocks on a
+	  semaphore between messages, so it never busy-starves anything).
+
 endif # NINEP_TRANSPORT_UART
 
 config NINEP_SESSION_POOL_UART
