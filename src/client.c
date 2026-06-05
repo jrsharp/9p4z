@@ -29,6 +29,9 @@ static struct ninep_tag_entry *alloc_tag_locked(struct ninep_client *client, uin
 			client->tags[i].complete = false;
 			client->tags[i].error = 0;
 			client->tags[i].user_ctx = NULL;
+			client->tags[i].resp = NULL;
+			client->tags[i].resp_cap = 0;
+			client->tags[i].resp_len = 0;
 			*tag = client->next_tag++;
 			client->tags[i].tag = *tag;
 			return &client->tags[i];
@@ -53,6 +56,7 @@ static void free_tag_locked(struct ninep_client *client, uint16_t tag)
 {
 	struct ninep_tag_entry *entry = find_tag_locked(client, tag);
 	if (entry) {
+		entry->resp = NULL;
 		entry->in_use = false;
 	}
 }
@@ -68,6 +72,7 @@ static void free_tag_locked(struct ninep_client *client, uint16_t tag)
 static void free_tag_entry_locked(struct ninep_tag_entry *entry)
 {
 	if (entry) {
+		entry->resp = NULL;
 		entry->in_use = false;
 	}
 }
@@ -187,18 +192,27 @@ static void client_recv_callback(struct ninep_transport *transport,
 		return;
 	}
 
-	/* Copy response to shared buffer */
-	if (len <= client->buf_size) {
-		memcpy(client->resp_buf, buf, len);
-		client->resp_len = len;
-	} else {
-		LOG_ERR("Response too large: %zu > %zu", len, client->buf_size);
-		entry->error = -ENOMEM;
-		entry->complete = true;
-		k_condvar_broadcast(&client->resp_cv);
-		k_mutex_unlock(&client->lock);
-		return;
+	/* Deliver this reply into the REQUESTER'S own buffer (keyed by tag), not a
+	 * single shared one -- so concurrent in-flight requests don't clobber each
+	 * other (the client lock is dropped during each op's wait). The op set
+	 * entry->resp to its (stack) buffer before sending; a freed/timed-out op
+	 * leaves resp == NULL so a late reply is harmlessly dropped. */
+	if (entry->resp) {
+		if (len <= entry->resp_cap) {
+			memcpy(entry->resp, buf, len);
+			entry->resp_len = len;
+		} else {
+			LOG_ERR("Reply %zu > resp_cap %u (tag %u)", len, entry->resp_cap, hdr.tag);
+			entry->error = -EMSGSIZE;
+			entry->complete = true;
+			k_condvar_broadcast(&client->resp_cv);
+			k_mutex_unlock(&client->lock);
+			return;
+		}
 	}
+	/* entry->resp == NULL: op doesn't need the body (clunk/create/remove) ->
+	 * just complete below. (A late reply for a freed tag was already dropped
+	 * at find_tag, since in_use is false.) */
 
 	/* Handle error response */
 	if (hdr.type == NINEP_RERROR) {
@@ -403,6 +417,11 @@ int ninep_client_version(struct ninep_client *client)
 	/* Override tag to NOTAG for version */
 	entry->tag = NINEP_NOTAG;
 
+	uint8_t rbuf[64];
+
+	entry->resp = rbuf;
+	entry->resp_cap = sizeof(rbuf);
+
 	/* Send and wait — version is idempotent, safe to retry */
 	int ret = send_and_wait(client, entry, len, client->max_retries);
 	if (ret < 0) {
@@ -413,9 +432,9 @@ int ninep_client_version(struct ninep_client *client)
 	}
 
 	/* Parse Rversion to get negotiated msize */
-	if (client->resp_len >= 11) {
-		client->msize = client->resp_buf[7] | (client->resp_buf[8] << 8) |
-		                (client->resp_buf[9] << 16) | (client->resp_buf[10] << 24);
+	if (entry->resp_len >= 11) {
+		client->msize = entry->resp[7] | (entry->resp[8] << 8) |
+		                (entry->resp[9] << 16) | (entry->resp[10] << 24);
 		LOG_INF("Negotiated msize: %u", client->msize);
 	}
 
@@ -468,6 +487,11 @@ afid_allocated:;
 		return len;
 	}
 
+	uint8_t rbuf[64];
+
+	entry->resp = rbuf;
+	entry->resp_cap = sizeof(rbuf);
+
 	/* Send and wait — auth is stateful (allocates afid), no retry */
 	int ret = send_and_wait(client, entry, len, 0);
 	if (ret < 0) {
@@ -481,9 +505,9 @@ afid_allocated:;
 
 	/* Parse Rauth to get auth qid */
 	struct ninep_client_fid *cfid = find_fid_locked(client, allocated_afid);
-	if (cfid && client->resp_len >= 20) {
+	if (cfid && entry->resp_len >= 20) {
 		size_t offset = 7;
-		ninep_parse_qid(client->resp_buf, client->resp_len, &offset, &cfid->qid);
+		ninep_parse_qid(entry->resp, entry->resp_len, &offset, &cfid->qid);
 		if (aqid) {
 			*aqid = cfid->qid;
 		}
@@ -538,6 +562,11 @@ fid_allocated:;
 		return len;
 	}
 
+	uint8_t rbuf[64];
+
+	entry->resp = rbuf;
+	entry->resp_cap = sizeof(rbuf);
+
 	/* Send and wait — attach is stateful (allocates fid), no retry */
 	int ret = send_and_wait(client, entry, len, 0);
 	if (ret < 0) {
@@ -551,9 +580,9 @@ fid_allocated:;
 
 	/* Parse Rattach to get root qid */
 	struct ninep_client_fid *cfid = find_fid_locked(client, allocated_fid);
-	if (cfid && client->resp_len >= 20) {
+	if (cfid && entry->resp_len >= 20) {
 		size_t offset = 7;
-		ninep_parse_qid(client->resp_buf, client->resp_len, &offset, &cfid->qid);
+		ninep_parse_qid(entry->resp, entry->resp_len, &offset, &cfid->qid);
 	}
 
 	free_tag_locked(client, tag);
@@ -621,6 +650,11 @@ fid_allocated:;
 		return len;
 	}
 
+	uint8_t rbuf[256];
+
+	entry->resp = rbuf;
+	entry->resp_cap = sizeof(rbuf);
+
 	/* Send and wait — walk is stateful (allocates newfid), no retry */
 	int ret = send_and_wait(client, entry, len, 0);
 	if (ret == -ETIMEDOUT) {
@@ -646,11 +680,11 @@ fid_allocated:;
 
 	/* Parse Rwalk to get final qid */
 	struct ninep_client_fid *cfid = find_fid_locked(client, allocated_fid);
-	if (cfid && client->resp_len >= 9) {
-		uint16_t nwqid = client->resp_buf[7] | (client->resp_buf[8] << 8);
+	if (cfid && entry->resp_len >= 9) {
+		uint16_t nwqid = entry->resp[7] | (entry->resp[8] << 8);
 		if (nwqid > 0) {
 			size_t offset = 9 + (nwqid - 1) * 13;
-			ninep_parse_qid(client->resp_buf, client->resp_len, &offset, &cfid->qid);
+			ninep_parse_qid(entry->resp, entry->resp_len, &offset, &cfid->qid);
 		}
 	}
 
@@ -681,6 +715,11 @@ int ninep_client_open(struct ninep_client *client, uint32_t fid, uint8_t mode)
 		return len;
 	}
 
+	uint8_t rbuf[64];
+
+	entry->resp = rbuf;
+	entry->resp_cap = sizeof(rbuf);
+
 	/* Send and wait — open is stateful (changes fid mode), no retry */
 	int ret = send_and_wait(client, entry, len, 0);
 	if (ret < 0) {
@@ -692,9 +731,9 @@ int ninep_client_open(struct ninep_client *client, uint32_t fid, uint8_t mode)
 
 	/* Parse Ropen to get iounit */
 	struct ninep_client_fid *cfid = find_fid_locked(client, fid);
-	if (cfid && client->resp_len >= 24) {
-		cfid->iounit = client->resp_buf[20] | (client->resp_buf[21] << 8) |
-		               (client->resp_buf[22] << 16) | (client->resp_buf[23] << 24);
+	if (cfid && entry->resp_len >= 24) {
+		cfid->iounit = entry->resp[20] | (entry->resp[21] << 8) |
+		               (entry->resp[22] << 16) | (entry->resp[23] << 24);
 	}
 
 	free_tag_locked(client, tag);
@@ -726,6 +765,14 @@ int ninep_client_read(struct ninep_client *client, uint32_t fid,
 		return len;
 	}
 
+	/* Per-op response buffer: holds Rread header(11) + up to ~2KB of data.
+	 * The mesh client's reads (DFU status, /net/aether datagrams) are small;
+	 * a reply exceeding this returns -EMSGSIZE rather than corrupting. */
+	uint8_t rbuf[2048];
+
+	entry->resp = rbuf;
+	entry->resp_cap = sizeof(rbuf);
+
 	/* Send and wait — read is idempotent, safe to retry */
 	int ret = send_and_wait(client, entry, len, client->max_retries);
 	if (ret < 0) {
@@ -736,15 +783,15 @@ int ninep_client_read(struct ninep_client *client, uint32_t fid,
 	}
 
 	/* Parse Rread and copy data to caller's buffer */
-	if (client->resp_len >= 11) {
-		uint32_t data_count = client->resp_buf[7] | (client->resp_buf[8] << 8) |
-		                      (client->resp_buf[9] << 16) | (client->resp_buf[10] << 24);
+	if (entry->resp_len >= 11) {
+		uint32_t data_count = entry->resp[7] | (entry->resp[8] << 8) |
+		                      (entry->resp[9] << 16) | (entry->resp[10] << 24);
 
 		if (data_count > count) {
 			data_count = count;
 		}
 
-		memcpy(buf, &client->resp_buf[11], data_count);
+		memcpy(buf, &entry->resp[11], data_count);
 		result = data_count;
 	} else {
 		result = -EIO;
@@ -779,6 +826,11 @@ int ninep_client_write(struct ninep_client *client, uint32_t fid,
 		return len;
 	}
 
+	uint8_t rbuf[64];
+
+	entry->resp = rbuf;
+	entry->resp_cap = sizeof(rbuf);
+
 	/* Send and wait — write is idempotent (same offset), safe to retry */
 	int ret = send_and_wait(client, entry, len, client->max_retries);
 	if (ret < 0) {
@@ -789,9 +841,9 @@ int ninep_client_write(struct ninep_client *client, uint32_t fid,
 	}
 
 	/* Parse Rwrite */
-	if (client->resp_len >= 11) {
-		result = client->resp_buf[7] | (client->resp_buf[8] << 8) |
-		         (client->resp_buf[9] << 16) | (client->resp_buf[10] << 24);
+	if (entry->resp_len >= 11) {
+		result = entry->resp[7] | (entry->resp[8] << 8) |
+		         (entry->resp[9] << 16) | (entry->resp[10] << 24);
 	} else {
 		result = -EIO;
 	}
@@ -824,6 +876,11 @@ int ninep_client_stat(struct ninep_client *client, uint32_t fid,
 		return len;
 	}
 
+	uint8_t rbuf[256];
+
+	entry->resp = rbuf;
+	entry->resp_cap = sizeof(rbuf);
+
 	/* Send and wait — stat is idempotent, safe to retry */
 	int ret = send_and_wait(client, entry, len, client->max_retries);
 	if (ret < 0) {
@@ -841,8 +898,8 @@ int ninep_client_stat(struct ninep_client *client, uint32_t fid,
 	 */
 	int result = -EIO;
 
-	if (stat && client->resp_len >= 9 + 2 + 41) {
-		const uint8_t *b = client->resp_buf;
+	if (stat && entry->resp_len >= 9 + 2 + 41) {
+		const uint8_t *b = entry->resp;
 		size_t off = 7;  /* skip header */
 
 		/* uint16_t nstat = b[off] | (b[off+1] << 8); */
@@ -859,7 +916,7 @@ int ninep_client_stat(struct ninep_client *client, uint32_t fid,
 		off += 4;
 
 		/* Parse qid (13 bytes) */
-		ninep_parse_qid(b, client->resp_len, &off, &stat->qid);
+		ninep_parse_qid(b, entry->resp_len, &off, &stat->qid);
 
 		stat->mode = b[off] | (b[off+1] << 8) |
 		             (b[off+2] << 16) | (b[off+3] << 24);

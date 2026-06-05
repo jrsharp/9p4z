@@ -52,6 +52,19 @@ struct ninep_tag_entry {
 	bool complete;          /* Response received */
 	int error;              /* Error code (0 = success) */
 	void *user_ctx;         /* Caller-provided context for result */
+
+	/*
+	 * Per-request response delivery. The caller supplies a buffer (typically
+	 * on its own stack) and stores it here before sending; the recv callback
+	 * copies that request's reply into it, keyed by tag. This replaces a single
+	 * shared resp_buf so concurrent in-flight requests don't clobber each other
+	 * (the client lock is dropped during the wait, so multiple ops can be
+	 * outstanding). `resp` is NULLed on free/timeout so a late reply never
+	 * writes into a caller's stack buffer that has gone away.
+	 */
+	uint8_t *resp;          /* caller's response buffer (NULL if none) */
+	uint32_t resp_cap;      /* capacity of resp */
+	uint32_t resp_len;      /* bytes the recv cb wrote into resp */
 };
 
 /**
