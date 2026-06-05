@@ -214,6 +214,20 @@ config NINEP_UART_DEFERRED_RX
 	  processing thread runs at a fixed sane preemptible priority (it blocks on a
 	  semaphore between messages, so it never busy-starves anything).
 
+config NINEP_UART_DEFERRED_RX_RING_SIZE
+	int "transport_uart deferred-RX ring buffer (bytes)"
+	default NINEP_MAX_MESSAGE_SIZE
+	depends on NINEP_UART_DEFERRED_RX
+	help
+	  The ISR drains received bytes into this byte ring; the processing thread
+	  frames whole 9P messages out of it. Decoupling intake from framing keeps
+	  the receive path drop-free for pipelined requests (9P multiplexes many
+	  outstanding tags) -- the previous design dropped any byte that arrived
+	  while a message was being processed. Size it at least one max message so
+	  a single in-flight message always fits even if the framer is briefly
+	  descheduled during a burst; defaulting to NINEP_MAX_MESSAGE_SIZE does
+	  that. Overflow is logged.
+
 endif # NINEP_TRANSPORT_UART
 
 config NINEP_SESSION_POOL_UART
@@ -238,6 +252,26 @@ config NINEP_SESSION_PROC_STACK_SIZE
 	  complete 9P messages off the transport receive path (UART ISR or BT
 	  RX thread). Must be deep enough for the worst-case
 	  9P -> union_fs -> backend -> filesystem call chain.
+
+config NINEP_SESSION_UART_RX_RING_SIZE
+	int "Per-session UART RX ring buffer (bytes)"
+	default NINEP_MAX_MESSAGE_SIZE
+	depends on NINEP_SESSION_POOL_UART
+	help
+	  The UART ISR drains received bytes into a per-session byte ring; a
+	  framer thread pulls whole 9P messages out of it. This decouples byte
+	  intake from message processing so the server never drops a pipelined
+	  request that arrives while a previous one is still being handled (9P
+	  is a multiplexed protocol -- clients may have many requests
+	  outstanding).
+
+	  Size it at least one max message: over a fast transport (USB CDC ACM)
+	  the ISR can deliver a whole message in a burst before the framer is
+	  scheduled, so a ring smaller than the message would overflow mid-frame
+	  and stall the transfer. Defaulting to NINEP_MAX_MESSAGE_SIZE guarantees
+	  a single in-flight message always fits; pipelined small requests share
+	  the same headroom. Overflow (sustained overload) drops bytes + is
+	  logged.
 
 config NINEP_TRANSPORT_TCP
 	bool "TCP Transport"

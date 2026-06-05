@@ -8,6 +8,7 @@
 #include <zephyr/drivers/uart.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/ring_buffer.h>
 #include <string.h>
 #include <errno.h>
 
@@ -25,9 +26,8 @@ struct uart_transport_data {
 	bool polling_active;
 #endif
 #ifdef CONFIG_NINEP_UART_DEFERRED_RX
-	struct k_sem msg_sem;       /* ISR -> processing thread: a message is ready */
-	uint32_t proc_len;          /* length of the ready message in rx_buf */
-	volatile bool processing;   /* a message is being handed up; ISR holds off RX */
+	struct k_sem msg_sem;       /* ISR -> framer thread: bytes are available */
+	struct ring_buf rx_ring;    /* ISR -> framer byte FIFO */
 	bool proc_active;
 	k_tid_t proc_tid;
 #endif
@@ -37,25 +37,47 @@ static void uart_irq_handler(const struct device *dev, void *user_data)
 {
 	struct ninep_transport *transport = user_data;
 	struct uart_transport_data *data = transport->priv_data;
-	uint8_t byte;
 
 	if (!uart_irq_update(dev)) {
 		return;
 	}
 
+#ifdef CONFIG_NINEP_UART_DEFERRED_RX
+	/*
+	 * Deferred-RX: the ISR only moves bytes into the ring as fast as
+	 * possible; the framer thread frames + dispatches off-ISR. This keeps
+	 * the receive path drop-free for pipelined requests (the previous design
+	 * dropped any byte that arrived while a message was being processed).
+	 */
+	bool got = false;
+
+	while (uart_irq_rx_ready(dev)) {
+		uint8_t buf[64];
+		int n = uart_fifo_read(dev, buf, sizeof(buf));
+
+		if (n <= 0) {
+			break;
+		}
+
+		uint32_t put = ring_buf_put(&data->rx_ring, buf, n);
+
+		if (put < (uint32_t)n) {
+			LOG_WRN("9P UART RX ring full, dropped %u bytes",
+				(uint32_t)n - put);
+		}
+		got = true;
+	}
+
+	if (got) {
+		k_sem_give(&data->msg_sem);
+	}
+#else
+	uint8_t byte;
+
 	while (uart_irq_rx_ready(dev)) {
 		if (uart_fifo_read(dev, &byte, 1) != 1) {
 			break;
 		}
-
-#ifdef CONFIG_NINEP_UART_DEFERRED_RX
-		/* The processing thread still holds the last message in rx_buf;
-		 * drop new bytes (request/response: nothing new is expected until
-		 * the reply has been sent). */
-		if (data->processing) {
-			continue;
-		}
-#endif
 
 		/* Store received byte */
 		if (data->rx_offset < data->rx_buf_size) {
@@ -83,14 +105,6 @@ static void uart_irq_handler(const struct device *dev, void *user_data)
 
 		/* Check if we have a complete message */
 		if (data->header_received && data->rx_offset >= data->expected_size) {
-#ifdef CONFIG_NINEP_UART_DEFERRED_RX
-			/* Hand off to the processing thread; it runs recv_cb (the
-			 * server handlers, incl. stack-heavy flash work) off-ISR and
-			 * resets the accumulator when done. */
-			data->proc_len = data->expected_size;
-			data->processing = true;
-			k_sem_give(&data->msg_sem);
-#else
 			/* Deliver complete message (inline in ISR) */
 			if (transport->recv_cb) {
 				transport->recv_cb(transport, data->rx_buf,
@@ -102,9 +116,9 @@ static void uart_irq_handler(const struct device *dev, void *user_data)
 			data->rx_offset = 0;
 			data->header_received = false;
 			data->expected_size = 0;
-#endif
 		}
 	}
+#endif
 }
 
 #ifdef CONFIG_NINEP_UART_POLLING_MODE
@@ -191,7 +205,18 @@ static void uart_polling_thread_fn(void *arg1, void *arg2, void *arg3)
 
 static struct k_thread uart_proc_thread;
 static K_THREAD_STACK_DEFINE(uart_proc_stack, UART_PROC_STACK_SIZE);
+/* Backing store for the deferred-RX ring (singleton, like the proc thread). */
+static uint8_t uart_rx_ring_mem[CONFIG_NINEP_UART_DEFERRED_RX_RING_SIZE];
 
+/*
+ * Framer: woken when the ISR adds bytes, it drains the ring and dispatches as
+ * many complete 9P messages as are available, then blocks again. Looping here
+ * is what makes the receive path robust to pipelining -- several requests
+ * buffered in the ring are all delivered, none dropped. The ISR is the sole
+ * producer into the ring and this is the sole consumer (ring_buf needs no extra
+ * lock); the framing state (rx_buf/rx_offset/header_received/expected_size) is
+ * touched only here.
+ */
 static void uart_proc_thread_fn(void *arg1, void *arg2, void *arg3)
 {
 	ARG_UNUSED(arg2);
@@ -208,22 +233,48 @@ static void uart_proc_thread_fn(void *arg1, void *arg2, void *arg3)
 			break;
 		}
 
-		/* Run the server handlers off-ISR. The ISR left the complete
-		 * message in rx_buf and set processing=true (so it won't touch
-		 * rx_buf meanwhile). */
-		if (transport->recv_cb) {
-			transport->recv_cb(transport, data->rx_buf, data->proc_len,
-			                   transport->user_data);
+		for (;;) {
+			/* Accumulate the header (>=7 bytes) to learn the size. */
+			if (!data->header_received) {
+				data->rx_offset += ring_buf_get(
+					&data->rx_ring,
+					&data->rx_buf[data->rx_offset],
+					7 - data->rx_offset);
+				if (data->rx_offset < 7) {
+					break;   /* await more bytes */
+				}
+
+				struct ninep_msg_header hdr;
+
+				if (ninep_parse_header(data->rx_buf, data->rx_offset,
+						       &hdr) != 0 ||
+				    hdr.size < 7 || hdr.size > data->rx_buf_size) {
+					LOG_ERR("bad 9P header; resyncing");
+					data->rx_offset = 0;   /* drop and re-hunt */
+					continue;
+				}
+				data->expected_size = hdr.size;
+				data->header_received = true;
+			}
+
+			/* Pull the rest of the body. */
+			data->rx_offset += ring_buf_get(
+				&data->rx_ring, &data->rx_buf[data->rx_offset],
+				data->expected_size - data->rx_offset);
+			if (data->rx_offset < data->expected_size) {
+				break;   /* await more bytes */
+			}
+
+			if (transport->recv_cb) {
+				transport->recv_cb(transport, data->rx_buf,
+						   data->expected_size,
+						   transport->user_data);
+			}
+
+			data->rx_offset = 0;
+			data->header_received = false;
+			data->expected_size = 0;
 		}
-
-		/* Reset the accumulator and let the ISR resume RX. */
-		unsigned int key = irq_lock();
-
-		data->rx_offset = 0;
-		data->header_received = false;
-		data->expected_size = 0;
-		data->processing = false;
-		irq_unlock(key);
 	}
 }
 #endif /* CONFIG_NINEP_UART_DEFERRED_RX */
@@ -256,9 +307,11 @@ static int uart_start(struct ninep_transport *transport)
 	}
 
 #if defined(CONFIG_NINEP_UART_DEFERRED_RX)
-	/* Interrupt RX (ISR accumulates) + a dedicated off-ISR processing thread. */
+	/* Interrupt RX (ISR fills the ring) + a dedicated off-ISR framer thread. */
 	k_sem_init(&data->msg_sem, 0, 1);
-	data->processing = false;
+	ring_buf_init(&data->rx_ring, sizeof(uart_rx_ring_mem), uart_rx_ring_mem);
+	data->rx_offset = 0;
+	data->header_received = false;
 	data->proc_active = true;
 	uart_irq_callback_user_data_set(data->uart_dev, uart_irq_handler,
 	                                transport);

@@ -79,30 +79,64 @@ static const struct ninep_transport_ops uart_session_transport_ops = {
 
 /* --- 9P message processing (work queue) ----------------------------------- */
 
+/*
+ * Framer: drain the RX ring, assembling and dispatching as many complete 9P
+ * messages as are available. Runs on the work queue (off the ISR), so recv_cb
+ * may block/take locks. Looping here is what makes the server robust to
+ * pipelining -- several requests buffered in the ring are all processed,
+ * none dropped. The ISR is the sole producer into the ring and this is the
+ * sole consumer, so ring_buf needs no extra lock; the framing state
+ * (rx_buf/rx_len/rx_expected/rx_state) is touched only here.
+ */
 static void uart_session_process_work_handler(struct k_work *work)
 {
 	struct uart_session_chan *ch =
 		CONTAINER_OF(work, struct uart_session_chan, process_work);
-	struct ninep_session *session = ch->session;
 
-	/* Session may have been freed (DTR dropped) while this was queued. */
-	if (!session || session->state != NINEP_SESSION_CONNECTED) {
-		LOG_WRN("9P work: session no longer connected, skipping");
-		return;
-	}
+	for (;;) {
+		struct ninep_session *session = ch->session;
 
-	struct ninep_transport *transport = &session->transport;
+		/* Session may have been freed (DTR dropped) mid-drain. */
+		if (!session || session->state != NINEP_SESSION_CONNECTED) {
+			return;
+		}
 
-	LOG_DBG("processing 9P message: %u bytes on session %d",
-		ch->process_len, session->session_id);
+		if (ch->rx_state == UART_RX_WAIT_SIZE) {
+			ch->rx_len += ring_buf_get(&ch->rx_ring,
+						   &ch->rx_buf[ch->rx_len],
+						   4 - ch->rx_len);
+			if (ch->rx_len < 4) {
+				return;   /* size field incomplete; await more bytes */
+			}
+			ch->rx_expected = ch->rx_buf[0] | (ch->rx_buf[1] << 8) |
+					  (ch->rx_buf[2] << 16) |
+					  ((uint32_t)ch->rx_buf[3] << 24);
+			if (ch->rx_expected < 7 || ch->rx_expected > ch->rx_buf_size) {
+				LOG_ERR("session %d: bad msg size %u; resyncing",
+					session->session_id, ch->rx_expected);
+				ch->rx_len = 0;   /* drop and re-hunt a size field */
+				continue;
+			}
+			ch->rx_state = UART_RX_WAIT_DATA;
+		}
 
-	if (transport->recv_cb) {
-		transport->recv_cb(transport, ch->rx_buf, ch->process_len,
-				   transport->user_data);
-	}
+		/* UART_RX_WAIT_DATA: pull the rest of the body. */
+		ch->rx_len += ring_buf_get(&ch->rx_ring, &ch->rx_buf[ch->rx_len],
+					   ch->rx_expected - ch->rx_len);
+		if (ch->rx_len < ch->rx_expected) {
+			return;   /* body incomplete; await more bytes */
+		}
 
-	/* Ready for the next message — unless a disconnect intervened. */
-	if (ch->rx_state == UART_RX_PROCESSING) {
+		struct ninep_transport *transport = &session->transport;
+
+		LOG_DBG("processing 9P message: %u bytes on session %d",
+			ch->rx_len, session->session_id);
+		if (transport->recv_cb) {
+			transport->recv_cb(transport, ch->rx_buf, ch->rx_len,
+					   transport->user_data);
+		}
+
+		/* Ready for the next message in the ring. */
 		ch->rx_len = 0;
 		ch->rx_expected = 0;
 		ch->rx_state = UART_RX_WAIT_SIZE;
@@ -119,6 +153,12 @@ static void uart_session_isr(const struct device *dev, void *user_data)
 		return;
 	}
 
+	bool got = false;
+
+	/* The ISR's only job is to move bytes into the ring as fast as possible;
+	 * framing + dispatch happen off-ISR in the work handler. This keeps the
+	 * receive path drop-free for pipelined requests (the previous design
+	 * dropped any byte that arrived while a message was being processed). */
 	while (uart_irq_rx_ready(dev)) {
 		uint8_t buf[64];
 		int n = uart_fifo_read(dev, buf, sizeof(buf));
@@ -127,68 +167,19 @@ static void uart_session_isr(const struct device *dev, void *user_data)
 			break;
 		}
 
-		int i = 0;
-		while (i < n) {
-			if (ch->rx_state == UART_RX_PROCESSING) {
-				/* Previous message still on the work queue. A
-				 * well-behaved client awaits its reply, so this
-				 * should not happen; drop to avoid corrupting the
-				 * in-flight buffer. */
-				LOG_WRN("session %d: dropping %d bytes while processing",
-					ch->session->session_id, n - i);
-				i = n;
-				break;
-			}
+		uint32_t put = ring_buf_put(&ch->rx_ring, buf, n);
 
-			if (ch->rx_state == UART_RX_WAIT_SIZE) {
-				size_t need = 4 - ch->rx_len;
-				size_t copy = MIN(need, (size_t)(n - i));
-
-				memcpy(&ch->rx_buf[ch->rx_len], &buf[i], copy);
-				ch->rx_len += copy;
-				i += copy;
-
-				if (ch->rx_len == 4) {
-					ch->rx_expected = ch->rx_buf[0] |
-							  (ch->rx_buf[1] << 8) |
-							  (ch->rx_buf[2] << 16) |
-							  (ch->rx_buf[3] << 24);
-
-					if (ch->rx_expected < 7 ||
-					    ch->rx_expected > ch->rx_buf_size) {
-						LOG_ERR("session %d: bad msg size %u",
-							ch->session->session_id,
-							ch->rx_expected);
-						/* Resync: discard and wait for a
-						 * fresh size field. */
-						ch->rx_len = 0;
-						ch->rx_state = UART_RX_WAIT_SIZE;
-						continue;
-					}
-
-					ch->rx_state = UART_RX_WAIT_DATA;
-				}
-			} else { /* UART_RX_WAIT_DATA */
-				size_t need = ch->rx_expected - ch->rx_len;
-				size_t copy = MIN(need, (size_t)(n - i));
-
-				memcpy(&ch->rx_buf[ch->rx_len], &buf[i], copy);
-				ch->rx_len += copy;
-				i += copy;
-
-				if (ch->rx_len == ch->rx_expected) {
-					/* Complete message — hand to work queue.
-					 * rx_buf is now owned by the handler until
-					 * it resets state; stop reading this batch. */
-					ch->process_len = ch->rx_len;
-					ch->rx_state = UART_RX_PROCESSING;
-					k_work_submit_to_queue(&uart_proc_wq,
-							       &ch->process_work);
-					i = n;
-					break;
-				}
-			}
+		if (put < (uint32_t)n) {
+			/* Genuine sustained overload: the framer can't keep up
+			 * (it normally drains far faster than the UART fills). */
+			LOG_WRN("session %d: RX ring full, dropped %u bytes",
+				ch->session->session_id, (uint32_t)n - put);
 		}
+		got = true;
+	}
+
+	if (got) {
+		k_work_submit_to_queue(&uart_proc_wq, &ch->process_work);
 	}
 }
 
@@ -212,6 +203,10 @@ static void uart_session_connect(struct ninep_session_pool_uart *up)
 		     (session->session_id * up->config.rx_buf_size_per_session);
 	ch->rx_buf_size = up->config.rx_buf_size_per_session;
 	ch->rx_state = UART_RX_WAIT_SIZE;
+	ch->ring_buf_mem = up->ring_pool +
+			   (session->session_id * CONFIG_NINEP_SESSION_UART_RX_RING_SIZE);
+	ring_buf_init(&ch->rx_ring, CONFIG_NINEP_SESSION_UART_RX_RING_SIZE,
+		      ch->ring_buf_mem);
 	k_work_init(&ch->process_work, uart_session_process_work_handler);
 
 	session->transport.ops = &uart_session_transport_ops;
@@ -257,12 +252,11 @@ static void uart_session_disconnect(struct ninep_session_pool_uart *up)
 
 		struct uart_session_chan *ch = &up->channels[i];
 
-		/* Stop accepting new bytes (work handler will not re-arm). */
-		ch->rx_state = UART_RX_PROCESSING;
-
-		/* Cancel a queued (not-yet-running) message. If it is mid-flight
-		 * it will see a non-CONNECTED session after we free it and bail. */
+		/* Cancel a queued (not-yet-running) framer pass. If it is
+		 * mid-drain it re-checks the session state each iteration and
+		 * bails once we free it below. */
 		(void)k_work_cancel(&ch->process_work);
+		ring_buf_reset(&ch->rx_ring);
 
 		/* Clunks all open fids and resets server + transport state. */
 		ninep_session_free(session);
