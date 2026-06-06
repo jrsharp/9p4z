@@ -712,6 +712,7 @@ struct ninep_async_read {
 	const char *uname;
 	uint64_t offset;
 	uint32_t count;
+	uint32_t epoch;          /* server->epoch at dispatch; reply dropped if it changed */
 	uint16_t tag;
 	bool in_use;
 	uint8_t data[CONFIG_NINEP_SERVER_ASYNC_READ_BUFSZ];
@@ -736,6 +737,20 @@ static void async_worker_fn(void *a, void *b, void *c)
 
 		int bytes = r->server->config.fs_ops->read(r->node, r->offset, r->data,
 				r->count, r->uname, r->server->config.fs_ctx);
+
+		/*
+		 * If the session was torn down (and possibly reused) while this
+		 * read was blocked, the server was re-init'd with a new epoch.
+		 * Sending now would inject a stale reply into a different client's
+		 * stream and desync it -- so drop the reply. Checked BEFORE taking
+		 * tx_buf_mutex because a reused session re-inits that very mutex.
+		 */
+		if (r->server->epoch != r->epoch) {
+			k_mutex_lock(&async_pool_lock, K_FOREVER);
+			r->in_use = false;
+			k_mutex_unlock(&async_pool_lock);
+			continue;
+		}
 
 		k_mutex_lock(&r->server->tx_buf_mutex, K_FOREVER);
 		if (bytes < 0) {
@@ -811,6 +826,7 @@ static bool async_dispatch_read(struct ninep_server *server, uint16_t tag,
 	r->node = sfid->node;
 	r->offset = offset;
 	r->count = count;
+	r->epoch = server->epoch;
 	r->uname = fid_identity(server, sfid);
 	if (k_msgq_put(&async_q, &r, K_NO_WAIT) == 0) {
 		return true;
@@ -1473,12 +1489,17 @@ int ninep_server_init(struct ninep_server *server,
 		return -EINVAL;
 	}
 
+	static atomic_t server_epoch_ctr;
+
 	memset(server, 0, sizeof(*server));
 	k_mutex_init(&server->tx_buf_mutex);
 	/* Copy config by value instead of storing pointer */
 	memcpy(&server->config, config, sizeof(server->config));
 	server->transport = transport;
 	server->msize = CONFIG_NINEP_MAX_MESSAGE_SIZE; /* Default until Tversion */
+	/* Unique, never 0: each (re)init -- i.e. each session-pool connection --
+	 * gets a fresh epoch so a stale async-read worker can detect reuse. */
+	server->epoch = (uint32_t)atomic_inc(&server_epoch_ctr) + 1;
 
 	/* Dynamically allocate RX/TX buffers (may use PSRAM on ESP32) */
 	size_t buf_size = CONFIG_NINEP_MAX_MESSAGE_SIZE;

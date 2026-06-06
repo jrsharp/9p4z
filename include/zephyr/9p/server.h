@@ -362,6 +362,17 @@ struct ninep_server {
 	size_t rx_len;
 
 	struct k_mutex tx_buf_mutex;
+
+	/*
+	 * Monotonic, unique per ninep_server_init(). A session pool reuses the
+	 * same ninep_server struct across connections (re-init per connect), so
+	 * the epoch distinguishes "this is still the session I was dispatched
+	 * for" from "the session was torn down and reused". An async-read worker
+	 * captures it at dispatch and drops its (now stale) reply if it changed
+	 * before the worker got to send -- otherwise a read that blocked across a
+	 * disconnect would inject a reply into a reused session's stream.
+	 */
+	uint32_t epoch;
 };
 
 /**
