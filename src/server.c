@@ -265,9 +265,21 @@ static void handle_tversion(struct ninep_server *server, const uint8_t *msg, siz
 
 	LOG_INF("Tversion: msize=%u, version=%.*s", msize, version_len, version);
 
-	/* Tversion flushes all server state - clear all fids and pools */
+	/* Tversion flushes all server state - clear all fids and pools.
+	 * A Tversion abandons the old session, so each open fid must be CLUNKED
+	 * through the filesystem (not just silently forgotten) -- otherwise the
+	 * backend leaks per-fid state. On /net/aether this is the conversation
+	 * leak: the relay's lazy re-attach (Tversion+Tattach) was dropping the
+	 * held conversation ctl fids without anet_clunk(K_CTL) -> conv_free, so
+	 * conversations orphaned and only a reboot freed them. Mirror the proper
+	 * teardown in ninep_server_cleanup. */
 	for (int i = 0; i < CONFIG_NINEP_SERVER_MAX_FIDS; i++) {
 		if (server->fids[i].in_use) {
+			if (server->config.fs_ops && server->config.fs_ops->clunk &&
+			    server->fids[i].node) {
+				server->config.fs_ops->clunk(server->fids[i].node,
+							     server->config.fs_ctx);
+			}
 			/* Release pooled resources */
 			if (server->fids[i].uname_idx != NINEP_POOL_NONE) {
 				uname_release(server, server->fids[i].uname_idx);
