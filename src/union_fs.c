@@ -205,15 +205,18 @@ static bool register_node_owner(struct ninep_union_fs *fs,
 			 * about decrementing refcount that's already 0. */
 			fs->node_owners[i].mount = mount;
 			fs->node_owners[i].last_access = now;
-			if (fs->node_owners[i].refcount == 0) {
-				/* Node was clunked, now being walked to again - reactivate */
-				fs->node_owners[i].refcount = 1;
-				LOG_DBG("Re-activated node=%p name='%s', refcount=1",
-				        node, node->name);
-			} else {
-				LOG_DBG("Re-registered node=%p name='%s', refcount=%u (unchanged)",
-				        node, node->name, fs->node_owners[i].refcount);
-			}
+			/* Every walked node is clunked exactly once by the server (as an
+			 * intermediate during the walk, or via its fid). So every
+			 * walk-return must incref, or the refcount undercounts when one
+			 * node backs several fids. That is exactly what happens with
+			 * backends that use STATIC nodes (aether_net reuses one node
+			 * pointer per path): the old "keep unchanged" left refcount at 1
+			 * for N fids, so it hit 0 after the first clunk, the node was
+			 * unregistered, and the next clunk/walk saw "no owner" / a
+			 * corrupted node_owners table -> "file not found". */
+			fs->node_owners[i].refcount++;
+			LOG_DBG("Re-registered node=%p name='%s', refcount=%u",
+			        node, node->name, fs->node_owners[i].refcount);
 			result = true;
 			goto out;
 		}
