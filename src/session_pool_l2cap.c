@@ -30,6 +30,23 @@ LOG_MODULE_REGISTER(ninep_session_pool_l2cap, CONFIG_NINEP_LOG_LEVEL);
 NET_BUF_POOL_DEFINE(l2cap_session_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
                     CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
 
+/* RX SDU reassembly. A CoC channel must advertise rx.mtu so the peer knows the
+ * largest SDU it may send; and to receive an SDU larger than the per-PDU MPS the
+ * stack reassembles it into a buffer obtained from alloc_buf. Without both, the
+ * channel is capped near the ~247 B MPS -- too small for a full /net/aether
+ * conversation datagram (a 448 B payload is a ~471 B 9P message). Track the TX
+ * MTU: the 9P server caps the negotiated msize at get_mtu()==tx.mtu (server.c),
+ * so no message can exceed this, and one SDU always holds a whole message. */
+#define L2CAP_SESSION_RX_MTU CONFIG_BT_L2CAP_TX_MTU
+NET_BUF_POOL_DEFINE(l2cap_session_rx_pool, 4,
+                    BT_L2CAP_SDU_BUF_SIZE(L2CAP_SESSION_RX_MTU), 8, NULL);
+
+static struct net_buf *l2cap_session_alloc_buf(struct bt_l2cap_chan *chan)
+{
+	ARG_UNUSED(chan);
+	return net_buf_alloc(&l2cap_session_rx_pool, K_NO_WAIT);
+}
+
 /*
  * Dedicated work queue for 9P message processing.
  * This decouples 9P processing from the BT RX thread, preventing:
@@ -58,6 +75,7 @@ static void l2cap_session_sent(struct bt_l2cap_chan *chan);
 static struct bt_l2cap_chan_ops l2cap_session_chan_ops = {
 	.connected = l2cap_session_connected,
 	.disconnected = l2cap_session_disconnected,
+	.alloc_buf = l2cap_session_alloc_buf,
 	.recv = l2cap_session_recv,
 	.sent = l2cap_session_sent,
 };
@@ -272,6 +290,10 @@ static int l2cap_session_accept(struct bt_conn *conn, struct bt_l2cap_server *se
 	l2cap_chan->rx_len = 0;
 	l2cap_chan->rx_expected = 0;
 	l2cap_chan->rx_state = RX_WAIT_SIZE;
+	/* Advertise our RX MTU so the peer may send a full 9P message in one SDU
+	 * (the memset above zeroed it; a CoC server MUST set rx.mtu). Reassembly of
+	 * SDUs larger than the per-PDU MPS uses the alloc_buf callback. */
+	l2cap_chan->le.rx.mtu = L2CAP_SESSION_RX_MTU;
 	k_work_init(&l2cap_chan->process_work, session_process_work_handler);
 
 	/* Initialize transport for this session */
