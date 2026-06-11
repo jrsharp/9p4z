@@ -121,9 +121,21 @@ static struct ninep_fs_node *alloc_node(struct ninep_sysfs *sysfs,
 	strncpy(node->name, name, sizeof(node->name) - 1);
 	node->type = is_dir ? NINEP_NODE_DIR : NINEP_NODE_FILE;
 	node->mode = is_dir ? (0755 | NINEP_DMDIR) : 0444;
-	node->qid.path = sysfs->next_qid_path++;
+	/* STABLE, path-derived qid.path: a file must present the SAME qid however
+	 * it is reached -- walked here, or enumerated by the sysfs_read directory
+	 * listing (which hashes the path identically). 9P requires stable qids, and
+	 * FUSE/macOS caches inodes by qid; a per-alloc sequential counter made the
+	 * readdir qid and the walk qid disagree for the same file, corrupting the
+	 * client's inode cache -> "Result too large" on reads, worsening as more
+	 * mismatched qids accumulated. Same hash as sysfs_read(). */
+	uint64_t qid_path = 0;
+	for (const char *p = name; *p; p++) {
+		qid_path = qid_path * 31 + (uint64_t)(uint8_t)*p;
+	}
+	node->qid.path = qid_path;
 	node->qid.version = 0;
 	node->qid.type = is_dir ? NINEP_QTDIR : NINEP_QTFILE;
+	ARG_UNUSED(sysfs);
 	node_cache.in_use[idx] = true;
 	node_cache.last_access[idx] = now;
 	node_cache.refcount[idx] = 0;
@@ -241,6 +253,10 @@ static struct ninep_fs_node *sysfs_walk(struct ninep_fs_node *parent,
 			node->mode = 0644;  /* Read-write for owner, read-only for others */
 		}
 
+		/* The returned node is about to back a new fid -> take a reference,
+		 * balanced by the fs_ops->clunk() the server will issue for that fid
+		 * (or for this node as a discarded multi-walk intermediate). */
+		incref_node(node);
 		return node;
 	}
 
@@ -254,6 +270,7 @@ static struct ninep_fs_node *sysfs_walk(struct ninep_fs_node *parent,
 				LOG_ERR("Node cache full");
 				return NULL;
 			}
+			incref_node(node);  /* fid reference; released at clunk */
 			return node;
 		}
 	}
@@ -277,13 +294,19 @@ static int sysfs_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 	        entry ? "found" : "NOT FOUND",
 	        entry ? entry->writable : 0);
 
+	/* open() is refcount-NEUTRAL. A node's reference is taken at walk()/ref()
+	 * -- when a fid starts referencing it -- and released at clunk(), so the
+	 * node survives as long as ANY fid references it, opened or not. Counting
+	 * on open() let the cache evict a node out from under a walked-but-unopened
+	 * fid (e.g. a directory fid mid-readdir, whose parent we then re-walk for
+	 * each child) -> the slot was reused and the stale parent->name made every
+	 * child walk after the first fail with "file not found". */
+
 	/* Directories are always read-only */
 	if (node->type == NINEP_NODE_DIR) {
 		if (mode != NINEP_OREAD && mode != NINEP_OEXEC) {
 			return -EACCES;
 		}
-		/* Success - increment refcount */
-		incref_node(node);
 		return 0;
 	}
 
@@ -292,8 +315,6 @@ static int sysfs_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 	uint8_t access_mode = mode & 0x03;  /* Keep only bottom 2 bits */
 
 	if (access_mode == NINEP_OREAD || access_mode == NINEP_OEXEC) {
-		/* Success - increment refcount */
-		incref_node(node);
 		return 0;  /* Read always allowed */
 	}
 
@@ -303,8 +324,6 @@ static int sysfs_open(struct ninep_fs_node *node, uint8_t mode, void *fs_ctx)
 			        entry, entry ? entry->writable : 0);
 			return -EACCES;  /* Not writable */
 		}
-		/* Success - increment refcount */
-		incref_node(node);
 		return 0;
 	}
 
@@ -524,6 +543,15 @@ static int sysfs_clunk(struct ninep_fs_node *node, void *fs_ctx)
 	return 0;
 }
 
+/* A fid was cloned (Twalk nwname=0) -> another fid now references this node.
+ * Take a reference so the cache won't evict it while that clone lives, balanced
+ * by the clunk the clone will eventually trigger. Mirrors the incref in walk(). */
+static void sysfs_ref(struct ninep_fs_node *node, void *fs_ctx)
+{
+	ARG_UNUSED(fs_ctx);
+	incref_node(node);
+}
+
 /* Filesystem operations */
 static const struct ninep_fs_ops sysfs_ops = {
 	.get_root = sysfs_get_root,
@@ -533,6 +561,7 @@ static const struct ninep_fs_ops sysfs_ops = {
 	.write = sysfs_write,
 	.stat = sysfs_stat,
 	.clunk = sysfs_clunk,
+	.ref = sysfs_ref,
 	.create = NULL,
 	.remove = NULL,
 };

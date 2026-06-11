@@ -1173,6 +1173,33 @@ static int union_get_path(struct ninep_fs_node *node, char *buf,
 }
 
 /* Union filesystem operations table */
+/*
+ * A fid was cloned (Twalk nwname=0) -> another fid now references this node.
+ * Mirror the incref that union_walk() does via register_node_owner(), so the
+ * ownership entry survives until ALL referencing fids are clunked. Without this
+ * the clone's eventual clunk decrefs an owner that was never increfed for it,
+ * driving the count to 0 while the original fid still holds the node -> the
+ * entry is dropped and find_node_owner() later misses -> "open failed".
+ * Untracked nodes (union root, mount roots, synthetic dirs) are resolved
+ * structurally by find_node_owner(), so incref_node() is a safe no-op for them.
+ */
+static void union_ref(struct ninep_fs_node *node, void *fs_ctx)
+{
+	struct ninep_union_fs *fs = (struct ninep_union_fs *)fs_ctx;
+
+	/* The clone increfs union's own ownership entry... */
+	incref_node(fs, node);
+
+	/* ...and propagates to the backend that owns the node, so a backend that
+	 * refcounts (e.g. the sysfs node cache) keeps it alive for the clone too.
+	 * Union root / mount roots / synthetic dirs have no backend ref entry --
+	 * find_node_owner() returns NULL or a root and we skip them. */
+	struct ninep_union_mount *mount = find_node_owner(fs, node);
+	if (mount && mount->fs_ops && mount->fs_ops->ref) {
+		mount->fs_ops->ref(node, mount->fs_ctx);
+	}
+}
+
 static const struct ninep_fs_ops union_fs_ops = {
 	.get_root = union_get_root,
 	.walk = union_walk,
@@ -1183,6 +1210,7 @@ static const struct ninep_fs_ops union_fs_ops = {
 	.create = union_create,
 	.remove = union_remove,
 	.clunk = union_clunk,
+	.ref = union_ref,
 	.get_path = union_get_path,
 	.read_will_block = union_read_will_block,
 };

@@ -544,6 +544,14 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 			return;
 		}
 		new_sfid->node = sfid->node;
+		/* A clone is a NEW fid referencing the same node without a walk().
+		 * Tell the fs so refcounting backends stay balanced with the
+		 * fs_ops->clunk() this fid will eventually trigger -- otherwise the
+		 * node is evicted while still referenced and a later op on the clone
+		 * fails ("open failed"). Dual of the clunk in handle_tclunk(). */
+		if (server->config.fs_ops->ref && sfid->node) {
+			server->config.fs_ops->ref(sfid->node, server->config.fs_ctx);
+		}
 		/* Share uname from parent fid (increment refcount) */
 		if (sfid->uname_idx != NINEP_POOL_NONE) {
 			new_sfid->uname_idx = sfid->uname_idx;

@@ -175,6 +175,31 @@ struct ninep_fs_ops {
 	int (*clunk)(struct ninep_fs_node *node, void *fs_ctx);
 
 	/**
+	 * @brief Take an additional reference to a node (fid clone)
+	 *
+	 * Called by the server when a Twalk with ZERO name elements clones a
+	 * fid -- creating a second fid that references the same node WITHOUT a
+	 * fresh walk(). It is the dual of clunk(): the cloned fid is eventually
+	 * clunked, which calls clunk() on this node. A filesystem that
+	 * refcounts nodes by fid (union_fs ownership tracking, the sysfs node
+	 * cache) MUST incref here, or it under-counts and evicts a node while a
+	 * fid still references it -- so a later open/read on a clone fails
+	 * ("open failed"). A plain `9p` client never trips this because it does
+	 * not clone held fids; 9pfuse and other rigorous clients do.
+	 *
+	 * Invariant the whole library should uphold: a node's refcount equals
+	 * the number of fids referencing it. A fid reference is CREATED by
+	 * walk() (final element), ref() (clone), or create(), and RELEASED by
+	 * clunk(). open()/read()/write() must be refcount-neutral.
+	 *
+	 * OPTIONAL: filesystems that do not refcount nodes leave this NULL.
+	 *
+	 * @param node   Node gaining a fid reference
+	 * @param fs_ctx Filesystem context
+	 */
+	void (*ref)(struct ninep_fs_node *node, void *fs_ctx);
+
+	/**
 	 * @brief Resolve a node to its policy-relevant path
 	 *
 	 * Used by the server to feed `auth_config->check_perm(identity, path,
