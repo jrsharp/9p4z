@@ -10,6 +10,10 @@
 #include <zephyr/9p/server.h>
 #include <zephyr/kernel.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
  * @brief Generic session pool for multi-client 9P servers
  *
@@ -140,5 +144,9 @@ struct ninep_session *ninep_session_get(struct ninep_session_pool *pool, int ses
  * @param pool Session pool
  */
 void ninep_session_pool_disconnect_all(struct ninep_session_pool *pool);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* ZEPHYR_INCLUDE_9P_SESSION_POOL_H_ */

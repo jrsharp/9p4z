@@ -20,7 +20,11 @@
 #include <zephyr/net_buf.h>
 #else
 #define NINEP_NCS_BUILD 0
+#if __has_include(<zephyr/net_buf.h>)
+#include <zephyr/net_buf.h>   /* mainline Zephyr >= 4.x relocated net_buf */
+#else
 #include <zephyr/net/buf.h>
+#endif
 #endif
 
 LOG_MODULE_REGISTER(ninep_l2cap_transport, CONFIG_NINEP_LOG_LEVEL);

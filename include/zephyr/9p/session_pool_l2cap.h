@@ -9,6 +9,10 @@
 #include <zephyr/9p/session_pool.h>
 #include <zephyr/bluetooth/l2cap.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
  * @brief L2CAP session pool for multi-client 9P servers
  *
@@ -161,5 +165,9 @@ struct ninep_session_pool_l2cap {
 		.rx_buf_pool = _##name##_rx_pool, \
 		.channels = _##name##_channels, \
 	}
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* ZEPHYR_INCLUDE_9P_SESSION_POOL_L2CAP_H_ */

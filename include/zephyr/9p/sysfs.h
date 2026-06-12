@@ -10,6 +10,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
  * @brief Sysfs - Dynamic synthetic filesystem for Zephyr
  *
@@ -167,5 +171,9 @@ int ninep_sysfs_register_dir(struct ninep_sysfs *sysfs, const char *path);
  * @return Pointer to filesystem operations
  */
 const struct ninep_fs_ops *ninep_sysfs_get_ops(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* ZEPHYR_INCLUDE_9P_SYSFS_H_ */
