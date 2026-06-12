@@ -89,6 +89,8 @@ struct ninep_remote_fs {
 
 	struct ninep_fs_node root;         /* the mount-root node (== base path) */
 
+	uint64_t qid_salt;                 /* seed mixed into path-derived qids */
+
 	struct k_mutex lock;               /* guards the node pool */
 };
 
@@ -114,6 +116,18 @@ int ninep_remote_fs_init(struct ninep_remote_fs *rfs,
 
 /** @brief fs_ops table for remote-mount backends (shared; ctx = the instance). */
 const struct ninep_fs_ops *ninep_remote_fs_get_ops(void);
+
+/**
+ * @brief Set a per-instance salt mixed into proxied qids.
+ *
+ * The proxied subtree's qids are otherwise derived from the upstream path alone,
+ * identical across two servers re-exporting the same upstream -- a client that
+ * mounts both at once (macOS/9pfuse, keyed by qid) then aliases them. Set a
+ * per-NODE-unique salt (e.g. from the SoC device id) so each presents distinct
+ * qids. Optional; default 0. Call after init, before serving. (qids are always
+ * forced non-zero regardless, so the proxy root + entries never collide on 0.)
+ */
+void ninep_remote_fs_set_qid_salt(struct ninep_remote_fs *rfs, uint64_t salt);
 
 /** @} */
 

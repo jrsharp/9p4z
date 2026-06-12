@@ -28,6 +28,22 @@ LOG_MODULE_REGISTER(ninep_remote_fs, CONFIG_NINEP_LOG_LEVEL);
 
 #define RN(node) CONTAINER_OF(node, struct ninep_remote_node, node)
 
+/* Derive a proxied node's qid.path from its full upstream path + the per-instance
+ * salt. The upstream qid is NOT trusted for this: the mount root is hardcoded 0
+ * and a failed get_qid leaves it 0, so several entries collapse to qid 0 and a
+ * qid-keyed client (macOS/9pfuse) aliases their inodes. Path-derived + salted ->
+ * unique, stable, distinct across two mounted nodes; forced non-zero (FUSE
+ * treats 0 specially). */
+static uint64_t remote_qid_path(const struct ninep_remote_fs *rfs, const char *path)
+{
+	uint64_t h = rfs->qid_salt;
+
+	for (const char *p = path; *p; p++) {
+		h = h * 31 + (uint64_t)(uint8_t)*p;
+	}
+	return h ? h : 1;
+}
+
 /* ---- node pool (brief rfs->lock around alloc/free/fill) ---- */
 
 static struct ninep_remote_node *node_alloc(struct ninep_remote_fs *rfs)
@@ -147,7 +163,11 @@ static struct ninep_fs_node *rmount_walk(struct ninep_fs_node *parent,
 	rn->cfid = cfid;
 	strncpy(rn->path, cpath, sizeof(rn->path) - 1);
 	strncpy(rn->node.name, elem, sizeof(rn->node.name) - 1);
-	rn->node.qid = q;
+	/* Keep the upstream TYPE (dir bit) but derive a unique, salted, non-zero
+	 * qid.path -- the upstream path is unreliable (see remote_qid_path). */
+	rn->node.qid.type = q.type;
+	rn->node.qid.version = 0;
+	rn->node.qid.path = remote_qid_path(rfs, cpath);
 	rn->node.type = (q.type & NINEP_QTDIR) ? NINEP_NODE_DIR : NINEP_NODE_FILE;
 	rn->node.mode = (rn->node.type == NINEP_NODE_DIR) ? (0755 | NINEP_DMDIR)
 							  : 0666;
@@ -341,8 +361,20 @@ int ninep_remote_fs_init(struct ninep_remote_fs *rfs,
 	rfs->root.type = NINEP_NODE_DIR;
 	rfs->root.mode = 0755 | NINEP_DMDIR;
 	rfs->root.qid.type = NINEP_QTDIR;
-	rfs->root.qid.path = 0;
+	rfs->root.qid.version = 0;
+	rfs->root.qid.path = remote_qid_path(rfs, base);  /* unique, non-zero (salt=0 here) */
 
 	LOG_INF("remote_fs: re-export upstream '%s' (%zu node pool)", base, num_nodes);
 	return 0;
+}
+
+void ninep_remote_fs_set_qid_salt(struct ninep_remote_fs *rfs, uint64_t salt)
+{
+	if (!rfs) {
+		return;
+	}
+	rfs->qid_salt = salt;
+	/* The root qid was computed at init with salt 0; re-derive it so the whole
+	 * proxied subtree is consistently salted (mirrors ninep_sysfs_set_qid_salt). */
+	rfs->root.qid.path = remote_qid_path(rfs, rfs->base);
 }
