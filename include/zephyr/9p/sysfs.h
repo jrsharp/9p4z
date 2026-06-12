@@ -79,7 +79,8 @@ struct ninep_sysfs {
 	size_t num_entries;                /* Number of registered entries */
 	size_t max_entries;                /* Maximum entries (array size) */
 	struct ninep_fs_node *root;        /* Root node */
-	uint64_t next_qid_path;            /* Next QID path number */
+	uint64_t next_qid_path;            /* (unused; qids are path-derived) */
+	uint64_t qid_salt;                 /* Seed mixed into path-derived qids */
 };
 
 /**
@@ -93,6 +94,23 @@ struct ninep_sysfs {
 int ninep_sysfs_init(struct ninep_sysfs *sysfs,
                      struct ninep_sysfs_entry *entries,
                      size_t max_entries);
+
+/**
+ * @brief Set a per-instance salt mixed into path-derived qids
+ *
+ * qids are normally a pure hash of the path, identical across two servers
+ * running the same firmware/namespace. A client that mounts BOTH at once
+ * (e.g. macOS/9pfuse, which keys its inode cache by qid/fileid) can then alias
+ * the two volumes and corrupt its cache. Setting a per-NODE-unique salt (e.g.
+ * derived from the SoC device id) makes each server present distinct qids for
+ * the same paths, so simultaneous mounts stay isolated. qids remain STABLE
+ * within an instance (so a file keeps one qid however it is reached). Optional;
+ * default salt 0 = pure path hash (unchanged). Call after init, before serving.
+ *
+ * @param sysfs Sysfs instance
+ * @param salt  Per-instance seed (e.g. hash of hwinfo_get_device_id())
+ */
+void ninep_sysfs_set_qid_salt(struct ninep_sysfs *sysfs, uint64_t salt);
 
 /**
  * @brief Register a sysfs file

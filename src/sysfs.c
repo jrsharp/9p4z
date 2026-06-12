@@ -128,14 +128,13 @@ static struct ninep_fs_node *alloc_node(struct ninep_sysfs *sysfs,
 	 * readdir qid and the walk qid disagree for the same file, corrupting the
 	 * client's inode cache -> "Result too large" on reads, worsening as more
 	 * mismatched qids accumulated. Same hash as sysfs_read(). */
-	uint64_t qid_path = 0;
+	uint64_t qid_path = sysfs->qid_salt;
 	for (const char *p = name; *p; p++) {
 		qid_path = qid_path * 31 + (uint64_t)(uint8_t)*p;
 	}
 	node->qid.path = qid_path;
 	node->qid.version = 0;
 	node->qid.type = is_dir ? NINEP_QTDIR : NINEP_QTFILE;
-	ARG_UNUSED(sysfs);
 	node_cache.in_use[idx] = true;
 	node_cache.last_access[idx] = now;
 	node_cache.refcount[idx] = 0;
@@ -390,14 +389,15 @@ static int sysfs_read(struct ninep_fs_node *node, uint64_t offset,
 			struct ninep_sysfs_entry *child_entry = find_entry(sysfs, child_path);
 			bool is_dir = child_entry ? child_entry->is_dir : false;
 
-			/* Build qid for this child */
+			/* Build qid for this child. MUST match alloc_node() exactly --
+			 * same salt seed and same (uint8_t) char handling -- so a file
+			 * presents the same qid whether listed here or walked to. */
 			struct ninep_qid child_qid;
 			child_qid.type = is_dir ? NINEP_QTDIR : NINEP_QTFILE;
 			child_qid.version = 0;
-			/* Generate unique qid.path based on path string hash */
-			child_qid.path = 0;
+			child_qid.path = sysfs->qid_salt;
 			for (const char *p = child_path; *p; p++) {
-				child_qid.path = child_qid.path * 31 + *p;
+				child_qid.path = child_qid.path * 31 + (uint64_t)(uint8_t)*p;
 			}
 
 			/* Calculate stat entry size:
@@ -592,6 +592,25 @@ int ninep_sysfs_init(struct ninep_sysfs *sysfs,
 
 	LOG_INF("Sysfs initialized (max_entries=%zu)", max_entries);
 	return 0;
+}
+
+void ninep_sysfs_set_qid_salt(struct ninep_sysfs *sysfs, uint64_t salt)
+{
+	if (!sysfs) {
+		return;
+	}
+	sysfs->qid_salt = salt;
+	/* The root node was allocated during init with the previous (0) salt;
+	 * re-derive its qid so the WHOLE tree -- root included -- is consistently
+	 * salted, otherwise two nodes' roots still collide across simultaneous
+	 * mounts. Same hash as alloc_node()/sysfs_read(). */
+	if (sysfs->root) {
+		uint64_t h = salt;
+		for (const char *p = sysfs->root->name; *p; p++) {
+			h = h * 31 + (uint64_t)(uint8_t)*p;
+		}
+		sysfs->root->qid.path = h;
+	}
 }
 
 int ninep_sysfs_register_file(struct ninep_sysfs *sysfs,
