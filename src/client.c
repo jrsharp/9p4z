@@ -235,6 +235,32 @@ static int wait_for_tag(struct ninep_client *client, struct ninep_tag_entry *ent
 }
 
 /*
+ * Cancel a timed-out request with Tflush so the server abandons it and won't
+ * emit an orphaned late reply for the (soon-reused) tag — the cause of the
+ * "No pending request for tag" warnings on a slow/lossy link.  Best-effort:
+ * caller holds client->lock; reuses tx_buf (the original message is done with).
+ */
+static void flush_tag_locked(struct ninep_client *client, uint16_t oldtag)
+{
+	uint16_t ftag;
+	struct ninep_tag_entry *fentry = alloc_tag_locked(client, &ftag);
+
+	if (!fentry) {
+		return;
+	}
+
+	int len = ninep_build_tflush(client->tx_buf, client->buf_size, ftag,
+				     oldtag);
+	if (len > 0 &&
+	    ninep_transport_send(client->transport, client->tx_buf, len) == 0) {
+		/* Wait briefly for Rflush; the cancel is best-effort regardless. */
+		(void)wait_for_tag(client, fentry, 2000);
+	}
+
+	free_tag_locked(client, ftag);
+}
+
+/*
  * Send a T-message (already in tx_buf) and wait for its response,
  * optionally retrying on timeout.
  *
@@ -264,15 +290,26 @@ static int send_and_wait(struct ninep_client *client,
 
 		ret = wait_for_tag(client, entry, client->config->timeout_ms);
 		if (ret != -ETIMEDOUT || retries_left == 0) {
+			if (ret == -ETIMEDOUT) {
+				/* Giving up on this tag — Tflush it so the server
+				 * cancels the in-flight op and no orphaned reply
+				 * lands later. */
+				flush_tag_locked(client, entry->tag);
+			}
 			return ret;
 		}
 
 		retries_left--;
 
-		/* Release lock during backoff so a late response
+		/* Release lock during exponential backoff so a late response
 		 * can still be delivered by the recv callback. */
+		uint32_t backoff = 250u << (retries - retries_left - 1);
+
+		if (backoff > 4000u) {
+			backoff = 4000u;
+		}
 		k_mutex_unlock(&client->lock);
-		k_msleep(500);
+		k_msleep(backoff);
 		k_mutex_lock(&client->lock, K_FOREVER);
 
 		/* Late response arrived during sleep? */

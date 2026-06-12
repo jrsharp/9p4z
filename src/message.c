@@ -427,6 +427,33 @@ int ninep_build_tclunk(uint8_t *buf, size_t buf_len, uint16_t tag, uint32_t fid)
 	return offset;
 }
 
+int ninep_build_tflush(uint8_t *buf, size_t buf_len, uint16_t tag,
+		       uint16_t oldtag)
+{
+	if (!buf || buf_len < 9) {
+		return -EINVAL;
+	}
+
+	uint32_t msg_size = 7 + 2;
+
+	size_t offset = 0;
+	struct ninep_msg_header hdr = {
+		.size = msg_size,
+		.type = NINEP_TFLUSH,
+		.tag = tag,
+	};
+
+	int ret = ninep_write_header(buf, buf_len, &hdr);
+	if (ret < 0) {
+		return ret;
+	}
+	offset = 7;
+
+	write_u16_le(buf, &offset, oldtag);
+
+	return offset;
+}
+
 int ninep_build_rclunk(uint8_t *buf, size_t buf_len, uint16_t tag)
 {
 	if (!buf || buf_len < 7) {

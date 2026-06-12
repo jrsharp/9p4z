@@ -177,6 +177,15 @@ int ninep_build_ropen(uint8_t *buf, size_t buf_len, uint16_t tag,
 int ninep_build_tclunk(uint8_t *buf, size_t buf_len, uint16_t tag, uint32_t fid);
 
 /**
+ * @brief Build a Tflush message (cancel a pending request)
+ *
+ * @param oldtag  Tag of the in-flight request to cancel
+ * @return Number of bytes written, or negative error code
+ */
+int ninep_build_tflush(uint8_t *buf, size_t buf_len, uint16_t tag,
+		       uint16_t oldtag);
+
+/**
  * @brief Build an Rclunk message
  *
  * @param buf Output buffer
