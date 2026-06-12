@@ -136,6 +136,21 @@ void ninep_client_get_stats(struct ninep_client *client,
 	k_mutex_unlock(&client->lock);
 }
 
+size_t ninep_client_last_ename(struct ninep_client *client, char *buf, size_t size)
+{
+	if (!buf || size == 0) return 0;
+	buf[0] = '\0';
+	if (!client) return 0;
+
+	k_mutex_lock(&client->lock, K_FOREVER);
+	size_t n = strlen(client->last_ename);
+	if (n >= size) n = size - 1;
+	memcpy(buf, client->last_ename, n);
+	buf[n] = '\0';
+	k_mutex_unlock(&client->lock);
+	return n;
+}
+
 static struct ninep_client_fid *find_fid_locked(struct ninep_client *client, uint32_t fid)
 {
 	for (size_t i = 0; i < client->max_fids; i++) {
@@ -191,12 +206,41 @@ static void client_recv_callback(struct ninep_transport *transport,
 		const char *ename;
 		uint16_t ename_len;
 
+		/* Default if we can't parse / unknown ename */
+		entry->error = -EIO;
+		client->last_ename[0] = '\0';
+
 		if (ninep_parse_string(buf, len, &offset, &ename, &ename_len) == 0) {
 			LOG_ERR("9P error: %.*s", ename_len, ename);
+
+			/* Surface the raw ename to callers via the client-level
+			 * last_ename slot. Callers should read it immediately
+			 * after a failed op; subsequent ops will overwrite. */
+			size_t cap = sizeof(client->last_ename) - 1;
+			size_t n = ename_len < cap ? ename_len : cap;
+			memcpy(client->last_ename, ename, n);
+			client->last_ename[n] = '\0';
+
+			/* Map well-known enames to specific errnos so callers
+			 * (gopher/netdial/etc.) can branch without parsing
+			 * strings. Match Plan 9 convention where possible. */
+			if (ename_len >= 17 &&
+			    memcmp(ename, "permission denied", 17) == 0) {
+				entry->error = -EACCES;
+			} else if (ename_len >= 14 &&
+			           memcmp(ename, "not authorized", 14) == 0) {
+				entry->error = -EPERM;
+			} else if (ename_len >= 9 &&
+			           memcmp(ename, "not found", 9) == 0) {
+				entry->error = -ENOENT;
+			} else if (ename_len >= 14 &&
+			           memcmp(ename, "file not found", 14) == 0) {
+				entry->error = -ENOENT;
+			}
 		}
-		entry->error = -EIO;
 	} else {
 		entry->error = 0;
+		client->last_ename[0] = '\0';
 	}
 
 	entry->complete = true;

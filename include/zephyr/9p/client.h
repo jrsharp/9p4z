@@ -143,6 +143,13 @@ struct ninep_client {
 	uint16_t next_tag;
 	uint8_t max_retries;  /* Retry count on timeout (0=no retry) */
 
+	/* Last server-reported error string (ename from the most recent
+	 * Rerror). Updated under client->lock by the receive callback. Valid
+	 * immediately after a failed op; subsequent ops will overwrite. Set
+	 * to "" on successful responses. Use ninep_client_last_ename() rather
+	 * than reading this directly. */
+	char last_ename[64];
+
 	/* Synchronization */
 	struct k_mutex lock;       /* Protects TX and tag table */
 	struct k_condvar resp_cv;  /* Signaled when any response arrives */
@@ -325,6 +332,33 @@ void ninep_client_free_fid(struct ninep_client *client, uint32_t fid);
  * @brief Dump fid and tag usage to log (diagnostic)
  */
 void ninep_client_dump_fids(struct ninep_client *client);
+
+/**
+ * @brief Get the ename string from the most recent server Rerror
+ *
+ * The 9P client maps well-known enames (e.g. "permission denied" → -EACCES,
+ * "not found" → -ENOENT) to specific errnos so callers can branch on the
+ * error type. For UX where the user needs to see the server's actual
+ * message ("guest connect budget exhausted" etc.), this accessor returns
+ * the raw ename captured from the last Rerror.
+ *
+ * Valid immediately after a failed op. Subsequent ops will overwrite. The
+ * string is empty after a successful op or if the client has never seen an
+ * Rerror.
+ *
+ * Not thread-safe across concurrent callers on the same client: if two
+ * threads issue requests in parallel and both fail, only the second
+ * thread's ename is visible. Most clients are single-threaded; for the
+ * multi-threaded case, pair the ename read with the same lock you use to
+ * serialize requests.
+ *
+ * @param client Client instance
+ * @param buf    Output buffer (NUL-terminated on return)
+ * @param size   Size of output buffer
+ * @return Number of characters written (excluding NUL), or 0 if empty
+ */
+size_t ninep_client_last_ename(struct ninep_client *client, char *buf,
+                                size_t size);
 
 /**
  * @brief Fid / tag pool statistics

@@ -180,6 +180,47 @@ static void send_error(struct ninep_server *server, uint16_t tag, const char *er
 }
 
 /*
+ * Map an errno from fs_ops to a Plan 9-style ename string.
+ *
+ * Sent to the client so it can both display the string and map well-known
+ * names back to specific errnos via the recv-side ename→errno table in
+ * client.c. End-to-end this gives callers an actionable errno (EACCES,
+ * ENOENT, ...) instead of every fs-op failure being squashed to EIO.
+ *
+ * fallback is used when err doesn't match any common value (e.g. "read
+ * failed", "open failed") — callers pass an op-specific generic string so
+ * unmapped errnos still describe what failed.
+ */
+static const char *errno_to_ename(int err, const char *fallback)
+{
+	switch (err) {
+	case -EACCES:       return "permission denied";
+	case -EPERM:        return "not authorized";
+	case -ENOENT:       return "file not found";
+	case -ENOTDIR:      return "not a directory";
+	case -EISDIR:       return "is a directory";
+	case -EEXIST:       return "file already exists";
+	case -ENOSPC:       return "no space left on device";
+	case -ENOMEM:       return "out of memory";
+	case -EINVAL:       return "invalid argument";
+	case -ENOTSUP:      return "operation not supported";
+#if defined(EOPNOTSUPP) && EOPNOTSUPP != ENOTSUP
+	case -EOPNOTSUPP:   return "operation not supported";
+#endif
+	case -EAGAIN:       return "resource temporarily unavailable";
+	case -ETIMEDOUT:    return "timeout";
+	case -EIO:
+	default:            return fallback;
+	}
+}
+
+static void send_error_errno(struct ninep_server *server, uint16_t tag,
+                             int err, const char *fallback)
+{
+	send_error(server, tag, errno_to_ename(err, fallback));
+}
+
+/*
  * Resolve the identity to surface to fs_ops / check_perm callbacks.
  *
  * For a fid that completed Tauth challenge-response (sfid->authenticated
@@ -663,7 +704,7 @@ static void handle_topen(struct ninep_server *server, uint16_t tag,
 	int ret = server->config.fs_ops->open(sfid->node, mode,
 	                                        server->config.fs_ctx);
 	if (ret < 0) {
-		send_error(server, tag, "open failed");
+		send_error_errno(server, tag, ret, "open failed");
 		return;
 	}
 
@@ -767,7 +808,7 @@ static void handle_tread(struct ninep_server *server, uint16_t tag,
 	                                          fid_identity(server, sfid),
 	                                          server->config.fs_ctx);
 	if (bytes < 0) {
-		send_error(server, tag, "read failed");
+		send_error_errno(server, tag, bytes, "read failed");
 		return;
 	}
 
@@ -800,7 +841,7 @@ static void handle_tstat(struct ninep_server *server, uint16_t tag,
 	                                             sizeof(stat_buf),
 	                                             server->config.fs_ctx);
 	if (stat_len < 0) {
-		send_error(server, tag, "stat failed");
+		send_error_errno(server, tag, stat_len, "stat failed");
 		return;
 	}
 
@@ -977,7 +1018,7 @@ static void handle_tcreate(struct ninep_server *server, uint16_t tag,
 		sfid->node, name, name_len, perm, mode, uname, &new_node, server->config.fs_ctx);
 
 	if (ret < 0 || !new_node) {
-		send_error(server, tag, "create failed");
+		send_error_errno(server, tag, ret, "create failed");
 		return;
 	}
 
@@ -1130,7 +1171,7 @@ static void handle_twrite(struct ninep_server *server, uint16_t tag,
 	int bytes = server->config.fs_ops->write(sfid->node, offset, data, count,
 	                                           uname, server->config.fs_ctx);
 	if (bytes < 0) {
-		send_error(server, tag, "write failed");
+		send_error_errno(server, tag, bytes, "write failed");
 		return;
 	}
 
@@ -1172,7 +1213,7 @@ static void handle_tremove(struct ninep_server *server, uint16_t tag,
 	/* Remove file/directory */
 	int ret = server->config.fs_ops->remove(sfid->node, server->config.fs_ctx);
 	if (ret < 0) {
-		send_error(server, tag, "remove failed");
+		send_error_errno(server, tag, ret, "remove failed");
 		return;
 	}
 
