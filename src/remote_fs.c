@@ -259,7 +259,40 @@ static int rmount_write(struct ninep_fs_node *node, uint64_t offset,
 	if (fid == NINEP_NOFID) {
 		return -ESTALE;
 	}
-	return ninep_client_write(rfs->client, fid, offset, buf, count);
+
+	/*
+	 * Rate-match the two transports. A large client write (e.g. a near-msize
+	 * firmware-OTA chunk arriving over USB-CDC) forwarded WHOLE to the upstream
+	 * server can overrun the upstream link's RX when that link is a raw
+	 * inter-chip UART with no hardware flow control (RTS/CTS) and the upstream
+	 * CPU stalls mid-receive on a slow op (a flash-page write during DFU, while
+	 * also doing real-time radio work) -> dropped bytes -> "write failed".
+	 * Forward in bounded sub-writes, each its own round-tripped Twrite: the
+	 * round-trip is the flow control, so the upstream never sees an oversized
+	 * burst. The host still issues one ordinary write; the chunking lives here
+	 * in the bridge, not in the client.
+	 */
+	uint32_t done = 0;
+
+	while (done < count) {
+		uint32_t n = count - done;
+
+		if (n > CONFIG_NINEP_REMOTE_FS_WRITE_CHUNK) {
+			n = CONFIG_NINEP_REMOTE_FS_WRITE_CHUNK;
+		}
+
+		int w = ninep_client_write(rfs->client, fid, offset + done,
+					   buf + done, n);
+		if (w < 0) {
+			return done > 0 ? (int)done : w;
+		}
+		done += (uint32_t)w;
+		if ((uint32_t)w < n) {
+			break;   /* short write -- stop and report progress */
+		}
+	}
+
+	return (int)done;
 }
 
 /* Synthesize the Rstat from the node's own cached qid/name (set at walk),

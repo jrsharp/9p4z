@@ -173,6 +173,23 @@ config NINEP_REMOTE_FS
 	  dynamic upstream trees (e.g. a Plan 9 /net clone/conversation interface)
 	  by keeping a persistent 1:1 local-fid to upstream-fid mapping.
 
+config NINEP_REMOTE_FS_WRITE_CHUNK
+	int "remote_fs forwarded-write chunk size (bytes)"
+	default 2048
+	depends on NINEP_REMOTE_FS
+	help
+	  Maximum payload the proxy forwards to the upstream server in a single
+	  Twrite. A large client write (e.g. a near-msize firmware-OTA chunk) is
+	  split into bounded, individually round-tripped sub-writes before going
+	  upstream. This rate-matches the two transports: when the upstream link is
+	  a raw inter-chip UART with no hardware flow control (RTS/CTS), forwarding
+	  a whole big burst can overrun the upstream's RX while it stalls on a slow
+	  op (a flash-page write during DFU), dropping bytes -> "write failed". The
+	  round-trip per sub-write is the flow control. The host still issues one
+	  ordinary write; the chunking lives in the bridge, not the client. Keep it
+	  comfortably below the upstream's proven-safe burst (e.g. 2048 for a 1 Mbps
+	  inter-chip UART on a CPU also doing real-time radio work).
+
 config NINEP_TRANSPORT_UART
 	bool "UART Transport"
 	depends on SERIAL
