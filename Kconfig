@@ -194,6 +194,19 @@ config NINEP_TRANSPORT_L2CAP_CLIENT
 
 	  Requires CONFIG_BT_CENTRAL for initiating BLE connections.
 
+config NINEP_TRANSPORT_AETHER
+	bool "Æther reliable-conversation Transport"
+	help
+	  Enable 9P over an Æther reliable-conversation device (/net/aether),
+	  per the aether(3) contract: one 9P message rides one reliable
+	  datagram; the device owns fragmentation, ordering, retransmit and
+	  de-dup, so the transport is thin.
+
+	  The transport is namespace- and radio-agnostic: the host injects the
+	  /net/aether file I/O (and an optional client fast path) via struct
+	  ninep_aether_io, so any provider -- LoRa, DECT NR+, IEEE 802.15.4 --
+	  can carry 9P through it unchanged.
+
 config NINEP_TRANSPORT_COAP
 	bool "CoAP Transport (Server Mode)"
 	depends on NETWORKING && COAP
