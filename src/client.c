@@ -187,10 +187,11 @@ static void client_recv_callback(struct ninep_transport *transport,
 		return;
 	}
 
-	/* Copy response to shared buffer */
+	/* Copy response into this tag's own RX buffer (per-tag when the caller
+	 * provided per-tag regions; otherwise the shared fallback). */
 	if (len <= client->buf_size) {
-		memcpy(client->resp_buf, buf, len);
-		client->resp_len = len;
+		memcpy(entry->rx, buf, len);
+		entry->rx_len = len;
 	} else {
 		LOG_ERR("Response too large: %zu > %zu", len, client->buf_size);
 		entry->error = -ENOMEM;
@@ -293,10 +294,10 @@ static void flush_tag_locked(struct ninep_client *client, uint16_t oldtag)
 		return;
 	}
 
-	int len = ninep_build_tflush(client->tx_buf, client->buf_size, ftag,
+	int len = ninep_build_tflush(fentry->tx, client->buf_size, ftag,
 				     oldtag);
 	if (len > 0 &&
-	    ninep_transport_send(client->transport, client->tx_buf, len) == 0) {
+	    ninep_transport_send(client->transport, fentry->tx, len) == 0) {
 		/* Wait briefly for Rflush; the cancel is best-effort regardless. */
 		(void)wait_for_tag(client, fentry, 2000);
 	}
@@ -327,7 +328,7 @@ static int send_and_wait(struct ninep_client *client,
 
 	for (;;) {
 		ret = ninep_transport_send(client->transport,
-					   client->tx_buf, msg_len);
+					   entry->tx, msg_len);
 		if (ret < 0) {
 			return ret;
 		}
@@ -386,26 +387,28 @@ int ninep_client_init(struct ninep_client *client,
 	client->next_fid = 0;
 	client->next_tag = 0;
 
-	/* Set up pool pointers - use external pools if provided, else embedded */
+	/* Set up pool pointers - use external pools if provided, else embedded.
+	 * pool_tx/pool_rx are the bases of the per-tag TX/RX regions (each
+	 * max_tags * buf_size); NULL means use the embedded per-tag arrays. */
+	uint8_t *pool_tx = NULL, *pool_rx = NULL;
 	if (config->pools != NULL) {
-		/* Caller-provided pools (can be in PSRAM, etc.) */
+		/* Caller-provided pools (can be in PSRAM, etc.).  tx_buf/rx_buf must
+		 * each be sized max_tags * buf_size -- one buffer per tag. */
 		client->fids = config->pools->fids;
 		client->max_fids = config->pools->max_fids;
 		client->tags = config->pools->tags;
 		client->max_tags = config->pools->max_tags;
-		client->tx_buf = config->pools->tx_buf;
-		client->resp_buf = config->pools->rx_buf;
 		client->buf_size = config->pools->buf_size;
+		pool_tx = config->pools->tx_buf;
+		pool_rx = config->pools->rx_buf;
 		LOG_INF("Using caller-provided pools (%zu fids, %zu tags, %zu buf)",
 		        client->max_fids, client->max_tags, client->buf_size);
 	} else {
-		/* Fall back to embedded arrays (backward compatibility) */
+		/* Embedded per-tag arrays. */
 		client->fids = client->_embedded_fids;
 		client->max_fids = CONFIG_NINEP_MAX_FIDS;
 		client->tags = client->_embedded_tags;
 		client->max_tags = CONFIG_NINEP_MAX_TAGS;
-		client->tx_buf = client->_embedded_tx_buf;
-		client->resp_buf = client->_embedded_resp_buf;
 		client->buf_size = CONFIG_NINEP_MAX_MESSAGE_SIZE;
 	}
 
@@ -413,9 +416,19 @@ int ninep_client_init(struct ninep_client *client,
 	k_mutex_init(&client->lock);
 	k_condvar_init(&client->resp_cv);
 
-	/* Initialize tag entries (all start free) */
+	/* Initialize tag entries (all start free) and wire each tag's own TX/RX
+	 * buffer so concurrent in-flight requests don't clobber each other
+	 * (true 9P tag multiplexing). */
 	for (size_t i = 0; i < client->max_tags; i++) {
 		client->tags[i].in_use = false;
+		if (pool_tx != NULL) {
+			client->tags[i].tx = pool_tx + i * client->buf_size;
+			client->tags[i].rx = pool_rx + i * client->buf_size;
+		} else {
+			client->tags[i].tx = client->_embedded_tx_buf[i];
+			client->tags[i].rx = client->_embedded_rx_buf[i];
+		}
+		client->tags[i].rx_len = 0;
 	}
 
 	/* Set transport callback */
@@ -456,7 +469,7 @@ int ninep_client_version(struct ninep_client *client)
 	}
 
 	/* Build Tversion */
-	int len = ninep_build_tversion(client->tx_buf, client->buf_size,
+	int len = ninep_build_tversion(entry->tx, client->buf_size,
 	                                NINEP_NOTAG, client->config->max_message_size,
 	                                client->config->version,
 	                                strlen(client->config->version));
@@ -479,9 +492,9 @@ int ninep_client_version(struct ninep_client *client)
 	}
 
 	/* Parse Rversion to get negotiated msize */
-	if (client->resp_len >= 11) {
-		client->msize = client->resp_buf[7] | (client->resp_buf[8] << 8) |
-		                (client->resp_buf[9] << 16) | (client->resp_buf[10] << 24);
+	if (entry->rx_len >= 11) {
+		client->msize = entry->rx[7] | (entry->rx[8] << 8) |
+		                (entry->rx[9] << 16) | (entry->rx[10] << 24);
 		LOG_INF("Negotiated msize: %u", client->msize);
 	}
 
@@ -522,7 +535,7 @@ int ninep_client_auth(struct ninep_client *client, uint32_t *afid,
 afid_allocated:;
 
 	/* Build Tauth */
-	int len = ninep_build_tauth(client->tx_buf, client->buf_size,
+	int len = ninep_build_tauth(entry->tx, client->buf_size,
 	                            tag, allocated_afid,
 	                            uname, strlen(uname),
 	                            aname, strlen(aname));
@@ -547,9 +560,9 @@ afid_allocated:;
 
 	/* Parse Rauth to get auth qid */
 	struct ninep_client_fid *cfid = find_fid_locked(client, allocated_afid);
-	if (cfid && client->resp_len >= 20) {
+	if (cfid && entry->rx_len >= 20) {
 		size_t offset = 7;
-		ninep_parse_qid(client->resp_buf, client->resp_len, &offset, &cfid->qid);
+		ninep_parse_qid(entry->rx, entry->rx_len, &offset, &cfid->qid);
 		if (aqid) {
 			*aqid = cfid->qid;
 		}
@@ -592,7 +605,7 @@ int ninep_client_attach(struct ninep_client *client, uint32_t *fid,
 fid_allocated:;
 
 	/* Build Tattach */
-	int len = ninep_build_tattach(client->tx_buf, client->buf_size,
+	int len = ninep_build_tattach(entry->tx, client->buf_size,
 	                               tag, allocated_fid, afid,
 	                               uname, strlen(uname),
 	                               aname, strlen(aname));
@@ -617,9 +630,9 @@ fid_allocated:;
 
 	/* Parse Rattach to get root qid */
 	struct ninep_client_fid *cfid = find_fid_locked(client, allocated_fid);
-	if (cfid && client->resp_len >= 20) {
+	if (cfid && entry->rx_len >= 20) {
 		size_t offset = 7;
-		ninep_parse_qid(client->resp_buf, client->resp_len, &offset, &cfid->qid);
+		ninep_parse_qid(entry->rx, entry->rx_len, &offset, &cfid->qid);
 	}
 
 	free_tag_locked(client, tag);
@@ -677,7 +690,7 @@ fid_allocated:;
 	}
 
 	/* Build Twalk */
-	int len = ninep_build_twalk(client->tx_buf, client->buf_size,
+	int len = ninep_build_twalk(entry->tx, client->buf_size,
 	                             tag, fid, allocated_fid, nwname, wnames, wname_lens);
 	if (len < 0) {
 		struct ninep_client_fid *cfid = find_fid_locked(client, allocated_fid);
@@ -712,11 +725,11 @@ fid_allocated:;
 
 	/* Parse Rwalk to get final qid */
 	struct ninep_client_fid *cfid = find_fid_locked(client, allocated_fid);
-	if (cfid && client->resp_len >= 9) {
-		uint16_t nwqid = client->resp_buf[7] | (client->resp_buf[8] << 8);
+	if (cfid && entry->rx_len >= 9) {
+		uint16_t nwqid = entry->rx[7] | (entry->rx[8] << 8);
 		if (nwqid > 0) {
 			size_t offset = 9 + (nwqid - 1) * 13;
-			ninep_parse_qid(client->resp_buf, client->resp_len, &offset, &cfid->qid);
+			ninep_parse_qid(entry->rx, entry->rx_len, &offset, &cfid->qid);
 		}
 	}
 
@@ -739,7 +752,7 @@ int ninep_client_open(struct ninep_client *client, uint32_t fid, uint8_t mode)
 	}
 
 	/* Build Topen */
-	int len = ninep_build_topen(client->tx_buf, client->buf_size,
+	int len = ninep_build_topen(entry->tx, client->buf_size,
 	                             tag, fid, mode);
 	if (len < 0) {
 		free_tag_locked(client, tag);
@@ -758,9 +771,9 @@ int ninep_client_open(struct ninep_client *client, uint32_t fid, uint8_t mode)
 
 	/* Parse Ropen to get iounit */
 	struct ninep_client_fid *cfid = find_fid_locked(client, fid);
-	if (cfid && client->resp_len >= 24) {
-		cfid->iounit = client->resp_buf[20] | (client->resp_buf[21] << 8) |
-		               (client->resp_buf[22] << 16) | (client->resp_buf[23] << 24);
+	if (cfid && entry->rx_len >= 24) {
+		cfid->iounit = entry->rx[20] | (entry->rx[21] << 8) |
+		               (entry->rx[22] << 16) | (entry->rx[23] << 24);
 	}
 
 	free_tag_locked(client, tag);
@@ -784,7 +797,7 @@ int ninep_client_read(struct ninep_client *client, uint32_t fid,
 	}
 
 	/* Build Tread */
-	int len = ninep_build_tread(client->tx_buf, client->buf_size,
+	int len = ninep_build_tread(entry->tx, client->buf_size,
 	                             tag, fid, offset, count);
 	if (len < 0) {
 		free_tag_locked(client, tag);
@@ -802,15 +815,15 @@ int ninep_client_read(struct ninep_client *client, uint32_t fid,
 	}
 
 	/* Parse Rread and copy data to caller's buffer */
-	if (client->resp_len >= 11) {
-		uint32_t data_count = client->resp_buf[7] | (client->resp_buf[8] << 8) |
-		                      (client->resp_buf[9] << 16) | (client->resp_buf[10] << 24);
+	if (entry->rx_len >= 11) {
+		uint32_t data_count = entry->rx[7] | (entry->rx[8] << 8) |
+		                      (entry->rx[9] << 16) | (entry->rx[10] << 24);
 
 		if (data_count > count) {
 			data_count = count;
 		}
 
-		memcpy(buf, &client->resp_buf[11], data_count);
+		memcpy(buf, &entry->rx[11], data_count);
 		result = data_count;
 	} else {
 		result = -EIO;
@@ -837,7 +850,7 @@ int ninep_client_write(struct ninep_client *client, uint32_t fid,
 	}
 
 	/* Build Twrite */
-	int len = ninep_build_twrite(client->tx_buf, client->buf_size,
+	int len = ninep_build_twrite(entry->tx, client->buf_size,
 	                              tag, fid, offset, count, buf);
 	if (len < 0) {
 		free_tag_locked(client, tag);
@@ -855,9 +868,9 @@ int ninep_client_write(struct ninep_client *client, uint32_t fid,
 	}
 
 	/* Parse Rwrite */
-	if (client->resp_len >= 11) {
-		result = client->resp_buf[7] | (client->resp_buf[8] << 8) |
-		         (client->resp_buf[9] << 16) | (client->resp_buf[10] << 24);
+	if (entry->rx_len >= 11) {
+		result = entry->rx[7] | (entry->rx[8] << 8) |
+		         (entry->rx[9] << 16) | (entry->rx[10] << 24);
 	} else {
 		result = -EIO;
 	}
@@ -882,7 +895,7 @@ int ninep_client_stat(struct ninep_client *client, uint32_t fid,
 	}
 
 	/* Build Tstat */
-	int len = ninep_build_tstat(client->tx_buf, client->buf_size,
+	int len = ninep_build_tstat(entry->tx, client->buf_size,
 	                             tag, fid);
 	if (len < 0) {
 		free_tag_locked(client, tag);
@@ -907,8 +920,8 @@ int ninep_client_stat(struct ninep_client *client, uint32_t fid,
 	 */
 	int result = -EIO;
 
-	if (stat && client->resp_len >= 9 + 2 + 41) {
-		const uint8_t *b = client->resp_buf;
+	if (stat && entry->rx_len >= 9 + 2 + 41) {
+		const uint8_t *b = entry->rx;
 		size_t off = 7;  /* skip header */
 
 		/* uint16_t nstat = b[off] | (b[off+1] << 8); */
@@ -925,7 +938,7 @@ int ninep_client_stat(struct ninep_client *client, uint32_t fid,
 		off += 4;
 
 		/* Parse qid (13 bytes) */
-		ninep_parse_qid(b, client->resp_len, &off, &stat->qid);
+		ninep_parse_qid(b, entry->rx_len, &off, &stat->qid);
 
 		stat->mode = b[off] | (b[off+1] << 8) |
 		             (b[off+2] << 16) | (b[off+3] << 24);
@@ -976,7 +989,7 @@ int ninep_client_create(struct ninep_client *client, uint32_t fid,
 	}
 
 	/* Build Tcreate */
-	int len = ninep_build_tcreate(client->tx_buf, client->buf_size,
+	int len = ninep_build_tcreate(entry->tx, client->buf_size,
 	                               tag, fid, name, strlen(name), perm, mode);
 	if (len < 0) {
 		free_tag_locked(client, tag);
@@ -1006,7 +1019,7 @@ int ninep_client_remove(struct ninep_client *client, uint32_t fid)
 	}
 
 	/* Build Tremove */
-	int len = ninep_build_tremove(client->tx_buf, client->buf_size,
+	int len = ninep_build_tremove(entry->tx, client->buf_size,
 	                               tag, fid);
 	if (len < 0) {
 		free_tag_locked(client, tag);
@@ -1041,7 +1054,7 @@ int ninep_client_clunk(struct ninep_client *client, uint32_t fid)
 	}
 
 	/* Build Tclunk */
-	int len = ninep_build_tclunk(client->tx_buf, client->buf_size,
+	int len = ninep_build_tclunk(entry->tx, client->buf_size,
 	                              tag, fid);
 	if (len < 0) {
 		free_tag_locked(client, tag);

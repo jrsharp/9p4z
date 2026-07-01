@@ -52,6 +52,9 @@ struct ninep_tag_entry {
 	bool complete;          /* Response received */
 	int error;              /* Error code (0 = success) */
 	void *user_ctx;         /* Caller-provided context for result */
+	uint8_t *tx;            /* This tag's TX buffer (buf_size bytes) */
+	uint8_t *rx;            /* This tag's RX buffer (buf_size bytes) */
+	uint32_t rx_len;        /* Length of the response in rx */
 };
 
 /**
@@ -73,13 +76,16 @@ struct ninep_client_pools {
 	struct ninep_tag_entry *tags;
 	size_t max_tags;
 
-	/** Transmit buffer - sized for max message */
+	/** Per-tag transmit region - sized max_tags * buf_size (one TX buffer
+	 *  per tag, indexed tx_buf + tag_slot * buf_size). */
 	uint8_t *tx_buf;
 
-	/** Receive/response buffer - sized for max message */
+	/** Per-tag receive region - sized max_tags * buf_size (one RX buffer
+	 *  per tag).  Per-tag buffers are what make concurrent requests on one
+	 *  session multiplex correctly instead of cross-delivering. */
 	uint8_t *rx_buf;
 
-	/** Buffer size (same for tx and rx) */
+	/** Size of ONE buffer (max message); tx_buf/rx_buf are max_tags of these. */
 	size_t buf_size;
 };
 
@@ -93,9 +99,14 @@ struct ninep_client_config {
 
 	/**
 	 * Optional: caller-provided memory pools.
-	 * If NULL, the client uses embedded arrays (backward compatible).
-	 * If non-NULL, the client uses the provided pools instead,
-	 * allowing placement in PSRAM or other memory regions.
+	 * If NULL, the client uses embedded arrays (placed in this struct).
+	 * If non-NULL, the client uses the provided pools instead, allowing
+	 * placement in PSRAM or other memory regions.
+	 *
+	 * NOTE (per-tag buffers): tx_buf and rx_buf must each be sized
+	 * max_tags * buf_size -- one TX and one RX buffer PER TAG, so multiple
+	 * requests can be outstanding on one session at once (true 9P
+	 * multiplexing).  See struct ninep_client_pools.
 	 */
 	const struct ninep_client_pools *pools;
 };
@@ -104,18 +115,24 @@ struct ninep_client_config {
  * @brief 9P client instance
  *
  * Thread-safe 9P client supporting concurrent operations. Multiple threads
- * can issue 9P requests simultaneously - the client serializes TX (message
- * building and sending) but allows concurrent waits for responses.
+ * can issue 9P requests simultaneously, each on its own tag, and the responses
+ * are delivered without clobbering each other.
  *
- * Memory-efficient design:
- * - Single shared response buffer (responses arrive serially on transport)
- * - Lightweight tag tracking (no per-tag buffers or semaphores)
- * - Single condvar for all waiters (broadcast on response arrival)
+ * Design:
+ * - PER-TAG TX/RX buffers: every tag has its own buffer, so a Twrite and a
+ *   Tread (etc.) can be in flight concurrently on one session.  This is what
+ *   makes 9P tag multiplexing actually correct (a single shared buffer would
+ *   cross-deliver concurrent responses).
+ * - Lightweight tag tracking; single condvar for all waiters (broadcast on
+ *   response arrival -- each waiter checks its own tag's completion).
  *
- * This allows 64+ concurrent tags in ~2KB vs the old ~20KB.
+ * Memory cost is max_tags * buf_size * 2 (one TX + one RX buffer per tag).
+ * For small msize / few tags this is modest; place the buffers in PSRAM via
+ * config->pools when tight or when scaling max_tags up.
  *
  * Pool support: If config->pools is provided, the client uses caller-provided
- * memory pools (can be in PSRAM, etc.). Otherwise falls back to embedded arrays.
+ * memory pools (can be in PSRAM, etc.). Otherwise it uses the embedded arrays
+ * below (sized by CONFIG_NINEP_MAX_TAGS / CONFIG_NINEP_MAX_MESSAGE_SIZE).
  */
 struct ninep_client {
 	const struct ninep_client_config *config;
@@ -126,18 +143,16 @@ struct ninep_client {
 	size_t max_fids;
 	struct ninep_tag_entry *tags;
 	size_t max_tags;
-	uint8_t *tx_buf;
-	uint8_t *resp_buf;
-	size_t buf_size;
+	size_t buf_size;   /* Per-tag TX/RX buffer size (one message) */
 
-	/* Embedded arrays - used when config->pools is NULL (backward compat) */
+	/* Embedded arrays - used when config->pools is NULL.  Per-tag TX/RX
+	 * buffers so embedded clients get correct multiplexing for free. */
 	struct ninep_client_fid _embedded_fids[CONFIG_NINEP_MAX_FIDS];
 	struct ninep_tag_entry _embedded_tags[CONFIG_NINEP_MAX_TAGS];
-	uint8_t _embedded_tx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
-	uint8_t _embedded_resp_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
+	uint8_t _embedded_tx_buf[CONFIG_NINEP_MAX_TAGS][CONFIG_NINEP_MAX_MESSAGE_SIZE];
+	uint8_t _embedded_rx_buf[CONFIG_NINEP_MAX_TAGS][CONFIG_NINEP_MAX_MESSAGE_SIZE];
 
 	/* Runtime state */
-	size_t resp_len;
 	uint32_t msize;  /* Negotiated max message size */
 	uint32_t next_fid;
 	uint16_t next_tag;
