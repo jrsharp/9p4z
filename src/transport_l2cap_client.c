@@ -315,7 +315,7 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 
 	LOG_DBG("rx %u bytes (state=%d rx_len=%u exp=%u)",
 	        buf->len, ch->rx_state, ch->rx_len, ch->rx_expected);
-	LOG_INF("L2CAP[%04x] recv: %u bytes", ch->le.tx.cid, buf->len);
+	LOG_DBG("L2CAP[%04x] recv: %u bytes", ch->le.tx.cid, buf->len);
 
 	/* Process all data in the buffer */
 	while (buf->len > 0) {
@@ -402,7 +402,7 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 static void l2cap_sent(struct bt_l2cap_chan *chan)
 {
 	struct bt_l2cap_le_chan *le = BT_L2CAP_LE_CHAN(chan);
-	LOG_INF("L2CAP[%04x] TX complete", le->tx.cid);
+	LOG_DBG("L2CAP[%04x] TX complete", le->tx.cid);
 }
 #else
 /* Mainline Zephyr: .sent callback has status parameter */
@@ -1173,7 +1173,7 @@ static int l2cap_client_send(struct ninep_transport *transport,
 	struct net_buf *msg_buf;
 	int ret;
 
-	LOG_INF("L2CAP[%04x] send: %zu bytes (type=%u) credits=%d",
+	LOG_DBG("L2CAP[%04x] send: %zu bytes (type=%u) credits=%d",
 	        data->channel.le.tx.cid, len,
 	        len >= 5 ? buf[4] : 0,
 	        (int)atomic_get(&data->channel.le.tx.credits));
