@@ -1114,9 +1114,15 @@ static void handle_tcreate(struct ninep_server *server, uint16_t tag,
 		return;
 	}
 
-	/* Update FID to point to new node */
+	/* Update FID to point to new node. Per 9P(5): Tcreate implicitly
+	 * opens the returned fid with the mode field of the request, so
+	 * subsequent Twrite/Tread on the same fid must succeed without a
+	 * separate Topen. Mirror what handle_topen does for the state the
+	 * new is_open enforcement in handle_tread/twrite looks at. */
 	sfid->node = new_node;
 	sfid->iounit = 0;
+	sfid->is_open = true;
+	sfid->open_mode = mode;
 
 	/* Send Rcreate */
 	ret = ninep_build_rcreate(server->tx_buf, server->tx_buf_size,
