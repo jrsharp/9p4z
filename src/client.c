@@ -491,12 +491,38 @@ int ninep_client_version(struct ninep_client *client)
 		return ret;
 	}
 
-	/* Parse Rversion to get negotiated msize */
-	if (entry->rx_len >= 11) {
-		client->msize = entry->rx[7] | (entry->rx[8] << 8) |
-		                (entry->rx[9] << 16) | (entry->rx[10] << 24);
-		LOG_INF("Negotiated msize: %u", client->msize);
+	/* Parse and validate Rversion. version(5): the server's msize must be
+	 * <= what we offered; we also cap it to our per-tag buffer. And the
+	 * server must actually speak our version — a "unknown" reply (or any
+	 * non-9P2000 string) means we cannot proceed. */
+	if (entry->rx_len < 13) {
+		free_tag_locked(client, tag);
+		k_mutex_unlock(&client->lock);
+		return -EIO;
 	}
+
+	uint32_t smsize = entry->rx[7] | (entry->rx[8] << 8) |
+	                  (entry->rx[9] << 16) | (entry->rx[10] << 24);
+	uint16_t sver_len = entry->rx[11] | (entry->rx[12] << 8);
+	const char *sver = (const char *)&entry->rx[13];
+
+	if (entry->rx_len < (size_t)(13 + sver_len) ||
+	    sver_len < 6 || memcmp(sver, "9P2000", 6) != 0) {
+		LOG_ERR("Server did not accept 9P2000 (version=%.*s)",
+		        (int)sver_len, sver);
+		free_tag_locked(client, tag);
+		k_mutex_unlock(&client->lock);
+		return -ENOTSUP;
+	}
+
+	client->msize = smsize;
+	if (client->msize > client->config->max_message_size) {
+		client->msize = client->config->max_message_size;
+	}
+	if (client->msize > client->buf_size) {
+		client->msize = client->buf_size;
+	}
+	LOG_INF("Negotiated msize: %u", client->msize);
 
 	free_tag_locked(client, tag);
 	k_mutex_unlock(&client->lock);
@@ -723,14 +749,31 @@ fid_allocated:;
 		return ret;
 	}
 
-	/* Parse Rwalk to get final qid */
+	/* Parse Rwalk. nwqid is how many elements the server actually walked.
+	 * If it falls short of nwname the walk stopped at a missing element:
+	 * per walk(5) the server did NOT establish newfid, so we must drop the
+	 * client-side fid and report failure rather than believe we hold a fid
+	 * for a path that doesn't fully exist. (A clone, nwname==0, yields
+	 * nwqid==0 and is a success.) */
 	struct ninep_client_fid *cfid = find_fid_locked(client, allocated_fid);
-	if (cfid && entry->rx_len >= 9) {
-		uint16_t nwqid = entry->rx[7] | (entry->rx[8] << 8);
-		if (nwqid > 0) {
-			size_t offset = 9 + (nwqid - 1) * 13;
-			ninep_parse_qid(entry->rx, entry->rx_len, &offset, &cfid->qid);
-		}
+	if (entry->rx_len < 9) {
+		if (cfid) cfid->in_use = false;
+		free_tag_locked(client, tag);
+		k_mutex_unlock(&client->lock);
+		return -EIO;
+	}
+
+	uint16_t nwqid = entry->rx[7] | (entry->rx[8] << 8);
+	if (nwqid < nwname) {
+		if (cfid) cfid->in_use = false;
+		free_tag_locked(client, tag);
+		k_mutex_unlock(&client->lock);
+		return -ENOENT;
+	}
+
+	if (cfid && nwqid > 0) {
+		size_t offset = 9 + (nwqid - 1) * 13;
+		ninep_parse_qid(entry->rx, entry->rx_len, &offset, &cfid->qid);
 	}
 
 	free_tag_locked(client, tag);
@@ -796,6 +839,16 @@ int ninep_client_read(struct ninep_client *client, uint32_t fid,
 		return -ENOMEM;
 	}
 
+	/* Cap the request so the Rread reply (11-byte header + data) fits the
+	 * negotiated msize; a short read is legal and the caller loops. */
+	uint32_t rmax = client->buf_size > 11 ? client->buf_size - 11 : 0;
+	if (client->msize > 11 && (client->msize - 11) < rmax) {
+		rmax = client->msize - 11;
+	}
+	if (count > rmax) {
+		count = rmax;
+	}
+
 	/* Build Tread */
 	int len = ninep_build_tread(entry->tx, client->buf_size,
 	                             tag, fid, offset, count);
@@ -849,6 +902,17 @@ int ninep_client_write(struct ninep_client *client, uint32_t fid,
 		return -ENOMEM;
 	}
 
+	/* Cap the payload so the Twrite (23-byte header + data) fits the
+	 * negotiated msize; a strict peer drops an over-msize message, so do a
+	 * short write and let the caller loop. */
+	uint32_t wmax = client->buf_size > 23 ? client->buf_size - 23 : 0;
+	if (client->msize > 23 && (client->msize - 23) < wmax) {
+		wmax = client->msize - 23;
+	}
+	if (count > wmax) {
+		count = wmax;
+	}
+
 	/* Build Twrite */
 	int len = ninep_build_twrite(entry->tx, client->buf_size,
 	                              tag, fid, offset, count, buf);
@@ -858,8 +922,11 @@ int ninep_client_write(struct ninep_client *client, uint32_t fid,
 		return len;
 	}
 
-	/* Send and wait — write is idempotent (same offset), safe to retry */
-	int ret = send_and_wait(client, entry, len, client->max_retries);
+	/* Send and wait with NO retry: Twrite is not idempotent in general. A
+	 * write to an append-only (DMAPPEND) file or a synthetic ctl/command
+	 * file ignores the offset, so a retransmit after a lost Rwrite would
+	 * duplicate the append or re-run the command. */
+	int ret = send_and_wait(client, entry, len, 0);
 	if (ret < 0) {
 		LOG_ERR("Write request failed: %d", ret);
 		free_tag_locked(client, tag);

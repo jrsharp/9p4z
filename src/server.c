@@ -143,6 +143,8 @@ static struct ninep_server_fid *alloc_fid(struct ninep_server *server, uint32_t 
 			server->fids[i].uname_idx = NINEP_POOL_NONE;
 			server->fids[i].auth_idx = NINEP_POOL_NONE;
 			server->fids[i].is_auth_fid = false;
+			server->fids[i].is_open = false;
+			server->fids[i].open_mode = 0;
 			return &server->fids[i];
 		}
 	}
@@ -299,16 +301,53 @@ static int check_perm_or_deny(struct ninep_server *server, uint16_t tag,
 /* Handle Tversion */
 static void handle_tversion(struct ninep_server *server, const uint8_t *msg, size_t len)
 {
+	uint16_t tag = msg[5] | (msg[6] << 8);
+
+	/* header[7] + msize[4] + version-count[2] */
+	if (len < 13) {
+		send_error(server, tag, "bad Tversion");
+		return;
+	}
+
 	uint32_t msize = msg[7] | (msg[8] << 8) | (msg[9] << 16) | (msg[10] << 24);
 	uint16_t version_len = msg[11] | (msg[12] << 8);
 	const char *version = (const char *)&msg[13];
 
+	if (len < (size_t)(13 + version_len)) {
+		send_error(server, tag, "bad Tversion");
+		return;
+	}
+
 	LOG_INF("Tversion: msize=%u, version=%.*s", msize, version_len, version);
 
-	/* Tversion flushes all server state - clear all fids and pools */
+	/* Negotiate msize down to min(client, config, transport MTU). Touches
+	 * no session state, so it is safe to do before validating the version. */
+	if (msize > CONFIG_NINEP_MAX_MESSAGE_SIZE) {
+		msize = CONFIG_NINEP_MAX_MESSAGE_SIZE;
+	}
+	int transport_mtu = ninep_transport_get_mtu(server->transport);
+	if (transport_mtu > 0 && (uint32_t)transport_mtu < msize) {
+		LOG_INF("Limiting msize to transport MTU: %u -> %d", msize, transport_mtu);
+		msize = transport_mtu;
+	}
+
+	/* version(5): we speak 9P2000. Any version whose leading 6 bytes are
+	 * "9P2000" (incl. 9P2000.u / 9P2000.L) negotiates down to plain 9P2000.
+	 * Anything else is refused with Rversion "unknown" -- NOT Rerror -- and
+	 * leaves the session untouched, since a garbled Tversion must not tear
+	 * down a live session. */
+	if (version_len < 6 || strncmp(version, "9P2000", 6) != 0) {
+		int ret = ninep_build_rversion(server->tx_buf, server->tx_buf_size,
+		                                tag, msize, "unknown", 7);
+		if (ret > 0) {
+			ninep_transport_send(server->transport, server->tx_buf, ret);
+		}
+		return;
+	}
+
+	/* Version accepted: Tversion resets all session state. */
 	for (int i = 0; i < CONFIG_NINEP_SERVER_MAX_FIDS; i++) {
 		if (server->fids[i].in_use) {
-			/* Release pooled resources */
 			if (server->fids[i].uname_idx != NINEP_POOL_NONE) {
 				uname_release(server, server->fids[i].uname_idx);
 			}
@@ -321,35 +360,13 @@ static void handle_tversion(struct ninep_server *server, const uint8_t *msg, siz
 		server->fids[i].uname_idx = NINEP_POOL_NONE;
 		server->fids[i].auth_idx = NINEP_POOL_NONE;
 	}
-	/* Clear pools */
 	memset(server->uname_refcount, 0, sizeof(server->uname_refcount));
 	memset(server->auth_pool_used, 0, sizeof(server->auth_pool_used));
-	LOG_DBG("All fids and pools cleared for new session");
 
-	/* Negotiate message size - use minimum of client, config, and transport MTU */
-	if (msize > CONFIG_NINEP_MAX_MESSAGE_SIZE) {
-		msize = CONFIG_NINEP_MAX_MESSAGE_SIZE;
-	}
-
-	/* Further limit by transport MTU if available */
-	int transport_mtu = ninep_transport_get_mtu(server->transport);
-	if (transport_mtu > 0 && (uint32_t)transport_mtu < msize) {
-		LOG_INF("Limiting msize to transport MTU: %u -> %d", msize, transport_mtu);
-		msize = transport_mtu;
-	}
-
-	/* Check version */
-	if (version_len != 6 || strncmp(version, "9P2000", 6) != 0) {
-		send_error(server, NINEP_NOTAG, "unsupported version");
-		return;
-	}
-
-	/* Store negotiated msize for read/write capping */
 	server->msize = msize;
 
-	/* Send Rversion */
 	int ret = ninep_build_rversion(server->tx_buf, server->tx_buf_size,
-	                                 NINEP_NOTAG, msize, "9P2000", 6);
+	                                tag, msize, "9P2000", 6);
 	if (ret > 0) {
 		ninep_transport_send(server->transport, server->tx_buf, ret);
 	}
@@ -391,9 +408,9 @@ static void handle_tattach(struct ninep_server *server, uint16_t tag,
 	 * uname starts at offset 15 */
 	uint16_t uname_len = 0;
 	const char *uname = "anonymous";  /* Default if parsing fails */
-	if (len > 17) {  /* Need at least 2 bytes for length */
+	if (len >= 17) {  /* header[7] fid[4] afid[4] + uname-count[2] */
 		uname_len = msg[15] | (msg[16] << 8);
-		if (len >= 17 + uname_len && uname_len > 0) {
+		if (len >= (size_t)(17 + uname_len) && uname_len > 0) {
 			uname = (const char *)&msg[17];
 		}
 	}
@@ -421,8 +438,14 @@ static void handle_tattach(struct ninep_server *server, uint16_t tag,
 			return;
 		}
 
-		/* Verify uname matches authenticated identity */
-		if (uname_len > 0 && strncmp(uname, auth_state->claimed_identity, uname_len) != 0) {
+		/* Verify uname matches the authenticated identity exactly. A
+		 * length-bounded strncmp alone is a prefix match -- uname "ad"
+		 * would pass against an authenticated "admin" -- so the lengths
+		 * must agree too. An empty uname is a deliberate "use my auth
+		 * identity" and skips the check. */
+		if (uname_len > 0 &&
+		    (uname_len != strlen(auth_state->claimed_identity) ||
+		     strncmp(uname, auth_state->claimed_identity, uname_len) != 0)) {
 			LOG_WRN("Tattach uname mismatch: claimed='%.*s', auth='%s'",
 			        uname_len, uname, auth_state->claimed_identity);
 			send_error(server, tag, "uname does not match authenticated identity");
@@ -563,6 +586,21 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 		return;
 	}
 
+	/* walk(5): it is illegal to walk an open fid, whether or not nwname
+	 * is 0. */
+	if (sfid->is_open) {
+		send_error(server, tag, "cannot walk an open fid");
+		return;
+	}
+
+	/* walk(5): at most MAXWELEM name elements. Reject an over-long walk
+	 * rather than silently truncating it and returning a newfid the client
+	 * will believe walked the full path. */
+	if (nwname > NINEP_MAX_WELEM) {
+		send_error(server, tag, "too many name elements");
+		return;
+	}
+
 	/* If nwname is 0, clone the FID */
 	if (nwname == 0) {
 		struct ninep_server_fid *new_sfid = alloc_fid(server, newfid);
@@ -599,10 +637,7 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 	size_t offset = 17;
 	int nwqid = 0;  /* Track actual number of successfully walked elements */
 
-	/* Limit walk to NINEP_MAX_WELEM per 9P2000 spec */
-	int max_walk = (nwname > NINEP_MAX_WELEM) ? NINEP_MAX_WELEM : nwname;
-
-	for (int i = 0; i < max_walk; i++) {
+	for (int i = 0; i < nwname; i++) {
 		/* Bounds check: need at least 2 bytes for name_len */
 		if (offset + 2 > len) {
 			if (node != sfid->node && server->config.fs_ops->clunk) {
@@ -641,7 +676,22 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 		}
 
 		if (!next) {
-			send_error(server, tag, "file not found");
+			/* walk(5): if the FIRST element fails to walk, the whole
+			 * request is an Rerror. A later element failing is NOT an
+			 * error — return a partial Rwalk with the qids gathered so
+			 * far and leave newfid unset, so the client knows the walk
+			 * stopped short. */
+			if (i == 0) {
+				send_error(server, tag, "file not found");
+				return;
+			}
+			int rerr = ninep_build_rwalk(server->tx_buf,
+			                             server->tx_buf_size,
+			                             tag, nwqid, wqids);
+			if (rerr > 0) {
+				ninep_transport_send(server->transport,
+				                     server->tx_buf, rerr);
+			}
 			return;
 		}
 
@@ -650,7 +700,7 @@ static void handle_twalk(struct ninep_server *server, uint16_t tag,
 		nwqid++;
 	}
 
-	/* Allocate new FID */
+	/* Full walk (nwqid == nwname): establish newfid at the final node. */
 	struct ninep_server_fid *new_sfid = alloc_fid(server, newfid);
 
 	if (!new_sfid) {
@@ -695,6 +745,12 @@ static void handle_topen(struct ninep_server *server, uint16_t tag,
 		return;
 	}
 
+	/* open(5): a fid may be opened only once. */
+	if (sfid->is_open) {
+		send_error(server, tag, "fid already open");
+		return;
+	}
+
 	/* Per-operation permission check. Sends Rerror itself on denial. */
 	if (check_perm_or_deny(server, tag, sfid, mode) < 0) {
 		return;
@@ -708,13 +764,20 @@ static void handle_topen(struct ninep_server *server, uint16_t tag,
 		return;
 	}
 
-	/* Set iounit based on actual transport MTU, not just config */
+	sfid->is_open = true;
+	sfid->open_mode = mode;
+
+	/* iounit is the largest guaranteed atomic read/write; base it on the
+	 * negotiated msize (further limited by the transport MTU), not the
+	 * compile-time maximum — otherwise we advertise more than the client
+	 * agreed to accept. */
+	uint32_t eff = server->msize ? server->msize
+	                             : CONFIG_NINEP_MAX_MESSAGE_SIZE;
 	int transport_mtu = ninep_transport_get_mtu(server->transport);
-	if (transport_mtu > 24) {
-		sfid->iounit = transport_mtu - 24; /* MTU minus Twrite/Rread header */
-	} else {
-		sfid->iounit = CONFIG_NINEP_MAX_MESSAGE_SIZE - 24; /* Fallback */
+	if (transport_mtu > 0 && (uint32_t)transport_mtu < eff) {
+		eff = transport_mtu;
 	}
+	sfid->iounit = eff > 24 ? eff - 24 : 0; /* minus Twrite/Rread header */
 
 	/* Send Ropen */
 	ret = ninep_build_ropen(server->tx_buf, server->tx_buf_size,
@@ -735,6 +798,12 @@ static void handle_topen(struct ninep_server *server, uint16_t tag,
 static void handle_tread(struct ninep_server *server, uint16_t tag,
                          const uint8_t *msg, size_t len)
 {
+	/* size[4] type[1] tag[2] fid[4] offset[8] count[4] = 23 bytes */
+	if (len < 23) {
+		send_error(server, tag, "malformed Tread");
+		return;
+	}
+
 	uint32_t fid = msg[7] | (msg[8] << 8) | (msg[9] << 16) | (msg[10] << 24);
 	uint64_t offset = msg[11] | ((uint64_t)msg[12] << 8) | ((uint64_t)msg[13] << 16) |
 	                  ((uint64_t)msg[14] << 24) | ((uint64_t)msg[15] << 32) |
@@ -790,6 +859,18 @@ static void handle_tread(struct ninep_server *server, uint16_t tag,
 
 	if (!sfid->node) {
 		send_error(server, tag, "unknown fid");
+		return;
+	}
+
+	/* read(5): the fid must be opened for reading. Requiring a prior Topen
+	 * also means the open-time permission check cannot be bypassed by
+	 * walking straight to a file and reading it. */
+	if (!sfid->is_open) {
+		send_error(server, tag, "fid not open");
+		return;
+	}
+	if ((sfid->open_mode & 3) == NINEP_OWRITE) {
+		send_error(server, tag, "fid not open for reading");
 		return;
 	}
 
@@ -983,8 +1064,19 @@ static void handle_tflush(struct ninep_server *server, uint16_t tag,
 static void handle_tcreate(struct ninep_server *server, uint16_t tag,
                            const uint8_t *msg, size_t len)
 {
+	/* size[4] type[1] tag[2] fid[4] name[s] perm[4] mode[1] */
+	if (len < 13) {
+		send_error(server, tag, "malformed Tcreate");
+		return;
+	}
 	uint32_t fid = msg[7] | (msg[8] << 8) | (msg[9] << 16) | (msg[10] << 24);
 	uint16_t name_len = msg[11] | (msg[12] << 8);
+
+	/* Refuse to index perm/mode past the received frame. */
+	if (len < (size_t)(13 + name_len + 5)) {
+		send_error(server, tag, "malformed Tcreate");
+		return;
+	}
 	const char *name = (const char *)&msg[13];
 	uint32_t perm = msg[13 + name_len] | (msg[14 + name_len] << 8) |
 	                (msg[15 + name_len] << 16) | (msg[16 + name_len] << 24);
@@ -1040,6 +1132,12 @@ static void handle_tcreate(struct ninep_server *server, uint16_t tag,
 static void handle_twrite(struct ninep_server *server, uint16_t tag,
                           const uint8_t *msg, size_t len)
 {
+	/* size[4] type[1] tag[2] fid[4] offset[8] count[4] data[count] */
+	if (len < 23) {
+		send_error(server, tag, "malformed Twrite");
+		return;
+	}
+
 	uint32_t fid = msg[7] | (msg[8] << 8) | (msg[9] << 16) | (msg[10] << 24);
 	uint64_t offset = msg[11] | ((uint64_t)msg[12] << 8) | ((uint64_t)msg[13] << 16) |
 	                  ((uint64_t)msg[14] << 24) | ((uint64_t)msg[15] << 32) |
@@ -1047,6 +1145,12 @@ static void handle_twrite(struct ninep_server *server, uint16_t tag,
 	                  ((uint64_t)msg[18] << 56);
 	uint32_t count = msg[19] | (msg[20] << 8) | (msg[21] << 16) | (msg[22] << 24);
 	const uint8_t *data = &msg[23];
+
+	/* Refuse to read data past the received frame. */
+	if ((len - 23) < count) {
+		send_error(server, tag, "malformed Twrite");
+		return;
+	}
 
 	LOG_DBG("Twrite: fid=%u, offset=%llu, count=%u", fid, offset, count);
 
@@ -1157,6 +1261,19 @@ static void handle_twrite(struct ninep_server *server, uint16_t tag,
 
 	if (!sfid->node) {
 		send_error(server, tag, "unknown fid");
+		return;
+	}
+
+	/* write(5): the fid must be opened for writing. As with Tread, this
+	 * also stops a client from bypassing the open-time permission check by
+	 * walking straight to a file and writing it. */
+	if (!sfid->is_open) {
+		send_error(server, tag, "fid not open");
+		return;
+	}
+	if ((sfid->open_mode & 3) == NINEP_OREAD ||
+	    (sfid->open_mode & 3) == NINEP_OEXEC) {
+		send_error(server, tag, "fid not open for writing");
 		return;
 	}
 

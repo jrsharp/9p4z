@@ -120,10 +120,44 @@ static int gen_large_bin(uint8_t *buf, size_t buf_size,
 	return to_copy;
 }
 
+/* RAM-backed writable file for the write stress tests. Reset per test. */
+static uint8_t rw_buf[2048];
+static size_t rw_len;
+
+static int gen_rw(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx)
+{
+	ARG_UNUSED(ctx);
+	if (offset >= rw_len) {
+		return 0;
+	}
+	size_t to_copy = rw_len - offset;
+	if (to_copy > buf_size) {
+		to_copy = buf_size;
+	}
+	memcpy(buf, rw_buf + offset, to_copy);
+	return to_copy;
+}
+
+static int write_rw(const uint8_t *buf, uint32_t count, uint64_t offset,
+                    void *ctx)
+{
+	ARG_UNUSED(ctx);
+	if (offset + count > sizeof(rw_buf)) {
+		return -ENOSPC;
+	}
+	memcpy(rw_buf + offset, buf, count);
+	if (offset + count > rw_len) {
+		rw_len = offset + count;
+	}
+	return count;
+}
+
 /* Setup */
-static void *stress_setup(void)
+static void stress_before(void *fixture)
 {
 	int ret;
+
+	ARG_UNUSED(fixture);
 
 	memset(&client_transport, 0, sizeof(client_transport));
 	memset(&server_transport, 0, sizeof(server_transport));
@@ -152,12 +186,16 @@ static void *stress_setup(void)
 	ninep_sysfs_register_file(&sysfs, "/dir1/dir2/deep.txt", gen_static,
 	                           (void *)deep_content);
 
-	/* Writable file for stress tests */
-	ninep_sysfs_register_file(&sysfs, "/writable.dat", gen_static,
-	                           (void *)"");
+	/* Genuinely writable file (RAM-backed) for the write stress tests. */
+	rw_len = 0;
+	ninep_sysfs_register_writable_file(&sysfs, "/writable.dat", gen_rw,
+	                                   write_rw, NULL);
 
-	/* Initialize server */
-	struct ninep_server_config server_config = {
+	/* Initialize server. Configs must be static: the client keeps its
+	 * config by pointer, so a stack local would dangle when this hook
+	 * returns (see client_server_test.c for the full rationale). */
+	static struct ninep_server_config server_config;
+	server_config = (struct ninep_server_config){
 		.fs_ops = ninep_sysfs_get_ops(),
 		.fs_ctx = &sysfs,
 		.max_message_size = CONFIG_NINEP_MAX_MESSAGE_SIZE,
@@ -170,8 +208,9 @@ static void *stress_setup(void)
 	ret = ninep_server_start(&server);
 	zassert_equal(ret, 0, "Failed to start server");
 
-	/* Initialize client */
-	struct ninep_client_config client_config = {
+	/* Initialize client (config held by pointer — see note above). */
+	static struct ninep_client_config client_config;
+	client_config = (struct ninep_client_config){
 		.max_message_size = CONFIG_NINEP_MAX_MESSAGE_SIZE,
 		.version = "9P2000",
 		.timeout_ms = 500,  /* Shorter timeout for stress tests */
@@ -179,14 +218,13 @@ static void *stress_setup(void)
 
 	ret = ninep_client_init(&client, &client_config, &client_transport.base);
 	zassert_equal(ret, 0, "Failed to init client");
-
-	return NULL;
 }
 
-static void stress_teardown(void *fixture)
+static void stress_after(void *fixture)
 {
 	ARG_UNUSED(fixture);
 	ninep_server_stop(&server);
+	ninep_server_cleanup(&server);
 }
 
 /* Test: Large file read (near max message size) */
@@ -516,6 +554,6 @@ ZTEST(stress, test_repeated_operations)
 	ninep_client_clunk(&client, root_fid);
 }
 
-ZTEST_SUITE(stress, NULL, stress_setup, NULL, NULL, stress_teardown);
+ZTEST_SUITE(stress, NULL, NULL, stress_before, stress_after, NULL);
 
 #endif /* CONFIG_NINEP_CLIENT && CONFIG_NINEP_SERVER */

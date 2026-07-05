@@ -308,6 +308,11 @@ struct ninep_server_fid {
 	bool authenticated;   /**< True if Tattach used a verified afid (uname
 	                       *   is then a CGA validated via P-256 over a
 	                       *   challenge); false if uname was merely claimed */
+	bool is_open;         /**< True after a successful Topen. Tread/Twrite
+	                       *   require it, so they cannot bypass the
+	                       *   open-time permission check. */
+	uint8_t open_mode;    /**< The mode Topen succeeded with (low 2 bits give
+	                       *   the access direction). */
 };
 
 /**

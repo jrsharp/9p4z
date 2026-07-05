@@ -205,17 +205,42 @@ static struct ninep_fs_node *sysfs_walk(struct ninep_fs_node *parent,
 	char target_path[256];
 	char child_match[64];
 
+	/* walk(5): "." stays in the current directory. */
+	if (name_len == 1 && name[0] == '.') {
+		return parent;
+	}
+
 	/* Build parent path */
 	if (strcmp(parent->name, "/") == 0) {
 		parent_path[0] = '\0';
 	} else {
 		strncpy(parent_path, parent->name, sizeof(parent_path) - 1);
+		parent_path[sizeof(parent_path) - 1] = '\0';
 	}
 
-	/* Build target path */
+	/* walk(5): ".." goes to the parent directory; at (or above) the root
+	 * it stays at the root. */
+	if (name_len == 2 && name[0] == '.' && name[1] == '.') {
+		if (parent_path[0] == '\0') {
+			return parent;  /* already at root */
+		}
+		char up[256];
+		strncpy(up, parent_path, sizeof(up) - 1);
+		up[sizeof(up) - 1] = '\0';
+		char *slash = strrchr(up, '/');
+		if (!slash || slash == up) {
+			return sysfs->root;  /* parent was a top-level dir */
+		}
+		*slash = '\0';
+		struct ninep_sysfs_entry *pe = find_entry(sysfs, up);
+		return alloc_node(sysfs, up, pe ? pe->is_dir : true);
+	}
+
+	/* Build target path. Entries are registered with a leading slash
+	 * (e.g. "/hello.txt"), so the root-level target must carry one too or
+	 * find_entry() never matches and every top-level walk returns ENOENT. */
 	if (parent_path[0] == '\0') {
-		/* Root - don't add leading slash */
-		snprintf(target_path, sizeof(target_path), "%.*s", name_len, name);
+		snprintf(target_path, sizeof(target_path), "/%.*s", name_len, name);
 	} else {
 		snprintf(target_path, sizeof(target_path), "%s/%.*s",
 		         parent_path, name_len, name);

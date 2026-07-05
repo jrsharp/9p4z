@@ -62,6 +62,15 @@ static struct ninep_fs_node *ramfs_walk(struct ninep_fs_node *parent,
 		return NULL;
 	}
 
+	/* walk(5): "." is the current directory; ".." is the parent, and
+	 * stays at the root when the root has no parent. */
+	if (name_len == 1 && name[0] == '.') {
+		return parent;
+	}
+	if (name_len == 2 && name[0] == '.' && name[1] == '.') {
+		return parent->parent ? parent->parent : parent;
+	}
+
 	struct ninep_fs_node *child = parent->children;
 
 	while (child) {
@@ -88,7 +97,16 @@ static int ramfs_read(struct ninep_fs_node *node, uint64_t offset,
                       void *fs_ctx)
 {
 	if (node->type == NINEP_NODE_DIR) {
-		/* Read directory entries */
+		/* Read directory entries.
+		 *
+		 * read(5): directory reads return whole stat records only, and a
+		 * client presents offset == 0 or the previous offset+count (no
+		 * seeking). This walk re-scans from the start each call (O(n^2))
+		 * and emits records whose byte-range starts at `offset`; because
+		 * we never split a record and `offset` is always a record
+		 * boundary for a conformant client, successive reads stay
+		 * coherent. A count too small to hold the next whole record
+		 * yields 0 bytes here — callers must offer count >= iounit. */
 		LOG_DBG("Reading directory '%s': children=%p, offset=%llu, count=%u",
 		        node->name, node->children, offset, count);
 
