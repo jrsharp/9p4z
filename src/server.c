@@ -171,6 +171,47 @@ static void free_fid(struct ninep_server *server, uint32_t fid)
 	}
 }
 
+/*
+ * Deferred (parked) reads — see read_deferred in server.h.
+ *
+ * pending_reads[] is protected by tx_buf_mutex, which the dispatch loop
+ * already holds for the duration of every handler. Completions from other
+ * threads validate the generation token after acquiring tx_buf_mutex, so
+ * dispatch never waits on a completer and a flushed/clunked request simply
+ * yields -ESTALE to the late completer.
+ */
+
+/* Caller holds tx_buf_mutex. Returns slot index, or -1 if the table is full. */
+static int pending_read_alloc(struct ninep_server *server, uint16_t tag,
+                              uint32_t fid, uint32_t count)
+{
+	for (int i = 0; i < CONFIG_NINEP_SERVER_MAX_PENDING_READS; i++) {
+		struct ninep_pending_read *p = &server->pending_reads[i];
+		if (!p->in_use) {
+			p->in_use = true;
+			p->tag = tag;
+			p->fid = fid;
+			p->count = count;
+			p->gen = ++server->pending_gen;
+			return i;
+		}
+	}
+	return -1;
+}
+
+/* Caller holds tx_buf_mutex. Answers a parked read with zero bytes (the
+ * canonical "cancelled" answer, per hubfs convention) and frees the slot. */
+static void pending_read_cancel(struct ninep_server *server,
+                                struct ninep_pending_read *p)
+{
+	int msg_size = ninep_build_rread(server->tx_buf, server->tx_buf_size,
+	                                 p->tag, 0);
+	if (msg_size > 0) {
+		ninep_transport_send(server->transport, server->tx_buf, msg_size);
+	}
+	p->in_use = false;
+}
+
 /* Send error response */
 static void send_error(struct ninep_server *server, uint16_t tag, const char *error)
 {
@@ -345,9 +386,21 @@ static void handle_tversion(struct ninep_server *server, const uint8_t *msg, siz
 		return;
 	}
 
-	/* Version accepted: Tversion resets all session state. */
+	/* Version accepted: Tversion resets all session state. Parked reads
+	 * are dropped without replies (the client reset the session); late
+	 * completers get -ESTALE from the generation check. */
+	for (int i = 0; i < CONFIG_NINEP_SERVER_MAX_PENDING_READS; i++) {
+		server->pending_reads[i].in_use = false;
+	}
 	for (int i = 0; i < CONFIG_NINEP_SERVER_MAX_FIDS; i++) {
 		if (server->fids[i].in_use) {
+			/* Let the filesystem release per-fid resources — the
+			 * reset is semantically a clunk of every live fid. */
+			if (server->config.fs_ops->clunk && server->fids[i].node &&
+			    !server->fids[i].is_auth_fid) {
+				server->config.fs_ops->clunk(server->fids[i].node,
+				                             server->config.fs_ctx);
+			}
 			if (server->fids[i].uname_idx != NINEP_POOL_NONE) {
 				uname_release(server, server->fids[i].uname_idx);
 			}
@@ -884,10 +937,57 @@ static void handle_tread(struct ninep_server *server, uint16_t tag,
 	}
 
 	/* Read data directly into tx_buf at offset 11 */
-	int bytes = server->config.fs_ops->read(sfid->node, offset,
-	                                          &server->tx_buf[11], count,
-	                                          fid_identity(server, sfid),
-	                                          server->config.fs_ctx);
+	int bytes;
+	if (server->config.fs_ops->read_deferred) {
+		/* One parked read per fid: a new Tread on a fid with an older
+		 * parked read answers the old one with zero bytes first (the
+		 * stream fs keeps a single wait slot per fid). Also guards
+		 * against a misbehaving client reusing a parked tag. */
+		for (int i = 0; i < CONFIG_NINEP_SERVER_MAX_PENDING_READS; i++) {
+			struct ninep_pending_read *p = &server->pending_reads[i];
+			if (p->in_use && (p->fid == fid || p->tag == tag)) {
+				LOG_DBG("New Tread supersedes parked read (tag %u, fid %u)",
+				        p->tag, p->fid);
+				pending_read_cancel(server, p);
+			}
+		}
+
+		struct ninep_read_handle h;
+		const struct ninep_read_handle *hp = NULL;
+		int slot = pending_read_alloc(server, tag, fid, count);
+		if (slot >= 0) {
+			h.server = server;
+			h.slot = (uint8_t)slot;
+			h.gen = server->pending_reads[slot].gen;
+			hp = &h;
+		} else {
+			LOG_WRN("Pending-read table full; Tread tag %u cannot defer", tag);
+		}
+
+		bytes = server->config.fs_ops->read_deferred(sfid->node, offset,
+		                                             &server->tx_buf[11], count,
+		                                             fid_identity(server, sfid),
+		                                             hp, server->config.fs_ctx);
+		if (bytes == NINEP_READ_DEFER && hp) {
+			/* Parked: the fs owns a copy of the handle and will
+			 * answer via ninep_server_read_complete(). No Rread now. */
+			return;
+		}
+		if (slot >= 0) {
+			/* Answered (or failed) immediately — release the slot. */
+			server->pending_reads[slot].in_use = false;
+		}
+		if (bytes == NINEP_READ_DEFER) {
+			/* fs violated the h==NULL contract; degrade to EOF. */
+			LOG_WRN("read_deferred returned DEFER with no handle; treating as 0");
+			bytes = 0;
+		}
+	} else {
+		bytes = server->config.fs_ops->read(sfid->node, offset,
+		                                    &server->tx_buf[11], count,
+		                                    fid_identity(server, sfid),
+		                                    server->config.fs_ctx);
+	}
 	if (bytes < 0) {
 		send_error_errno(server, tag, bytes, "read failed");
 		return;
@@ -1052,8 +1152,19 @@ static void handle_tflush(struct ninep_server *server, uint16_t tag,
 	uint16_t oldtag = msg[7] | (msg[8] << 8);
 	LOG_DBG("Tflush: oldtag=%u", oldtag);
 
-	/* Simple implementation: just acknowledge the flush */
-	/* A full implementation would cancel pending operations for oldtag */
+	/* Cancel a parked (deferred) read for oldtag: answer it with
+	 * Rread count=0, then Rflush — in that order on the wire (hubfs
+	 * convention). Both sends happen under tx_buf_mutex, which the
+	 * dispatch loop already holds, so ordering is guaranteed. A late
+	 * completer for this request will get -ESTALE and drop it. */
+	for (int i = 0; i < CONFIG_NINEP_SERVER_MAX_PENDING_READS; i++) {
+		struct ninep_pending_read *p = &server->pending_reads[i];
+		if (p->in_use && p->tag == oldtag) {
+			LOG_DBG("Tflush cancels parked read tag %u", oldtag);
+			pending_read_cancel(server, p);
+		}
+	}
+
 	int ret = ninep_build_rflush(server->tx_buf, server->tx_buf_size, tag);
 	if (ret > 0) {
 		ninep_transport_send(server->transport, server->tx_buf, ret);
@@ -1386,6 +1497,16 @@ static void handle_tclunk(struct ninep_server *server, uint16_t tag,
 	 * Clunk must always succeed, even for unknown FIDs.
 	 */
 	if (sfid) {
+		/* Answer any parked reads on this fid with Rread count=0
+		 * before the fs clunk drops their wait-registry entries. */
+		for (int i = 0; i < CONFIG_NINEP_SERVER_MAX_PENDING_READS; i++) {
+			struct ninep_pending_read *p = &server->pending_reads[i];
+			if (p->in_use && p->fid == fid) {
+				LOG_DBG("Tclunk fid %u cancels parked read tag %u", fid, p->tag);
+				pending_read_cancel(server, p);
+			}
+		}
+
 		/* Call filesystem clunk handler if available */
 		if (server->config.fs_ops->clunk && sfid->node) {
 			server->config.fs_ops->clunk(sfid->node, server->config.fs_ctx);
@@ -1474,6 +1595,67 @@ void ninep_server_process_message(struct ninep_server *server,
 	k_mutex_unlock(&server->tx_buf_mutex);
 }
 
+int ninep_server_read_complete(struct ninep_read_handle h,
+                               const uint8_t *data, size_t len)
+{
+	struct ninep_server *server = h.server;
+
+	if (!server || h.slot >= CONFIG_NINEP_SERVER_MAX_PENDING_READS) {
+		return -EINVAL;
+	}
+
+	/* Teardown gate: refuse if the server is shutting down; otherwise
+	 * count ourselves in so ninep_server_cleanup() waits for us before
+	 * the server memory goes away. */
+	k_mutex_lock(&server->pending_lock, K_FOREVER);
+	if (server->dying) {
+		k_mutex_unlock(&server->pending_lock);
+		return -ESTALE;
+	}
+	server->completions_active++;
+	k_mutex_unlock(&server->pending_lock);
+
+	int ret = 0;
+
+	k_mutex_lock(&server->tx_buf_mutex, K_FOREVER);
+	struct ninep_pending_read *p = &server->pending_reads[h.slot];
+	if (!p->in_use || p->gen != h.gen) {
+		/* Flushed, clunked, or session reset since parking. Normal. */
+		ret = -ESTALE;
+	} else {
+		if (len > p->count) {
+			len = p->count;
+		}
+		if (len > server->tx_buf_size - 11) {
+			len = server->tx_buf_size - 11;
+		}
+		if (len > 0) {
+			memcpy(&server->tx_buf[11], data, len);
+		}
+		int msg_size = ninep_build_rread(server->tx_buf, server->tx_buf_size,
+		                                 p->tag, (uint32_t)len);
+		if (msg_size > 0) {
+			int sret = ninep_transport_send(server->transport,
+			                                server->tx_buf, msg_size);
+			if (sret < 0) {
+				ret = sret;
+			}
+		} else {
+			ret = (msg_size < 0) ? msg_size : -EINVAL;
+		}
+		/* The request is answered (or unanswerable) either way. */
+		p->in_use = false;
+	}
+	k_mutex_unlock(&server->tx_buf_mutex);
+
+	k_mutex_lock(&server->pending_lock, K_FOREVER);
+	server->completions_active--;
+	k_condvar_broadcast(&server->pending_cv);
+	k_mutex_unlock(&server->pending_lock);
+
+	return ret;
+}
+
 /* Transport callback */
 static void server_recv_callback(struct ninep_transport *transport,
                                  const uint8_t *buf, size_t len, void *user_data)
@@ -1493,6 +1675,8 @@ int ninep_server_init(struct ninep_server *server,
 
 	memset(server, 0, sizeof(*server));
 	k_mutex_init(&server->tx_buf_mutex);
+	k_mutex_init(&server->pending_lock);
+	k_condvar_init(&server->pending_cv);
 	/* Copy config by value instead of storing pointer */
 	memcpy(&server->config, config, sizeof(server->config));
 	server->transport = transport;
@@ -1539,6 +1723,24 @@ void ninep_server_cleanup(struct ninep_server *server)
 	}
 
 	LOG_INF("Cleaning up 9P server - clunking open fids");
+
+	/* Teardown gate for deferred reads: refuse new completions, then wait
+	 * for any completion currently inside (or blocked on) tx_buf_mutex to
+	 * drain. After this, no other thread can touch this server, so it is
+	 * safe for the caller to free/unwind the server's memory once we
+	 * return. pending_lock is never held while acquiring tx_buf_mutex,
+	 * and we hold no other lock here, so this cannot deadlock. */
+	k_mutex_lock(&server->pending_lock, K_FOREVER);
+	server->dying = true;
+	while (server->completions_active > 0) {
+		k_condvar_wait(&server->pending_cv, &server->pending_lock, K_FOREVER);
+	}
+	k_mutex_unlock(&server->pending_lock);
+
+	/* Drop parked reads without replies — the connection is going away. */
+	for (int i = 0; i < CONFIG_NINEP_SERVER_MAX_PENDING_READS; i++) {
+		server->pending_reads[i].in_use = false;
+	}
 
 	/* Clunk all open fids to properly release filesystem resources */
 	for (int i = 0; i < CONFIG_NINEP_SERVER_MAX_FIDS; i++) {

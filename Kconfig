@@ -62,6 +62,17 @@ config NINEP_SERVER_AUTH_POOL
 	  only need 1 auth fid at a time, so a small pool (2-4) is sufficient.
 	  Memory: ~130 bytes per slot.
 
+config NINEP_SERVER_MAX_PENDING_READS
+	int "Maximum parked (deferred) reads per server session"
+	default 4
+	depends on NINEP_SERVER
+	help
+	  Maximum Tread requests that can be parked awaiting deferred
+	  completion (see the read_deferred fs op), e.g. blocked chat
+	  stream reads. When the table is full, further reads on stream
+	  files degrade gracefully to an immediate 0-byte Rread.
+	  Memory: ~16 bytes per slot.
+
 config NINEP_SERVER_UNAME_POOL
 	int "Username pool size"
 	default 8

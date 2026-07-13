@@ -761,6 +761,34 @@ static int union_read(struct ninep_fs_node *node, uint64_t offset,
 	return mount->fs_ops->read(node, offset, buf, count, uname, mount->fs_ctx);
 }
 
+static int union_read_deferred(struct ninep_fs_node *node, uint64_t offset,
+                               uint8_t *buf, uint32_t count, const char *uname,
+                               const struct ninep_read_handle *h, void *fs_ctx)
+{
+	struct ninep_union_fs *fs = (struct ninep_union_fs *)fs_ctx;
+
+	/* Union root and synthetic directories never defer — reuse the
+	 * regular read path for them. */
+	if (node == fs->root || IS_SYNTHETIC_DIR(fs, node)) {
+		return union_read(node, offset, buf, count, uname, fs_ctx);
+	}
+
+	struct ninep_union_mount *mount = find_node_owner(fs, node);
+
+	if (!mount) {
+		return union_read(node, offset, buf, count, uname, fs_ctx);
+	}
+
+	if (mount->fs_ops->read_deferred) {
+		return mount->fs_ops->read_deferred(node, offset, buf, count,
+		                                    uname, h, mount->fs_ctx);
+	}
+	if (!mount->fs_ops->read) {
+		return -ENOTSUP;
+	}
+	return mount->fs_ops->read(node, offset, buf, count, uname, mount->fs_ctx);
+}
+
 static int union_stat(struct ninep_fs_node *node, uint8_t *buf,
                        size_t buf_len, void *fs_ctx)
 {
@@ -1157,6 +1185,7 @@ static const struct ninep_fs_ops union_fs_ops = {
 	.walk = union_walk,
 	.open = union_open,
 	.read = union_read,
+	.read_deferred = union_read_deferred,
 	.write = union_write,
 	.stat = union_stat,
 	.create = union_create,
