@@ -1,0 +1,15 @@
+# Paths excluded from `git archive` release tarballs.  They remain in
+# the (public) git repository but do not ship in source drops.
+
+# Assistant/config plumbing
+CLAUDE.md                       export-ignore
+
+# Internal working / planning notes
+docs/BBS_SPLIT_PLAN.md          export-ignore
+docs/WORKFLOW.md                export-ignore
+docs/FEASIBILITY.md             export-ignore
+docs/MIGRATION.md               export-ignore
+
+# Git metadata
+.gitattributes                  export-ignore
+.gitignore                      export-ignore

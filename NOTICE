@@ -1,0 +1,40 @@
+9p4z — Third-Party Attribution and Notices
+==========================================
+
+Each component retains its original license.  If you notice an
+attribution missing from this list, please open an issue and it
+will be added in the next release.
+
+
+Zephyr RTOS
+-----------
+
+    Project: Zephyr RTOS
+    Origin:  https://zephyrproject.org/
+    License: Apache-2.0
+
+    9p4z is a Zephyr module: it builds against the Zephyr kernel,
+    Bluetooth (L2CAP), and networking APIs.  No Zephyr source is
+    vendored into this repository.
+
+
+Design lineage
+--------------
+
+The 9P2000 protocol is the work of Bell Labs (Plan 9).  9p4z is an
+independent implementation from the published protocol
+specification; no Plan 9 source code is incorporated.
+
+
+Development and authorship
+--------------------------
+
+9p4z is designed, directed, and built by Jon Sharp.  It has been
+developed in substantial collaboration with Claude (Anthropic's
+frontier models, via Claude Code).  Design decisions, direction,
+and responsibility for the result rest with Jon.  Code smells belong
+to Claude. ;)
+
+---
+
+Copyright (c) 2025-2026 Jon Sharp.

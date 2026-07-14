@@ -61,4 +61,12 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed setup instructions.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details
+MIT License - see [LICENSE](LICENSE) file for details.  Third-party
+attribution and authorship notes in [NOTICE](NOTICE).
+
+---
+
+Copyright (c) 2025-2026 Jon Sharp.
+
+Built in substantial collaboration with Claude (Anthropic) — see the
+"Development and authorship" section of [NOTICE](NOTICE).
