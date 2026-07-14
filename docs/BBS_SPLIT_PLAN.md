@@ -140,7 +140,7 @@ scripts/setup-ncs-l2cap.sh      # Keep in 9p4z (L2CAP-related)
 - [ ] Create backup branch: `git checkout -b pre-bbs-split`
 
 ### Phase 2: Create 9bbs Repository
-- [ ] Create new directory: `/Users/jrsharp/src/9bbs/`
+- [ ] Create new directory: `~/src/9bbs/`
 - [ ] Initialize git repo
 - [ ] Create basic structure (CMakeLists.txt, Kconfig, zephyr/module.yml, west.yml)
 - [ ] Copy BBS files from 9p4z
@@ -235,7 +235,7 @@ build:
 
 If something goes wrong:
 ```bash
-cd /Users/jrsharp/src/9p4z
+cd ~/src/9p4z
 git checkout pre-bbs-split
 # Or:
 git reset --hard <commit-before-split>

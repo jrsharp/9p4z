@@ -4,12 +4,12 @@
 
 ```bash
 # Build
-/Users/jrsharp/zephyr-workspaces/build-ncs.sh
+~/zephyr-workspaces/build-ncs.sh
 
 # Flash
 cd /opt/nordic/ncs/v3.1.1
 export PATH="/opt/nordic/ncs/toolchains/561dce9adf/bin:/opt/nordic/ncs/toolchains/561dce9adf/nrfutil/bin:$PATH"
-west flash -d /Users/jrsharp/zephyr-workspaces/9p4z-ncs-workspace/build/9p_server_tcp/9p_server_tcp --runner jlink
+west flash -d ~/zephyr-workspaces/9p4z-ncs-workspace/build/9p_server_tcp/9p_server_tcp --runner jlink
 ```
 
 ## Architecture
@@ -24,7 +24,7 @@ west flash -d /Users/jrsharp/zephyr-workspaces/9p4z-ncs-workspace/build/9p_serve
    - No `list(APPEND ZEPHYR_EXTRA_MODULES ...)`
    - Build system handles module loading via cmake args
 
-3. **Direct source reference**: Build references `/Users/jrsharp/src/9p4z/` directly
+3. **Direct source reference**: Build references `~/src/9p4z/` directly
    - Changes in source repo immediately reflected in builds
    - No copy/sync required
    - No workspace confusion
@@ -32,14 +32,14 @@ west flash -d /Users/jrsharp/zephyr-workspaces/9p4z-ncs-workspace/build/9p_serve
 ## Directory Structure
 
 ```
-/Users/jrsharp/src/9p4z/                    # Source repo (git)
+~/src/9p4z/                    # Source repo (git)
   ├── samples/9p_server_tcp/                # Sample application
   │   ├── CMakeLists.txt                    # Clean, no module path hacks
   │   ├── prj_nrf.conf                      # nRF7002dk config
   │   └── boards/nrf7002dk_nrf5340_cpuapp.conf  # Board-specific WiFi config
   └── ...
 
-/Users/jrsharp/zephyr-workspaces/
+~/zephyr-workspaces/
   ├── build-ncs.sh                          # Build script
   └── 9p4z-ncs-workspace/
       └── build/9p_server_tcp/              # Build output
@@ -56,7 +56,7 @@ west flash -d /Users/jrsharp/zephyr-workspaces/9p4z-ncs-workspace/build/9p_serve
 
 ## Build Script
 
-Location: `/Users/jrsharp/zephyr-workspaces/build-ncs.sh`
+Location: `~/zephyr-workspaces/build-ncs.sh`
 
 ```bash
 #!/bin/bash
@@ -70,15 +70,15 @@ export PATH="/opt/nordic/ncs/toolchains/561dce9adf/nrfutil/bin:$PATH"
 # Use a build directory outside of NCS to avoid conflicts
 /opt/nordic/ncs/toolchains/561dce9adf/Cellar/python@3.12/3.12.4/Frameworks/Python.framework/Versions/3.12/bin/west build \
   -b nrf7002dk/nrf5340/cpuapp \
-  -d /Users/jrsharp/zephyr-workspaces/9p4z-ncs-workspace/build/9p_server_tcp \
-  /Users/jrsharp/src/9p4z/samples/9p_server_tcp \
+  -d ~/zephyr-workspaces/9p4z-ncs-workspace/build/9p_server_tcp \
+  ~/src/9p4z/samples/9p_server_tcp \
   --pristine \
-  -- -DCONF_FILE=prj_nrf.conf -DZEPHYR_EXTRA_MODULES=/Users/jrsharp/src/9p4z
+  -- -DCONF_FILE=prj_nrf.conf -DZEPHYR_EXTRA_MODULES=~/src/9p4z
 ```
 
 **Key Arguments**:
 - `-DCONF_FILE=prj_nrf.conf`: Uses nRF-specific configuration
-- `-DZEPHYR_EXTRA_MODULES=/Users/jrsharp/src/9p4z`: Loads 9p4z module without west.yml
+- `-DZEPHYR_EXTRA_MODULES=~/src/9p4z`: Loads 9p4z module without west.yml
 
 ## Board Configuration
 
@@ -118,14 +118,14 @@ CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE=2048
 ```bash
 cd /opt/nordic/ncs/v3.1.1
 export PATH="/opt/nordic/ncs/toolchains/561dce9adf/bin:/opt/nordic/ncs/toolchains/561dce9adf/nrfutil/bin:$PATH"
-west flash -d /Users/jrsharp/zephyr-workspaces/9p4z-ncs-workspace/build/9p_server_tcp/9p_server_tcp --runner jlink
+west flash -d ~/zephyr-workspaces/9p4z-ncs-workspace/build/9p_server_tcp/9p_server_tcp --runner jlink
 ```
 
 ### Using nrfutil (Alternative)
 ```bash
 cd /opt/nordic/ncs/v3.1.1
 export PATH="/opt/nordic/ncs/toolchains/561dce9adf/nrfutil/bin:$PATH"
-nrfutil device program --firmware /Users/jrsharp/zephyr-workspaces/9p4z-ncs-workspace/build/9p_server_tcp/9p_server_tcp/zephyr/zephyr.hex --core Application
+nrfutil device program --firmware ~/zephyr-workspaces/9p4z-ncs-workspace/build/9p_server_tcp/9p_server_tcp/zephyr/zephyr.hex --core Application
 ```
 
 ## Usage After Boot
@@ -149,8 +149,8 @@ uart:~$ net conn
 ## Troubleshooting
 
 ### Build fails with "undefined symbol NINEP"
-- Check that `-DZEPHYR_EXTRA_MODULES=/Users/jrsharp/src/9p4z` is in the west build command
-- Verify `/Users/jrsharp/src/9p4z/zephyr/module.yml` exists
+- Check that `-DZEPHYR_EXTRA_MODULES=~/src/9p4z` is in the west build command
+- Verify `~/src/9p4z/zephyr/module.yml` exists
 
 ### West manifest errors
 - Ensure `/opt/nordic/ncs/v3.1.1/nrf/west.yml` has NO 9p4z entry
@@ -161,14 +161,14 @@ uart:~$ net conn
 - Check that `CONFIG_WIFI_NRF700X=y` is set
 
 ### Code changes not taking effect
-- Build system references source directly: `/Users/jrsharp/src/9p4z/`
-- Just run `/Users/jrsharp/zephyr-workspaces/build-ncs.sh` again
+- Build system references source directly: `~/src/9p4z/`
+- Just run `~/zephyr-workspaces/build-ncs.sh` again
 - No need to copy or sync anything!
 
 ## Development Workflow
 
-1. Edit code in `/Users/jrsharp/src/9p4z/`
-2. Run `/Users/jrsharp/zephyr-workspaces/build-ncs.sh`
+1. Edit code in `~/src/9p4z/`
+2. Run `~/zephyr-workspaces/build-ncs.sh`
 3. Flash with west
 4. Test on hardware
 

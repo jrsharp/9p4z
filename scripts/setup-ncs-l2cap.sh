@@ -52,7 +52,8 @@ echo -e "${GREEN}[2/5]${NC} Setting up west manifest..."
 mkdir -p "$WORKSPACE_DIR/manifest"
 
 # Create west.yml manifest
-cat > "$WORKSPACE_DIR/manifest/west.yml" << 'EOF'
+NINEP_SRC="$(cd "$(dirname "$0")/.." && pwd)"
+cat > "$WORKSPACE_DIR/manifest/west.yml" << EOF
 manifest:
   version: "0.13"
 
@@ -63,7 +64,7 @@ manifest:
     # Use local 9p4z module
     - name: 9p4z
       path: 9p4z
-      url: file:///Users/jrsharp/src/9p4z
+      url: file://$NINEP_SRC
       revision: HEAD
 
   # All NCS modules are symlinked, not fetched
@@ -144,6 +145,6 @@ echo "  source activate.sh"
 echo "  cd 9p4z/samples/9p_server_l2cap"
 echo "  ./build-ncs.sh"
 echo ""
-echo -e "${YELLOW}Note: Changes in /Users/jrsharp/src/9p4z will be reflected${NC}"
+echo -e "${YELLOW}Note: Changes in $NINEP_SRC will be reflected${NC}"
 echo -e "${YELLOW}      in the workspace via the symlink!${NC}"
 echo ""

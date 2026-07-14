@@ -11,16 +11,16 @@ See **[docs/NCS-BUILD-SETUP.md](docs/NCS-BUILD-SETUP.md)** for complete setup.
 Quick commands:
 ```bash
 # Build
-/Users/jrsharp/zephyr-workspaces/build-ncs.sh
+~/zephyr-workspaces/build-ncs.sh
 
 # Flash
 cd /opt/nordic/ncs/v3.1.1
 export PATH="/opt/nordic/ncs/toolchains/561dce9adf/bin:/opt/nordic/ncs/toolchains/561dce9adf/nrfutil/bin:$PATH"
-west flash -d /Users/jrsharp/zephyr-workspaces/9p4z-ncs-workspace/build/9p_server_tcp/9p_server_tcp --runner jlink
+west flash -d ~/zephyr-workspaces/9p4z-ncs-workspace/build/9p_server_tcp/9p_server_tcp --runner jlink
 ```
 
 **Key Points:**
-- Source: `/Users/jrsharp/src/9p4z/` (changes take effect immediately)
+- Source: `~/src/9p4z/` (changes take effect immediately)
 - No west.yml modification needed
 - Uses `ZEPHYR_EXTRA_MODULES` cmake argument
 - 686KB binary with full WiFi + 9P TCP server
@@ -32,8 +32,8 @@ west flash -d /Users/jrsharp/zephyr-workspaces/9p4z-ncs-workspace/build/9p_serve
 ## Project Structure
 
 ```
-/Users/jrsharp/src/9p4z/                    # Git repository (source of truth)
-/Users/jrsharp/zephyr-workspaces/9p4z-workspace/
+~/src/9p4z/                    # Git repository (source of truth)
+~/zephyr-workspaces/9p4z-workspace/
 ├── .venv/                                  # Python venv with west, zephyr deps
 ├── 9p4z/                                   # Module (sync from src/9p4z)
 ├── zephyr/                                 # Zephyr RTOS v3.7.0
@@ -45,7 +45,7 @@ west flash -d /Users/jrsharp/zephyr-workspaces/9p4z-ncs-workspace/build/9p_serve
 
 Always use the workspace venv:
 ```bash
-cd /Users/jrsharp/zephyr-workspaces/9p4z-workspace
+cd ~/zephyr-workspaces/9p4z-workspace
 source .venv/bin/activate
 ```
 
@@ -83,13 +83,13 @@ west build -t run
 
 ## Syncing Changes
 
-Changes in `/Users/jrsharp/src/9p4z` are the source of truth.
+Changes in `~/src/9p4z` are the source of truth.
 To sync to workspace:
 
 ```bash
 # Only sync 9p4z module files (NOT the entire workspace)
-rsync -av /Users/jrsharp/src/9p4z/ \
-  /Users/jrsharp/zephyr-workspaces/9p4z-workspace/9p4z/ \
+rsync -av ~/src/9p4z/ \
+  ~/zephyr-workspaces/9p4z-workspace/9p4z/ \
   --exclude build --exclude .git --exclude '.DS_Store' --exclude tests
 ```
 
@@ -106,7 +106,7 @@ rsync -av /Users/jrsharp/src/9p4z/ \
 
 ### Workspace Corrupted
 ```bash
-cd /Users/jrsharp/zephyr-workspaces/9p4z-workspace
+cd ~/zephyr-workspaces/9p4z-workspace
 rm -rf * .west .venv
 python3 -m venv .venv
 source .venv/bin/activate
