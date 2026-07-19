@@ -468,48 +468,57 @@ static void handle_tattach(struct ninep_server *server, uint16_t tag,
 		}
 	}
 
-	/* Check authentication requirement */
+	/* Validate authentication. An afid is validated whenever the client
+	 * presents one, REGARDLESS of auth_cfg->required. Otherwise, with
+	 * required==false, the `authenticated` flag below (afid != NOFID)
+	 * would be set for an entirely unvalidated afid, and the client's
+	 * self-claimed uname would then be trusted by fid_identity() as a
+	 * verified identity -- a crypto-free auth/authorization bypass.
+	 * `required` only decides whether an attach lacking valid auth is
+	 * rejected outright (true) or admitted as an anonymous guest (false). */
 	const struct ninep_auth_config *auth_cfg = server->config.auth_config;
-	if (auth_cfg && auth_cfg->required) {
-		/* afid == NOFID means no auth attempted */
-		if (afid == NINEP_NOFID) {
-			send_error(server, tag, "authentication required");
-			return;
-		}
+	bool auth_ok = false;
 
-		/* Find and verify auth fid */
+	if (afid != NINEP_NOFID) {
+		/* Find and verify the auth fid + its completed challenge-response */
 		struct ninep_server_fid *auth_fid = find_fid(server, afid);
-		if (!auth_fid || !auth_fid->is_auth_fid) {
-			send_error(server, tag, "invalid auth fid");
-			return;
-		}
+		struct ninep_auth_state *auth_state =
+			(auth_fid && auth_fid->is_auth_fid)
+				? auth_get(server, auth_fid->auth_idx)
+				: NULL;
 
-		/* Get auth state from pool */
-		struct ninep_auth_state *auth_state = auth_get(server, auth_fid->auth_idx);
 		if (!auth_state || !auth_state->authenticated) {
-			send_error(server, tag, "authentication incomplete");
-			return;
+			/* afid present but no valid completed Tauth. */
+			if (auth_cfg && auth_cfg->required) {
+				send_error(server, tag, "authentication incomplete");
+				return;
+			}
+			/* Not required: admit as unauthenticated guest (auth_ok stays false). */
+		} else {
+			/* Verify uname matches the authenticated identity exactly. A
+			 * length-bounded strncmp alone is a prefix match -- uname "ad"
+			 * would pass against an authenticated "admin" -- so the lengths
+			 * must agree too. An empty uname is a deliberate "use my auth
+			 * identity" and skips the check. */
+			if (uname_len > 0 &&
+			    (uname_len != strlen(auth_state->claimed_identity) ||
+			     strncmp(uname, auth_state->claimed_identity, uname_len) != 0)) {
+				LOG_WRN("Tattach uname mismatch: claimed='%.*s', auth='%s'",
+				        uname_len, uname, auth_state->claimed_identity);
+				send_error(server, tag, "uname does not match authenticated identity");
+				return;
+			}
+
+			/* Use authenticated identity as uname */
+			uname = auth_state->claimed_identity;
+			uname_len = strlen(auth_state->claimed_identity);
+			auth_ok = true;
+			LOG_INF("Authenticated attach for identity '%s'", uname);
 		}
-
-		/* Verify uname matches the authenticated identity exactly. A
-		 * length-bounded strncmp alone is a prefix match -- uname "ad"
-		 * would pass against an authenticated "admin" -- so the lengths
-		 * must agree too. An empty uname is a deliberate "use my auth
-		 * identity" and skips the check. */
-		if (uname_len > 0 &&
-		    (uname_len != strlen(auth_state->claimed_identity) ||
-		     strncmp(uname, auth_state->claimed_identity, uname_len) != 0)) {
-			LOG_WRN("Tattach uname mismatch: claimed='%.*s', auth='%s'",
-			        uname_len, uname, auth_state->claimed_identity);
-			send_error(server, tag, "uname does not match authenticated identity");
-			return;
-		}
-
-		/* Use authenticated identity as uname */
-		uname = auth_state->claimed_identity;
-		uname_len = strlen(auth_state->claimed_identity);
-
-		LOG_INF("Authenticated attach for identity '%s'", uname);
+	} else if (auth_cfg && auth_cfg->required) {
+		/* No afid at all, and auth is mandatory. */
+		send_error(server, tag, "authentication required");
+		return;
 	}
 
 	/* Allocate FID */
@@ -523,11 +532,12 @@ static void handle_tattach(struct ninep_server *server, uint16_t tag,
 	/* Intern uname in pool */
 	sfid->uname_idx = uname_intern(server, uname, uname_len);
 
-	/* Mark this fid's identity as verified if (and only if) the attach
-	 * went through a valid Tauth challenge-response. When auth_cfg->required
-	 * is false and the client doesn't present an afid, the uname is just
-	 * a claim — the per-op check_perm should treat it as "guest". */
-	sfid->authenticated = (afid != NINEP_NOFID);
+	/* Verified if and only if a valid Tauth challenge-response completed
+	 * above (auth_ok). A bare afid value proves nothing on its own, so it
+	 * must never gate this flag directly. An unverified attach keeps its
+	 * claimed uname interned for logging but is treated as "guest" by the
+	 * per-op check_perm (fid_identity returns "" for !authenticated). */
+	sfid->authenticated = auth_ok;
 
 	LOG_INF("Tattach: fid=%u, uname='%s'%s", fid,
 	        uname_get(server, sfid->uname_idx),
