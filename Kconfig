@@ -196,6 +196,16 @@ config NINEP_TRANSPORT_UART
 	help
 	  Enable 9P over UART serial transport.
 
+config NINEP_TRANSPORT_NSFILE
+	bool "Namespace-file Transport (mount over an open 9P channel)"
+	depends on NAMESPACE
+	help
+	  Enable 9P over an already-open namespace file -- a Plan 9 `mount fd`.
+	  Runs a ninep_client over a message-framed bidirectional channel such as a
+	  connected /net/aether/<N>/data mesh conversation, so a remote node's
+	  filesystem can be mounted over the mesh (aether!<addr>). Needs ns_read/
+	  ns_write (the namespace file API).
+
 if NINEP_TRANSPORT_UART
 
 config NINEP_UART_POLLING_MODE

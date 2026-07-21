@@ -51,6 +51,10 @@ if(CONFIG_NINEP_TRANSPORT_UART)
   zephyr_library_sources(src/transport_uart.c)
 endif()
 
+if(CONFIG_NINEP_TRANSPORT_NSFILE)
+  zephyr_library_sources(src/transport_nsfile.c)
+endif()
+
 if(CONFIG_NINEP_TRANSPORT_TCP)
   zephyr_library_sources(src/transport_tcp.c)
 endif()
