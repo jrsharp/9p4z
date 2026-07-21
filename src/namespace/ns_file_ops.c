@@ -111,10 +111,13 @@ static struct ns_fd_entry *get_fd_entry(int fd)
 		return NULL;
 	}
 
-	/* Check ownership (optional - could allow cross-thread access) */
+	/* Cross-thread access is legitimate and allowed: a 9P transport over an
+	 * ns fd (transport_nsfile) is inherently multi-threaded -- the dialer thread
+	 * opens the channel, client threads write requests, an RX thread reads
+	 * replies. Track the opener for diagnostics but don't warn (it would spam on
+	 * every op over a mesh mount). */
 	if (fd_table[fd].owner != k_current_get()) {
-		LOG_WRN("FD %d accessed by non-owner thread", fd);
-		/* Allow for now, but log warning */
+		LOG_DBG("FD %d accessed by non-owner thread (allowed)", fd);
 	}
 
 	k_mutex_unlock(&fd_table_lock);
