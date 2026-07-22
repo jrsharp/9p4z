@@ -808,7 +808,7 @@ static int async_pool_init(void)
 		k_thread_create(&async_threads[i], async_stacks[i],
 				CONFIG_NINEP_SERVER_ASYNC_READ_STACK,
 				async_worker_fn, NULL, NULL, NULL,
-				K_PRIO_PREEMPT(7), 0, K_NO_WAIT);
+				CONFIG_NINEP_SERVER_ASYNC_READ_PRIORITY, 0, K_NO_WAIT);
 		k_thread_name_set(&async_threads[i], "9p_aread");
 	}
 	return 0;

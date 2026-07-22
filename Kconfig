@@ -92,6 +92,19 @@ config NINEP_SERVER_ASYNC_READ_BUFSZ
 	  copied into the (mutex-held) tx buffer. Caps the count of an async
 	  read; sized for the largest blocking record (e.g. a datagram).
 
+config NINEP_SERVER_ASYNC_READ_PRIORITY
+	int "Async read worker thread priority"
+	default 7
+	depends on NINEP_SERVER_ASYNC_READ
+	help
+	  Raw Zephyr thread priority for the async read workers (default
+	  K_PRIO_PREEMPT(7) = 7). On a host that also runs a hard, cooperative
+	  RX/mesh workqueue (e.g. the DECT 9151), a PREEMPT worker is starved by
+	  that COOP thread and the 9P client can't drain datagrams -> the
+	  conversation rxq overflows and reads hang. Set a COOP value just above
+	  the mesh workq (e.g. -15 = K_PRIO_COOP(1) when the mesh is COOP(2), with
+	  NUM_COOP=16) so the drain runs to completion at each yield point.
+
 config NINEP_SERVER_AUTH_POOL
 	int "Authentication state pool size"
 	default 4
@@ -254,6 +267,20 @@ config NINEP_UART_DEFERRED_RX_RING_SIZE
 	  a single in-flight message always fits even if the framer is briefly
 	  descheduled during a burst; defaulting to NINEP_MAX_MESSAGE_SIZE does
 	  that. Overflow is logged.
+
+config NINEP_UART_PROC_PRIORITY
+	int "transport_uart deferred-RX framer thread priority"
+	default 6
+	depends on NINEP_UART_DEFERRED_RX
+	help
+	  Raw Zephyr thread priority for the framer thread (default
+	  K_PRIO_PREEMPT(6) = 6). On a host that also runs a hard, cooperative
+	  RX/mesh workqueue (e.g. the DECT 9151), a PREEMPT framer is STARVED by
+	  that COOP thread, so incoming 9P requests aren't parsed/answered and the
+	  server appears to hang under load. Set a COOP value just above the mesh
+	  workq (e.g. -15 = K_PRIO_COOP(1) when the mesh is COOP(2), NUM_COOP=16)
+	  so the framer runs to completion at each yield point. The relay (no
+	  radio) keeps the default 6.
 
 endif # NINEP_TRANSPORT_UART
 

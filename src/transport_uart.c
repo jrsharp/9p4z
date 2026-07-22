@@ -204,7 +204,7 @@ static void uart_polling_thread_fn(void *arg1, void *arg2, void *arg3)
 #define UART_PROC_STACK_SIZE CONFIG_NINEP_UART_POLLING_STACK_SIZE
 /* Sane default: responsive enough to answer 9P promptly, but the thread blocks
  * on msg_sem between messages so it never busy-starves real-time peers. */
-#define UART_PROC_PRIORITY   K_PRIO_PREEMPT(6)
+#define UART_PROC_PRIORITY   CONFIG_NINEP_UART_PROC_PRIORITY
 
 static struct k_thread uart_proc_thread;
 static K_THREAD_STACK_DEFINE(uart_proc_stack, UART_PROC_STACK_SIZE);
