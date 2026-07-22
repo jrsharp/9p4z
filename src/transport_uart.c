@@ -30,6 +30,9 @@ struct uart_transport_data {
 	struct ring_buf rx_ring;    /* ISR -> framer byte FIFO */
 	bool proc_active;
 	k_tid_t proc_tid;
+	bool resyncing;             /* instrumentation: mid-resync (sliding to re-lock) */
+	uint32_t resync_slid;       /* bytes slid in the current resync */
+	uint32_t ring_hw;           /* ring high-water mark seen by the framer */
 #endif
 };
 
@@ -233,6 +236,18 @@ static void uart_proc_thread_fn(void *arg1, void *arg2, void *arg3)
 			break;
 		}
 
+		/* instrumentation: how full does the ring get before we drain it? A new
+		 * high-water past 50% warns that the framer thread is falling behind
+		 * (the precursor to a drop -> desync). */
+		uint32_t used = ring_buf_size_get(&data->rx_ring);
+		if (used > data->ring_hw) {
+			data->ring_hw = used;
+			if (used > CONFIG_NINEP_UART_DEFERRED_RX_RING_SIZE / 2) {
+				LOG_WRN("9P RX ring high-water %u/%u", used,
+					(uint32_t)CONFIG_NINEP_UART_DEFERRED_RX_RING_SIZE);
+			}
+		}
+
 		for (;;) {
 			/* Accumulate the header (>=7 bytes) to learn the size. */
 			if (!data->header_received) {
@@ -262,10 +277,22 @@ static void uart_proc_thread_fn(void *arg1, void *arg2, void *arg3)
 					 * gated by the 9P type range (100..127), lets the framer re-lock
 					 * on the next genuine frame instead.
 					 */
+					if (!data->resyncing) {
+						data->resyncing = true;
+						data->resync_slid = 0;
+						LOG_WRN("9P RESYNC start (ring used=%u)",
+							ring_buf_size_get(&data->rx_ring));
+					}
+					data->resync_slid++;
 					memmove(data->rx_buf, data->rx_buf + 1,
 						data->rx_offset - 1);
 					data->rx_offset -= 1;
 					continue;
+				}
+				if (data->resyncing) {
+					LOG_WRN("9P RESYNC recovered after %u bytes (type=%u size=%u)",
+						data->resync_slid, hdr.type, hdr.size);
+					data->resyncing = false;
 				}
 				data->expected_size = hdr.size;
 				data->header_received = true;
