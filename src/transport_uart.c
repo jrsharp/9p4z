@@ -248,9 +248,23 @@ static void uart_proc_thread_fn(void *arg1, void *arg2, void *arg3)
 
 				if (ninep_parse_header(data->rx_buf, data->rx_offset,
 						       &hdr) != 0 ||
-				    hdr.size < 7 || hdr.size > data->rx_buf_size) {
-					LOG_ERR("bad 9P header; resyncing");
-					data->rx_offset = 0;   /* drop and re-hunt */
+				    hdr.size < 7 || hdr.size > data->rx_buf_size ||
+				    hdr.type < NINEP_TVERSION ||
+				    hdr.type > NINEP_RWSTAT) {
+					/*
+					 * Byte loss desynced the stream. Slide forward ONE byte and
+					 * re-hunt for a valid frame boundary. The old code reset
+					 * rx_offset to 0, discarding the whole 7-byte window -- that
+					 * could skip a real frame start AND, worse, silently accept a
+					 * plausible-but-misaligned header (7 <= size <= buf), delivering
+					 * a corrupt message and staying wedged forever (the mesh_client
+					 * never recovered without a reboot). Sliding one byte at a time,
+					 * gated by the 9P type range (100..127), lets the framer re-lock
+					 * on the next genuine frame instead.
+					 */
+					memmove(data->rx_buf, data->rx_buf + 1,
+						data->rx_offset - 1);
+					data->rx_offset -= 1;
 					continue;
 				}
 				data->expected_size = hdr.size;
