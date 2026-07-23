@@ -86,6 +86,14 @@ struct l2cap_9p_chan {
 	uint32_t rx_expected;      /* Expected total message size */
 	enum l2cap_rx_state rx_state;
 	bool in_use;               /* Track if this channel slot is allocated */
+	struct k_sem tx_sem;       /* TX serialization: one SDU in flight per channel.
+				    * Taken in l2cap_send, given in l2cap_sent (when the
+				    * stack finishes the SDU) -- so a send issued while a
+				    * prior SDU is still in flight WAITS instead of being
+				    * dropped on -EAGAIN. Without this, a deferred Rread
+				    * (sent seconds later from a worker) collides with
+				    * another reply and is silently lost, which made
+				    * blocking /net reads never complete over L2CAP. */
 };
 
 /* Transport private data */
@@ -212,6 +220,11 @@ static void l2cap_connected(struct bt_l2cap_chan *chan)
 	ch->rx_expected = 0;
 	ch->rx_state = RX_WAIT_SIZE;
 	ch->in_use = true;
+
+	/* One SDU in flight to start; re-init here so a sem left "taken" by a send
+	 * that never completed on a prior connection (peer vanished pre-sent) does
+	 * not block this fresh connection. */
+	k_sem_init(&ch->tx_sem, 1, 1);
 
 	LOG_INF("Channel ready, initial credits=%d", (int)atomic_get(&ch->le.rx.credits));
 }
@@ -367,7 +380,16 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 
 static void l2cap_sent(struct bt_l2cap_chan *chan)
 {
-	LOG_DBG("L2CAP sent successfully");
+#if NINEP_NCS_BUILD
+	struct bt_l2cap_le_chan *le_chan = BT_L2CAP_LE_CHAN(chan);
+	struct l2cap_9p_chan *ch = CONTAINER_OF(le_chan, struct l2cap_9p_chan, le);
+#else
+	struct l2cap_9p_chan *ch = CONTAINER_OF(chan, struct l2cap_9p_chan, le.chan);
+#endif
+
+	/* SDU fully transmitted -- release the TX slot so the next send can go. */
+	k_sem_give(&ch->tx_sem);
+	LOG_DBG("L2CAP sent; tx_sem released");
 }
 
 static struct bt_l2cap_chan_ops l2cap_chan_ops = {
@@ -457,10 +479,22 @@ static int l2cap_send(struct ninep_transport *transport, const uint8_t *buf,
 		return -ENOTCONN;
 	}
 
+	/* Serialize: L2CAP allows only one SDU in flight per channel, so a send
+	 * issued while a prior SDU is still going out returns -EAGAIN. Wait for the
+	 * previous send's `sent` callback (which gives tx_sem) rather than dropping
+	 * -- otherwise a deferred Rread (sent seconds later from an async-read
+	 * worker) collides with another reply and is silently lost. Runs in a 9P
+	 * worker thread (l2cap_recv only queues), so blocking here is fine. */
+	if (k_sem_take(&active_chan->tx_sem, K_MSEC(2000)) != 0) {
+		LOG_ERR("L2CAP TX stalled (prior SDU never completed); dropping %zu-byte reply", len);
+		return -EAGAIN;
+	}
+
 	/* Allocate from application buffer pool */
 	msg_buf = net_buf_alloc(&l2cap_tx_pool, K_FOREVER);
 	if (!msg_buf) {
 		LOG_ERR("Failed to allocate net_buf");
+		k_sem_give(&active_chan->tx_sem);
 		return -ENOMEM;
 	}
 	/* Reserve L2CAP SDU headroom */
@@ -469,18 +503,24 @@ static int l2cap_send(struct ninep_transport *transport, const uint8_t *buf,
 	/* Copy message data to net_buf */
 	net_buf_add_mem(msg_buf, buf, len);
 
-	LOG_INF("L2CAP send: %zu bytes", len);
-
-	/* Send via L2CAP channel */
-	ret = bt_l2cap_chan_send(&active_chan->le.chan, msg_buf);
-	if (ret < 0) {
+	/* The tx_sem already rules out an in-flight collision, so a remaining
+	 * -EAGAIN is transient TX-credit exhaustion (peer replenishes as it drains
+	 * its RX). Spin briefly rather than drop. On error, bt_l2cap_chan_send does
+	 * NOT take the buffer, so retrying with the same msg_buf is safe. */
+	for (int tries = 0; ; tries++) {
+		ret = bt_l2cap_chan_send(&active_chan->le.chan, msg_buf);
+		if (ret >= 0) {
+			return len;   /* success: tx_sem released by l2cap_sent() */
+		}
+		if (ret == -EAGAIN && tries < 100) {
+			k_sleep(K_MSEC(10));
+			continue;
+		}
 		LOG_ERR("bt_l2cap_chan_send failed: %d", ret);
 		net_buf_unref(msg_buf);
+		k_sem_give(&active_chan->tx_sem);
 		return ret;
 	}
-
-	LOG_INF("L2CAP sent %zu bytes successfully", len);
-	return len;
 }
 
 static int l2cap_start(struct ninep_transport *transport)

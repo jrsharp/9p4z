@@ -243,6 +243,14 @@ static void uart_session_disconnect(struct ninep_session_pool_uart *up)
 	 * channel/session we are about to free. */
 	uart_irq_rx_disable(up->config.uart_dev);
 
+	/* Notify the app FIRST: a proxied op (e.g. a blocking /net/aether read the
+	 * killed host client left outstanding) may be stuck on a downstream client,
+	 * fouling it for the next session. Let the app reset it before we clunk the
+	 * session's fids (which themselves proxy over that client). */
+	if (up->config.on_disconnect) {
+		up->config.on_disconnect(up->config.disconnect_ctx);
+	}
+
 	for (int i = 0; i < up->pool->max_sessions; i++) {
 		struct ninep_session *session = ninep_session_get(up->pool, i);
 

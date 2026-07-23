@@ -182,6 +182,18 @@ int ninep_client_init(struct ninep_client *client,
 int ninep_client_version(struct ninep_client *client);
 
 /**
+ * @brief Abort all in-flight requests and ready the client for re-attach.
+ *
+ * Wakes every waiter blocked on an outstanding request with -ECONNRESET and
+ * clears the tag pool, so a stuck proxied operation (e.g. a blocking read left
+ * behind when the upstream session died) releases the link instead of fouling
+ * the next ninep_client_version()/attach. Safe to call from another thread.
+ *
+ * @param client Client instance
+ */
+void ninep_client_reset(struct ninep_client *client);
+
+/**
  * @brief Authenticate with server (Tauth/Rauth)
  *
  * Initiates the authentication protocol by sending Tauth and receiving

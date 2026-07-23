@@ -252,6 +252,40 @@ static void client_recv_callback(struct ninep_transport *transport,
 }
 
 /*
+ * Abort every in-flight request and ready the client for a fresh session.
+ *
+ * Called when the layer above (the relay's host 9P session) drops while proxied
+ * operations are still outstanding on this client -- e.g. a killed host client
+ * left a blocking /net/aether data read waiting on the 9151. That stuck request
+ * holds its worker and fouls the link, so the next re-attach times out (the
+ * "connecting..." hang after a kill). Wake every stuck waiter with -ECONNRESET
+ * and detach its response buffer (so a late reply can't scribble a freed stack
+ * buffer); each returns, frees its tag, and releases the link -- so the next
+ * ninep_client_version/attach starts from a clean tag pool.
+ */
+void ninep_client_reset(struct ninep_client *client)
+{
+	if (!client) {
+		return;
+	}
+
+	k_mutex_lock(&client->lock, K_FOREVER);
+	for (size_t i = 0; i < client->max_tags; i++) {
+		struct ninep_tag_entry *e = &client->tags[i];
+
+		if (e->in_use && !e->complete) {
+			e->resp = NULL;
+			e->resp_len = 0;
+			e->error = -ECONNRESET;
+			e->complete = true;
+		}
+	}
+	k_condvar_broadcast(&client->resp_cv);
+	k_mutex_unlock(&client->lock);
+	LOG_INF("client reset: aborted in-flight requests, ready for re-attach");
+}
+
+/*
  * Wait for a specific tag's response with timeout
  * Caller must hold lock on entry, lock is held on return
  */

@@ -46,6 +46,12 @@ struct ninep_session_pool_uart_config {
 	struct ninep_fs_ops *fs_ops;       /* filesystem operations (shared) */
 	void *fs_context;                  /* filesystem context (shared) */
 	const struct ninep_auth_config *auth_config;  /* optional auth (shared) */
+	/* Optional: invoked when a host session drops (DTR de-asserted), BEFORE the
+	 * session's fids are cleaned up. Lets the app tear down any downstream state
+	 * an in-flight proxied op left fouled -- e.g. reset a client whose blocking
+	 * read is stuck -- so the next session re-attaches cleanly. */
+	void (*on_disconnect)(void *ctx);
+	void *disconnect_ctx;
 };
 
 /**
