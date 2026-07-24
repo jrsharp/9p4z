@@ -105,6 +105,16 @@ struct ninep_client_config {
 	uint32_t timeout_ms;  /* Request timeout in milliseconds */
 
 	/**
+	 * Optional separate timeout for Tread (0 = use timeout_ms). A proxied read
+	 * of a /net data node blocks server-side until a datagram arrives; capping
+	 * it at the normal RPC timeout leaves a worker parked on the far side that
+	 * then steals the next datagram (messages dropped after an idle pause). Set
+	 * this well above any expected conversational gap so a normal pause never
+	 * trips it, while other ops keep the fast timeout for link-death detection.
+	 */
+	uint32_t read_timeout_ms;
+
+	/**
 	 * Optional: caller-provided memory pools.
 	 * If NULL, the client uses embedded arrays (backward compatible).
 	 * If non-NULL, the client uses the provided pools instead,

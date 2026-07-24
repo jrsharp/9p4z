@@ -10,6 +10,7 @@
 
 #include <zephyr/9p/client.h>
 #include <zephyr/9p/message.h>
+#include <zephyr/9p/protocol.h>
 #include <zephyr/logging/log.h>
 #include <string.h>
 #include <errno.h>
@@ -333,6 +334,17 @@ static int send_and_wait(struct ninep_client *client,
 	uint8_t retries_left = retries;
 	int ret;
 
+	/* A Tread on a blocking /net data node has no bounded server-side latency
+	 * (it waits for the next datagram). Use the longer read timeout when set so
+	 * a conversational pause doesn't abandon the read and leave a far-side
+	 * worker to steal the next message; all other ops keep the fast timeout. */
+	uint32_t timeout = client->config->timeout_ms;
+
+	if (client->config->read_timeout_ms != 0 &&
+	    client->tx_buf[4] == NINEP_TREAD) {
+		timeout = client->config->read_timeout_ms;
+	}
+
 	for (;;) {
 		ret = ninep_transport_send(client->transport,
 					   client->tx_buf, msg_len);
@@ -340,7 +352,7 @@ static int send_and_wait(struct ninep_client *client,
 			return ret;
 		}
 
-		ret = wait_for_tag(client, entry, client->config->timeout_ms);
+		ret = wait_for_tag(client, entry, timeout);
 		if (ret != -ETIMEDOUT || retries_left == 0) {
 			return ret;
 		}
