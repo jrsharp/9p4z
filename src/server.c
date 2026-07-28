@@ -22,6 +22,10 @@
 
 LOG_MODULE_REGISTER(ninep_server, CONFIG_NINEP_LOG_LEVEL);
 
+/* True only while handle_tversion() is clunking the old session's fids, so a
+ * backend's clunk callback can tell a session-reset from an explicit Tclunk. */
+bool ninep_clunk_session_reset;
+
 /* Forward declarations */
 static uint64_t get_current_time_ms(void);
 
@@ -273,6 +277,11 @@ static void handle_tversion(struct ninep_server *server, const uint8_t *msg, siz
 	 * held conversation ctl fids without anet_clunk(K_CTL) -> conv_free, so
 	 * conversations orphaned and only a reboot freed them. Mirror the proper
 	 * teardown in ninep_server_cleanup. */
+	/* Distinguish this session-reset clunk from an explicit Tclunk: a backend like
+	 * ninep_dfu must NOT treat a re-version as "transfer finished" (finalizing a
+	 * partial image) -- only a real Tclunk means done. This lets a resumable OTA
+	 * re-version the mesh session mid-transfer without prematurely finalizing. */
+	ninep_clunk_session_reset = true;
 	for (int i = 0; i < CONFIG_NINEP_SERVER_MAX_FIDS; i++) {
 		if (server->fids[i].in_use) {
 			if (server->config.fs_ops && server->config.fs_ops->clunk &&
@@ -293,6 +302,7 @@ static void handle_tversion(struct ninep_server *server, const uint8_t *msg, siz
 		server->fids[i].uname_idx = NINEP_POOL_NONE;
 		server->fids[i].auth_idx = NINEP_POOL_NONE;
 	}
+	ninep_clunk_session_reset = false;
 	/* Clear pools */
 	memset(server->uname_refcount, 0, sizeof(server->uname_refcount));
 	memset(server->auth_pool_used, 0, sizeof(server->auth_pool_used));

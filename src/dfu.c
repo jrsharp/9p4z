@@ -243,6 +243,8 @@ static int dfu_write(const uint8_t *buf, uint32_t count, uint64_t offset, void *
 /**
  * @brief Sysfs clunk callback - finalize upload when file is closed
  */
+extern bool ninep_clunk_session_reset;
+
 static int dfu_clunk(void *ctx)
 {
 	struct ninep_dfu *dfu = ctx;
@@ -250,6 +252,15 @@ static int dfu_clunk(void *ctx)
 
 	/* No upload in progress - nothing to finalize */
 	if (dfu->state != NINEP_DFU_RECEIVING) {
+		return 0;
+	}
+
+	/* A session reset (Tversion) is NOT "transfer finished" -- e.g. a resumable
+	 * OTA re-versions the mesh session mid-transfer to recover from a wedge.
+	 * Finalizing here would flush a partial page + request-upgrade on an incomplete
+	 * image and corrupt it. Keep the DFU RECEIVING and its position; only a real
+	 * Tclunk (the explicit commit) finalizes. */
+	if (ninep_clunk_session_reset) {
 		return 0;
 	}
 
