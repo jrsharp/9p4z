@@ -190,30 +190,34 @@ static int dfu_write(const uint8_t *buf, uint32_t count, uint64_t offset, void *
 	struct ninep_dfu *dfu = ctx;
 	int ret;
 
-	/* First write starts the upload */
-	if (dfu->state != NINEP_DFU_RECEIVING) {
+	/* Start the upload only on a genuinely FRESH transfer (offset 0). A reconnect that
+	 * RESUMES an in-progress transfer re-opens the file and writes from offset 0 again;
+	 * we must NOT re-init/re-erase then (that would wipe bytes_written and the received
+	 * data -> the classic "expected 0" gap loop on a repeat OTA). Only offset 0 with the
+	 * DFU not already receiving is a real new upload. */
+	if (dfu->state != NINEP_DFU_RECEIVING && offset == 0 && dfu->bytes_written == 0) {
 		ret = dfu_start_upload(dfu);
 		if (ret < 0) {
 			return ret;
 		}
+	} else if (dfu->state != NINEP_DFU_RECEIVING) {
+		/* Resuming (or a stray write after complete/error): keep our position. */
+		dfu->state = NINEP_DFU_RECEIVING;
 	}
 
-	/* IDEMPOTENT by offset. flash_img_buffered_write only appends, so historically
-	 * this ignored `offset` and trusted strict in-order delivery. Over a lossy mesh
-	 * with a reply-suppressed windowed sender, a chunk whose ACK was lost gets RE-sent
-	 * (a fresh transport seq, so not deduped) -- appending it a second time would shift
-	 * the whole image and corrupt it (MCUboot then rejects the secondary slot). Use the
-	 * offset the client stamped: a write at an already-written offset is a duplicate
-	 * (skip, report success -- exactly-once); a forward gap means a chunk was lost
-	 * (fail, don't silently corrupt). In-order writes (offset == bytes_written) proceed. */
+	/* IDEMPOTENT + RESUMABLE by offset. flash_img only appends, so this uses the client's
+	 * stamped offset. offset < bytes_written = a duplicate/already-have chunk (skip --
+	 * exactly-once, so a re-sent chunk doesn't double-append and shift the image, which
+	 * is what made MCUboot reject the slot). offset > bytes_written = an out-of-order or
+	 * lost chunk: SKIP it (do NOT go terminal -- that re-inits and loops) and stay
+	 * RECEIVING; the sender's resumable retry re-sends from bytes_written and fills it.
+	 * offset == bytes_written = the next in-order chunk -> write. */
 	if (offset < dfu->bytes_written) {
-		return (int)count;   /* duplicate retransmit -- already have these bytes */
+		return (int)count;   /* duplicate/already-written -- skip */
 	}
 	if (offset > dfu->bytes_written) {
-		LOG_ERR("DFU: offset gap: got %llu, expected %u (lost chunk)",
-			(unsigned long long)offset, dfu->bytes_written);
-		set_state(dfu, NINEP_DFU_ERROR, -EINVAL);
-		return -EINVAL;
+		/* Non-fatal gap: drop this chunk, keep our position; resume fills it. */
+		return (int)count;
 	}
 
 	/* Write chunk to flash */
