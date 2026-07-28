@@ -187,7 +187,6 @@ static int dfu_read(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx)
  */
 static int dfu_write(const uint8_t *buf, uint32_t count, uint64_t offset, void *ctx)
 {
-	ARG_UNUSED(offset);
 	struct ninep_dfu *dfu = ctx;
 	int ret;
 
@@ -197,6 +196,24 @@ static int dfu_write(const uint8_t *buf, uint32_t count, uint64_t offset, void *
 		if (ret < 0) {
 			return ret;
 		}
+	}
+
+	/* IDEMPOTENT by offset. flash_img_buffered_write only appends, so historically
+	 * this ignored `offset` and trusted strict in-order delivery. Over a lossy mesh
+	 * with a reply-suppressed windowed sender, a chunk whose ACK was lost gets RE-sent
+	 * (a fresh transport seq, so not deduped) -- appending it a second time would shift
+	 * the whole image and corrupt it (MCUboot then rejects the secondary slot). Use the
+	 * offset the client stamped: a write at an already-written offset is a duplicate
+	 * (skip, report success -- exactly-once); a forward gap means a chunk was lost
+	 * (fail, don't silently corrupt). In-order writes (offset == bytes_written) proceed. */
+	if (offset < dfu->bytes_written) {
+		return (int)count;   /* duplicate retransmit -- already have these bytes */
+	}
+	if (offset > dfu->bytes_written) {
+		LOG_ERR("DFU: offset gap: got %llu, expected %u (lost chunk)",
+			(unsigned long long)offset, dfu->bytes_written);
+		set_state(dfu, NINEP_DFU_ERROR, -EINVAL);
+		return -EINVAL;
 	}
 
 	/* Write chunk to flash */
