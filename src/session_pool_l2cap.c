@@ -34,6 +34,11 @@ LOG_MODULE_REGISTER(ninep_session_pool_l2cap, CONFIG_NINEP_LOG_LEVEL);
 NET_BUF_POOL_DEFINE(l2cap_session_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
                     CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
 
+/* How long a send sleeps between re-checks while the TX pool is empty.
+ * Short enough that a wedge is caught promptly, long enough that a busy
+ * link isn't spinning. */
+#define NINEP_TX_ALLOC_SLICE_MS 250
+
 /*
  * Dedicated work queue for 9P message processing.
  * This decouples 9P processing from the BT RX thread, preventing:
@@ -93,6 +98,16 @@ static void l2cap_session_connected(struct bt_l2cap_chan *chan)
 	ch->rx_len = 0;
 	ch->rx_expected = 0;
 	ch->rx_state = RX_WAIT_SIZE;
+
+	/* Fresh TX accounting. Seed the completion clock with now, so the
+	 * first send is measured from the channel opening rather than from
+	 * boot — otherwise a board that has been up for a while declares a
+	 * wedge on its very first response. */
+	atomic_set(&ch->tx_in_flight, 0);
+	ch->tx_last_done_ms = k_uptime_get_32();
+	ch->tx_sends = 0;
+	ch->tx_completions = 0;
+	ch->tx_wedged = false;
 
 	/* Mark session as connected */
 	ninep_session_connected(ch->session);
@@ -245,7 +260,137 @@ static int l2cap_session_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 
 static void l2cap_session_sent(struct bt_l2cap_chan *chan)
 {
-	LOG_INF("TX sent callback fired");
+#if NINEP_NCS_BUILD
+	struct bt_l2cap_le_chan *le_chan = BT_L2CAP_LE_CHAN(chan);
+	struct l2cap_session_chan *ch = CONTAINER_OF(le_chan, struct l2cap_session_chan, le);
+#else
+	struct l2cap_session_chan *ch = CONTAINER_OF(chan, struct l2cap_session_chan, le.chan);
+#endif
+
+	/* Proof that TX is still moving — this is the only thing that
+	 * distinguishes a slow link from a dead one. */
+	ch->tx_completions++;
+	ch->tx_last_done_ms = k_uptime_get_32();
+	atomic_dec(&ch->tx_in_flight);
+
+	LOG_DBG("TX complete on session %d (%u in flight)",
+	        ch->session ? ch->session->session_id : -1,
+	        (unsigned)atomic_get(&ch->tx_in_flight));
+}
+
+/*
+ * Has TX stopped, as opposed to merely fallen behind?
+ *
+ * Only meaningful when we are owed completions: with nothing in flight
+ * there is no evidence either way, and a quiet idle link would look
+ * identical to a wedged one.
+ */
+static bool l2cap_session_tx_wedged(struct l2cap_session_chan *ch)
+{
+	if (CONFIG_NINEP_L2CAP_TX_WEDGE_MS <= 0) {
+		return false;
+	}
+
+	if (atomic_get(&ch->tx_in_flight) <= 0) {
+		return false;
+	}
+
+	return (k_uptime_get_32() - ch->tx_last_done_ms) >
+	       (uint32_t)CONFIG_NINEP_L2CAP_TX_WEDGE_MS;
+}
+
+/*
+ * Tear the channel down so the client notices and reconnects.
+ *
+ * Doing nothing is the worse option: the link stays up, every response
+ * is dropped, and the device looks alive while answering nothing. A
+ * disconnect costs one reconnect and returns the in-flight buffers.
+ *
+ * The disconnect runs from a work item, not from whoever noticed. The
+ * disconnected callback frees the session, and the caller here is
+ * typically deep inside that same session's request handling — running
+ * it inline risks pulling the server out from under the stack that is
+ * still unwinding through it.
+ */
+static void l2cap_session_tx_recover_handler(struct k_work *work)
+{
+	struct l2cap_session_chan *ch =
+		CONTAINER_OF(work, struct l2cap_session_chan, tx_recover_work);
+	int ret;
+
+	ret = bt_l2cap_chan_disconnect(&ch->le.chan);
+	if (ret < 0) {
+		LOG_ERR("Session %d: L2CAP disconnect failed: %d",
+		        ch->session ? ch->session->session_id : -1, ret);
+	}
+}
+
+static void l2cap_session_tx_recover(struct l2cap_session_chan *ch);
+
+/*
+ * Look for a wedge across every session, not just the one that noticed.
+ *
+ * The TX net_buf pool is shared, so the session that fails to allocate is
+ * usually not the one holding the buffers hostage — a wedged peer stops
+ * sending, and therefore stops being the one to run this check. Sweeping
+ * everyone is what lets a healthy session's stall trigger the teardown of
+ * whichever session actually broke.
+ */
+static void l2cap_session_tx_sweep(struct ninep_session_pool_l2cap *pool)
+{
+	if (!pool) {
+		return;
+	}
+
+	for (int i = 0; i < pool->config.max_sessions; i++) {
+		struct l2cap_session_chan *ch = &pool->channels[i];
+
+		if (!ch->session || ch->session->state != NINEP_SESSION_CONNECTED) {
+			continue;
+		}
+		if (l2cap_session_tx_wedged(ch)) {
+			l2cap_session_tx_recover(ch);
+		}
+	}
+}
+
+static void l2cap_session_tx_recover(struct l2cap_session_chan *ch)
+{
+	if (ch->tx_wedged) {
+		return;  /* Teardown already requested */
+	}
+	ch->tx_wedged = true;
+
+	LOG_ERR("Session %d: TX wedged — %u sends, %u completions, "
+	        "%u in flight, none completed for %ums. Disconnecting.",
+	        ch->session ? ch->session->session_id : -1,
+	        ch->tx_sends, ch->tx_completions,
+	        (unsigned)atomic_get(&ch->tx_in_flight),
+	        (unsigned)(k_uptime_get_32() - ch->tx_last_done_ms));
+
+	k_work_submit_to_queue(&ninep_proc_wq, &ch->tx_recover_work);
+}
+
+int ninep_session_pool_l2cap_tx_stats(struct ninep_session_pool_l2cap *pool,
+                                       int session_id,
+                                       struct ninep_l2cap_tx_stats *stats)
+{
+	if (!pool || !stats || session_id < 0 ||
+	    session_id >= pool->config.max_sessions) {
+		return -EINVAL;
+	}
+
+	struct l2cap_session_chan *ch = &pool->channels[session_id];
+	atomic_val_t in_flight = atomic_get(&ch->tx_in_flight);
+
+	stats->sends = ch->tx_sends;
+	stats->completions = ch->tx_completions;
+	stats->in_flight = in_flight > 0 ? (uint32_t)in_flight : 0;
+	stats->idle_ms = in_flight > 0 ?
+	                 (k_uptime_get_32() - ch->tx_last_done_ms) : 0;
+	stats->wedged = ch->tx_wedged;
+
+	return 0;
 }
 
 static int l2cap_session_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
@@ -270,6 +415,7 @@ static int l2cap_session_accept(struct bt_conn *conn, struct bt_l2cap_server *se
 	memset(l2cap_chan, 0, sizeof(*l2cap_chan));
 	l2cap_chan->le.chan.ops = &l2cap_session_chan_ops;
 	l2cap_chan->session = session;
+	l2cap_chan->pool = l2cap_pool;
 	l2cap_chan->rx_buf = l2cap_pool->rx_buf_pool +
 	                     (session->session_id * l2cap_pool->config.rx_buf_size_per_session);
 	l2cap_chan->rx_buf_size = l2cap_pool->config.rx_buf_size_per_session;
@@ -277,6 +423,7 @@ static int l2cap_session_accept(struct bt_conn *conn, struct bt_l2cap_server *se
 	l2cap_chan->rx_expected = 0;
 	l2cap_chan->rx_state = RX_WAIT_SIZE;
 	k_work_init(&l2cap_chan->process_work, session_process_work_handler);
+	k_work_init(&l2cap_chan->tx_recover_work, l2cap_session_tx_recover_handler);
 
 	/* Initialize transport for this session */
 	session->transport.ops = &l2cap_session_transport_ops;
@@ -314,27 +461,64 @@ static int l2cap_session_send(struct ninep_transport *transport, const uint8_t *
 		return -ENOTCONN;
 	}
 
-	LOG_INF("TX send: %zu bytes, session %d", len, chan->session->session_id);
+	LOG_DBG("TX send: %zu bytes, session %d", len, chan->session->session_id);
 
-	/* Allocate from application buffer pool.
-	 * The net_buf pool itself provides back-pressure — when all buffers
-	 * are in-flight, this blocks until a sent callback frees one.
-	 * Use a timeout to avoid permanent deadlock if BLE stalls. */
-	msg_buf = net_buf_alloc(&l2cap_session_tx_pool, K_MSEC(5000));
-	if (!msg_buf) {
-		LOG_ERR("TX buffer alloc timeout (all %d bufs in flight)", TX_BUF_COUNT);
-		return -EAGAIN;
+	if (chan->tx_wedged) {
+		return -ENOTCONN;  /* Teardown pending; don't queue more */
 	}
+
+	/*
+	 * Wait for a free TX buffer in slices rather than one long sleep.
+	 * The pool is the back-pressure — it drains as sent callbacks land —
+	 * but if those callbacks have stopped, waiting the full timeout only
+	 * delays the inevitable while holding up every other session on the
+	 * shared processing work queue. So re-check for a wedge each slice
+	 * and bail out as soon as one is provable.
+	 */
+	for (int waited = 0; ; waited += NINEP_TX_ALLOC_SLICE_MS) {
+		msg_buf = net_buf_alloc(&l2cap_session_tx_pool,
+		                        K_MSEC(NINEP_TX_ALLOC_SLICE_MS));
+		if (msg_buf) {
+			break;
+		}
+
+		/* The buffers may be held by a different session entirely, so
+		 * check them all; if that frees some, the next slice gets one. */
+		l2cap_session_tx_sweep(chan->pool);
+		if (chan->tx_wedged) {
+			return -ENOTCONN;
+		}
+
+		if (waited + NINEP_TX_ALLOC_SLICE_MS >= CONFIG_NINEP_L2CAP_TX_ALLOC_MS) {
+			LOG_ERR("Session %d: no TX buffer after %dms (all %d in flight)",
+			        chan->session->session_id,
+			        CONFIG_NINEP_L2CAP_TX_ALLOC_MS, TX_BUF_COUNT);
+			return -EAGAIN;
+		}
+	}
+
 	/* Reserve L2CAP SDU headroom */
 	net_buf_reserve(msg_buf, BT_L2CAP_SDU_CHAN_SEND_RESERVE);
 
 	/* Copy message data to net_buf */
 	net_buf_add_mem(msg_buf, buf, len);
 
+	/* Count before sending: the sent callback can fire from another
+	 * thread the moment bt_l2cap_chan_send() takes the buffer, and a
+	 * decrement that beats its increment underflows the counter. */
+	if (atomic_inc(&chan->tx_in_flight) == 0) {
+		/* Nothing was outstanding, so the last completion time says
+		 * nothing about the link — it could be minutes of idle. Start
+		 * the clock here or an idle session's first send looks wedged. */
+		chan->tx_last_done_ms = k_uptime_get_32();
+	}
+	chan->tx_sends++;
+
 	/* Send via L2CAP channel */
 	ret = bt_l2cap_chan_send(&chan->le.chan, msg_buf);
 	if (ret < 0) {
 		LOG_ERR("bt_l2cap_chan_send failed: %d", ret);
+		atomic_dec(&chan->tx_in_flight);
 		net_buf_unref(msg_buf);
 		return ret;
 	}

@@ -184,6 +184,32 @@ config NINEP_L2CAP_MTU
 	  Typical values are 512, 1024, 2048, or 4096.
 	  Default: 4096 bytes.
 
+config NINEP_L2CAP_TX_WEDGE_MS
+	int "Declare the L2CAP TX path wedged after this long with no progress"
+	default 10000
+	help
+	  A send is slow when the link is busy and wedged when it has
+	  stopped entirely. The two look identical from the caller, so we
+	  tell them apart by progress: if buffers are in flight and the
+	  channel's sent callback has not fired for this many milliseconds,
+	  TX is not going to recover on its own and the session is torn
+	  down so the client can reconnect.
+
+	  This works around a stall seen after long sessions where sends
+	  are accepted but completions never arrive, leaving the device
+	  reachable but mute. Set to 0 to never tear down (a wedge then
+	  persists until the client gives up).
+
+config NINEP_L2CAP_TX_ALLOC_MS
+	int "How long a send waits for a free TX buffer"
+	default 5000
+	help
+	  Upper bound on waiting for the TX pool when every buffer is in
+	  flight. Must comfortably exceed the time to drain a full pool
+	  over a slow connection interval, or healthy transfers get
+	  cancelled; the wedge detector, not this timeout, is what catches
+	  a genuinely dead TX path.
+
 endif # NINEP_TRANSPORT_L2CAP
 
 config NINEP_TRANSPORT_L2CAP_CLIENT

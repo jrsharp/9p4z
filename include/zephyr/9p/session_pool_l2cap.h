@@ -125,6 +125,7 @@ void ninep_session_pool_l2cap_destroy(struct ninep_session_pool_l2cap *pool);
 struct l2cap_session_chan {
 	struct bt_l2cap_le_chan le;
 	struct ninep_session *session;
+	struct ninep_session_pool_l2cap *pool;  /* Owning pool; the TX pool is shared */
 	uint8_t *rx_buf;
 	size_t rx_buf_size;
 	size_t rx_len;
@@ -132,7 +133,44 @@ struct l2cap_session_chan {
 	enum { RX_WAIT_SIZE, RX_WAIT_DATA, RX_PROCESSING } rx_state;
 	struct k_work process_work;  /* Async 9P processing off BT RX thread */
 	uint32_t process_len;        /* Length of message to process */
+
+	/* TX health. A wedged TX path accepts sends forever and completes
+	 * none of them, so the only honest signal is completions: in_flight
+	 * says whether we are owed any, last_done_ms when one last arrived. */
+	atomic_t tx_in_flight;
+	uint32_t tx_last_done_ms;    /* k_uptime_get_32() at last sent callback */
+	uint32_t tx_sends;           /* Cumulative, for the stats file */
+	uint32_t tx_completions;
+	bool tx_wedged;              /* Latched: teardown already requested */
+	struct k_work tx_recover_work;  /* Disconnects off the noticing thread */
 };
+
+/**
+ * @brief Snapshot of a session's TX health
+ *
+ * A wedge is invisible from the client side — the link stays up and
+ * reads simply never answer — so the counters are worth surfacing
+ * somewhere a field unit can be asked about them.
+ */
+struct ninep_l2cap_tx_stats {
+	uint32_t sends;         /* SDUs handed to bt_l2cap_chan_send() */
+	uint32_t completions;   /* sent callbacks received */
+	uint32_t in_flight;     /* sends - completions */
+	uint32_t idle_ms;       /* Since the last completion, 0 if none owed */
+	bool wedged;            /* Teardown was triggered by the detector */
+};
+
+/**
+ * @brief Read TX health for one session
+ *
+ * @param pool L2CAP session pool
+ * @param session_id Session index
+ * @param stats Filled in on success
+ * @return 0 on success, -EINVAL if the session id is out of range
+ */
+int ninep_session_pool_l2cap_tx_stats(struct ninep_session_pool_l2cap *pool,
+                                       int session_id,
+                                       struct ninep_l2cap_tx_stats *stats);
 
 /**
  * @brief L2CAP session pool structure
@@ -150,18 +188,22 @@ struct ninep_session_pool_l2cap {
  * @brief Static allocation macro implementation
  * @internal
  */
+/*
+ * The storage is a byte array sized by the same formula the heap path
+ * uses, not a hand-written copy of struct ninep_session_pool. A copy
+ * silently undersizes the array the moment a field is added to the real
+ * struct — which had already happened for auth_config, putting the last
+ * session's tail past the end of the array.
+ */
 #define _NINEP_SESSION_POOL_L2CAP_DEFINE(name, num_sessions, rx_buf_size) \
 	static uint8_t _##name##_rx_pool[(num_sessions) * (rx_buf_size)]; \
 	static struct l2cap_session_chan _##name##_channels[num_sessions]; \
-	static struct { \
-		int max_sessions; \
-		struct k_mutex lock; \
-		struct ninep_fs_ops *fs_ops; \
-		void *fs_context; \
-		struct ninep_session sessions[num_sessions]; \
-	} _##name##_session_pool_storage; \
+	static uint8_t _##name##_session_pool_storage[ \
+		sizeof(struct ninep_session_pool) + \
+		(num_sessions) * sizeof(struct ninep_session)] \
+		__aligned(__alignof__(struct ninep_session_pool)); \
 	static struct ninep_session_pool_l2cap name = { \
-		.pool = (struct ninep_session_pool *)&_##name##_session_pool_storage, \
+		.pool = (struct ninep_session_pool *)_##name##_session_pool_storage, \
 		.rx_buf_pool = _##name##_rx_pool, \
 		.channels = _##name##_channels, \
 	}
