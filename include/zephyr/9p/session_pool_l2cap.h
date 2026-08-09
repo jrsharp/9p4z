@@ -134,6 +134,19 @@ struct l2cap_session_chan {
 	struct k_work process_work;  /* Async 9P processing off BT RX thread */
 	uint32_t process_len;        /* Length of message to process */
 
+	/* Bytes that arrived while rx_buf was busy being processed.
+	 *
+	 * An L2CAP channel is a byte stream, so a pipelining client (iOS
+	 * writes 9P messages into an NSOutputStream and CoreBluetooth packs
+	 * them as it likes) routinely puts several messages in one SDU.
+	 * Only the first can be parsed into rx_buf while the work queue
+	 * owns it; the rest wait here and are parsed the moment it frees.
+	 * Discarding them instead loses whole requests silently and the
+	 * client sits on its timeout. */
+	uint8_t rx_pending[CONFIG_NINEP_L2CAP_RX_PENDING_SIZE];
+	size_t rx_pending_len;
+	struct k_mutex rx_lock;      /* rx_* state: BT RX thread vs work queue */
+
 	/* TX health. A wedged TX path accepts sends forever and completes
 	 * none of them, so the only honest signal is completions: in_flight
 	 * says whether we are owed any, last_done_ms when one last arrived. */

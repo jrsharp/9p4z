@@ -200,6 +200,23 @@ config NINEP_L2CAP_TX_WEDGE_MS
 	  reachable but mute. Set to 0 to never tear down (a wedge then
 	  persists until the client gives up).
 
+config NINEP_L2CAP_RX_PENDING_SIZE
+	int "Bytes of not-yet-parsed L2CAP receive data held per session"
+	default 512
+	help
+	  An L2CAP channel carries a byte stream, not a message stream:
+	  iOS hands the app an NSOutputStream, so a client that pipelines
+	  requests routinely lands several 9P messages in a single SDU.
+	  Only one message at a time can occupy the session RX buffer
+	  while the work queue processes it, so the rest of the SDU is
+	  held here and parsed as soon as that buffer frees up. Without
+	  it those bytes are discarded and the client waits out its
+	  timeout for replies that will never come.
+
+	  Sized for a burst of small requests (a walk/open/read/clunk is
+	  tens of bytes); an overflow is reported rather than silently
+	  dropped.
+
 config NINEP_L2CAP_TX_ALLOC_MS
 	int "How long a send waits for a free TX buffer"
 	default 5000

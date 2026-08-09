@@ -146,8 +146,77 @@ static void l2cap_session_disconnected(struct bt_l2cap_chan *chan)
 }
 
 /*
- * Work handler: processes a complete 9P message on the dedicated work queue
+ * Feed bytes into the RX state machine.
+ *
+ * Returns the number of bytes consumed. Stops early — before the buffer
+ * is exhausted — once a complete message is sitting in rx_buf, because
+ * that buffer then belongs to whoever processes it. The caller decides
+ * what processing means: the BT RX thread hands it to the work queue,
+ * the work queue handles it inline. Caller holds ch->rx_lock.
+ */
+static size_t rx_consume(struct l2cap_session_chan *ch,
+                         const uint8_t *data, size_t len)
+{
+	size_t used = 0;
+
+	while (used < len && ch->rx_state != RX_PROCESSING) {
+		if (ch->rx_state == RX_WAIT_SIZE) {
+			size_t need = 4 - ch->rx_len;
+			size_t copy = MIN(need, len - used);
+
+			memcpy(&ch->rx_buf[ch->rx_len], data + used, copy);
+			used += copy;
+			ch->rx_len += copy;
+
+			if (ch->rx_len == 4) {
+				ch->rx_expected = ch->rx_buf[0] |
+				                  (ch->rx_buf[1] << 8) |
+				                  (ch->rx_buf[2] << 16) |
+				                  (ch->rx_buf[3] << 24);
+
+				LOG_DBG("Message size: %u bytes", ch->rx_expected);
+
+				if (ch->rx_expected < 7 ||
+				    ch->rx_expected > ch->rx_buf_size) {
+					LOG_ERR("Invalid message size: %u (max: %zu)",
+					        ch->rx_expected, ch->rx_buf_size);
+					/* Framing is lost and there is no way to
+					 * find the next boundary — drop the rest
+					 * and resynchronise on the next SDU. */
+					ch->rx_len = 0;
+					ch->rx_expected = 0;
+					ch->rx_state = RX_WAIT_SIZE;
+					return len;
+				}
+
+				ch->rx_state = RX_WAIT_DATA;
+			}
+		} else {
+			size_t need = ch->rx_expected - ch->rx_len;
+			size_t copy = MIN(need, len - used);
+
+			memcpy(&ch->rx_buf[ch->rx_len], data + used, copy);
+			used += copy;
+			ch->rx_len += copy;
+
+			if (ch->rx_len == ch->rx_expected) {
+				LOG_DBG("Complete message received: %u bytes", ch->rx_len);
+				ch->process_len = ch->rx_len;
+				ch->rx_state = RX_PROCESSING;
+			}
+		}
+	}
+
+	return used;
+}
+
+/*
+ * Work handler: processes complete 9P messages on the dedicated work queue
  * thread, keeping the BT RX thread free for other BLE operations.
+ *
+ * Loops rather than handling one message per submission: rx_pending may
+ * already hold the next request, and re-arming the work item for each
+ * would let a pipelining client outrun us.
  */
 static void session_process_work_handler(struct k_work *work)
 {
@@ -162,21 +231,49 @@ static void session_process_work_handler(struct k_work *work)
 
 	struct ninep_transport *transport = &session->transport;
 
-	LOG_DBG("Processing 9P message: %u bytes on session %d",
-	        ch->process_len, session->session_id);
+	for (;;) {
+		LOG_DBG("Processing 9P message: %u bytes on session %d",
+		        ch->process_len, session->session_id);
 
-	/* Deliver to 9P server (this may do filesystem I/O, send response, etc.) */
-	if (transport->recv_cb) {
-		transport->recv_cb(transport, ch->rx_buf,
-		                   ch->process_len, transport->user_data);
-	}
+		/* Deliver to 9P server (may do filesystem I/O, send a response,
+		 * etc.). Called without rx_lock held: it is slow, and the BT RX
+		 * thread must stay free to stash whatever arrives meanwhile. */
+		if (transport->recv_cb) {
+			transport->recv_cb(transport, ch->rx_buf,
+			                   ch->process_len, transport->user_data);
+		}
 
-	/* Reset RX state machine — ready for next message from BT RX thread.
-	 * Check state again in case disconnect happened during processing. */
-	if (ch->rx_state == RX_PROCESSING) {
+		k_mutex_lock(&ch->rx_lock, K_FOREVER);
+
+		/* A disconnect during processing already reset the state. */
+		if (ch->rx_state != RX_PROCESSING) {
+			k_mutex_unlock(&ch->rx_lock);
+			return;
+		}
+
 		ch->rx_len = 0;
 		ch->rx_expected = 0;
 		ch->rx_state = RX_WAIT_SIZE;
+
+		/* Whatever the client sent while we were busy is parsed now. */
+		if (ch->rx_pending_len > 0) {
+			size_t used = rx_consume(ch, ch->rx_pending,
+			                         ch->rx_pending_len);
+
+			ch->rx_pending_len -= used;
+			if (ch->rx_pending_len > 0) {
+				memmove(ch->rx_pending, ch->rx_pending + used,
+				        ch->rx_pending_len);
+			}
+		}
+
+		bool another = (ch->rx_state == RX_PROCESSING);
+
+		k_mutex_unlock(&ch->rx_lock);
+
+		if (!another) {
+			return;
+		}
 	}
 }
 
@@ -191,73 +288,44 @@ static int l2cap_session_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 
 	LOG_DBG("L2CAP session recv: %u bytes for session %d", buf->len, ch->session->session_id);
 
-	/* Process all data in the buffer */
-	while (buf->len > 0) {
-		if (ch->rx_state == RX_PROCESSING) {
-			/* Previous message still being processed on work queue.
-			 * L2CAP flow control should prevent this, but guard anyway. */
-			LOG_WRN("Session %d: data arrived while processing, dropping %u bytes",
-			        ch->session->session_id, buf->len);
-			return -EBUSY;
-		}
+	k_mutex_lock(&ch->rx_lock, K_FOREVER);
 
-		if (ch->rx_state == RX_WAIT_SIZE) {
-			/* Reading 4-byte size field */
-			size_t need = 4 - ch->rx_len;
-			size_t copy = MIN(need, buf->len);
+	size_t used = 0;
 
-			memcpy(&ch->rx_buf[ch->rx_len], buf->data, copy);
-			net_buf_pull(buf, copy);
-			ch->rx_len += copy;
+	/* Parse straight into rx_buf only when it is free and nothing is
+	 * already queued ahead of this SDU — otherwise requests reorder. */
+	if (ch->rx_state != RX_PROCESSING && ch->rx_pending_len == 0) {
+		used = rx_consume(ch, buf->data, buf->len);
+	}
 
-			if (ch->rx_len == 4) {
-				/* Parse size field (little-endian) */
-				ch->rx_expected = ch->rx_buf[0] |
-				                  (ch->rx_buf[1] << 8) |
-				                  (ch->rx_buf[2] << 16) |
-				                  (ch->rx_buf[3] << 24);
+	bool submit = (ch->rx_state == RX_PROCESSING && used > 0);
+	size_t left = buf->len - used;
 
-				LOG_DBG("Message size: %u bytes", ch->rx_expected);
-
-				/* Validate size */
-				if (ch->rx_expected < 7 || ch->rx_expected > ch->rx_buf_size) {
-					LOG_ERR("Invalid message size: %u (max: %zu)",
-					        ch->rx_expected, ch->rx_buf_size);
-					ch->rx_len = 0;
-					ch->rx_state = RX_WAIT_SIZE;
-					return -EINVAL;
-				}
-
-				ch->rx_state = RX_WAIT_DATA;
-			}
+	if (left > 0) {
+		if (ch->rx_pending_len + left <= sizeof(ch->rx_pending)) {
+			memcpy(ch->rx_pending + ch->rx_pending_len,
+			       buf->data + used, left);
+			ch->rx_pending_len += left;
 		} else {
-			/* Reading message body (RX_WAIT_DATA) */
-			size_t need = ch->rx_expected - ch->rx_len;
-			size_t copy = MIN(need, buf->len);
-
-			memcpy(&ch->rx_buf[ch->rx_len], buf->data, copy);
-			net_buf_pull(buf, copy);
-			ch->rx_len += copy;
-
-			if (ch->rx_len == ch->rx_expected) {
-				/* Complete message — hand off to processing thread */
-				LOG_DBG("Complete message received: %u bytes", ch->rx_len);
-				ch->process_len = ch->rx_len;
-				ch->rx_state = RX_PROCESSING;
-				k_work_submit_to_queue(&ninep_proc_wq, &ch->process_work);
-
-				/* Don't process more data from this SDU — the rx_buf
-				 * is now owned by the work handler until it resets state.
-				 * Any remaining bytes in buf are for the next message
-				 * which can't start until processing completes. */
-				break;
-			}
+			/* Never silent: losing bytes desynchronises the stream
+			 * and the client waits out its timeout for a reply that
+			 * is never coming. */
+			LOG_ERR("Session %d: RX pending full (%zu + %zu > %zu), "
+			        "dropping %zu bytes - raise "
+			        "CONFIG_NINEP_L2CAP_RX_PENDING_SIZE",
+			        ch->session->session_id, ch->rx_pending_len,
+			        left, sizeof(ch->rx_pending), left);
 		}
+	}
+
+	k_mutex_unlock(&ch->rx_lock);
+
+	if (submit) {
+		k_work_submit_to_queue(&ninep_proc_wq, &ch->process_work);
 	}
 
 	return 0;
 }
-
 static void l2cap_session_sent(struct bt_l2cap_chan *chan)
 {
 #if NINEP_NCS_BUILD
