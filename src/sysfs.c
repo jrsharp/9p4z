@@ -133,11 +133,26 @@ static struct ninep_fs_node *alloc_node(struct ninep_sysfs *sysfs,
 }
 
 /* Helper: Find entry by path */
+/* Entry paths are whatever the caller registered. Some callers use a
+ * leading slash ("/hello.txt"), some do not ("hello.txt"), and sysfs_walk
+ * builds its lookup key with one. Comparing raw strings therefore depends
+ * on a convention nothing enforces — and when it broke, every top-level
+ * walk failed: the file was ENOENT and the directory fell through to the
+ * "has children" branch, which found none and returned nothing.
+ *
+ * Normalise instead of demanding a convention: a leading slash is not
+ * significant on either side of the comparison. */
+static const char *path_key(const char *p)
+{
+	return (p && p[0] == '/') ? p + 1 : p;
+}
+
 static struct ninep_sysfs_entry *find_entry(struct ninep_sysfs *sysfs,
                                               const char *path)
 {
 	for (size_t i = 0; i < sysfs->num_entries; i++) {
-		if (strcmp(sysfs->entries[i].path, path) == 0) {
+		if (strcmp(path_key(sysfs->entries[i].path),
+		           path_key(path)) == 0) {
 			return &sysfs->entries[i];
 		}
 	}
@@ -149,10 +164,14 @@ static struct ninep_sysfs_entry *find_entry(struct ninep_sysfs *sysfs,
 static bool is_child_of(const char *path, const char *parent_path,
                          char *child_name, size_t child_name_size)
 {
+	path = path_key(path);
+	parent_path = path_key(parent_path);
+
 	size_t parent_len = strlen(parent_path);
 
-	/* Root directory special case */
-	if (strcmp(parent_path, "/") == 0) {
+	/* Root directory special case (path_key has already dropped the
+	 * leading slash, so the root arrives here as ""). */
+	if (parent_path[0] == '\0' || strcmp(parent_path, "/") == 0) {
 		parent_len = 0;
 	}
 
