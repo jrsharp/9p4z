@@ -493,7 +493,6 @@ static int srv_fs_read(struct ninep_fs_node *node, uint64_t offset,
                        uint8_t *buf, uint32_t count, const char *uname, void *fs_ctx)
 {
 	ARG_UNUSED(fs_ctx);
-	ARG_UNUSED(uname);
 
 	LOG_DBG("srv_fs_read: node=%p, offset=%llu, count=%u", node, offset, count);
 
@@ -577,7 +576,12 @@ static int srv_fs_read(struct ninep_fs_node *node, uint64_t offset,
 			void *ctx = entry->local.server->config.fs_ctx;
 
 			if (ops && ops->read) {
-				int ret = ops->read(node, offset, buf, count, NULL, ctx);
+				/* Forward the caller's identity. Passing NULL here
+				 * made every read under /srv anonymous no matter
+				 * how the session had authenticated — /srv/bbs/whoami
+				 * answered "guest" to a client whose Tauth the server
+				 * had just accepted. srv_fs_write already forwards it. */
+				int ret = ops->read(node, offset, buf, count, uname, ctx);
 				if (ret >= 0 || ret != -EINVAL) {
 					k_mutex_unlock(&global_srv_registry.lock);
 					return ret;
