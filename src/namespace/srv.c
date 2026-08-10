@@ -708,11 +708,67 @@ static int srv_fs_remove(struct ninep_fs_node *node, void *fs_ctx)
 	return -EROFS;
 }
 
+/* Deferred variant: hand the service the read handle so a stream file
+ * can park the request instead of answering it empty.
+ *
+ * Without this, srv exposed only .read, so the 9P server took the plain
+ * path and passed no handle. A stream that would have parked — /gfx's
+ * draw stream, a chat room — has nothing to do with a handle-less read
+ * but return 0 bytes, and a client that receives 0 has no choice but to
+ * poll. That is why a static scene under /srv updated erratically while
+ * one with motion in it looked fine: with continuous damage there is
+ * always something to return, so the polling never shows.
+ */
+static int srv_fs_read_deferred(struct ninep_fs_node *node, uint64_t offset,
+                                uint8_t *buf, uint32_t count,
+                                const char *uname,
+                                const struct ninep_read_handle *h,
+                                void *fs_ctx)
+{
+	/* The srv root is a synthetic directory; nothing to defer. */
+	if (node == srv_root_node) {
+		return srv_fs_read(node, offset, buf, count, uname, fs_ctx);
+	}
+
+	k_mutex_lock(&global_srv_registry.lock, K_FOREVER);
+	struct srv_entry *entry = global_srv_registry.services;
+
+	while (entry) {
+		if (entry->type == SRV_TYPE_LOCAL && entry->local.server) {
+			const struct ninep_fs_ops *ops = entry->local.server->config.fs_ops;
+			void *ctx = entry->local.server->config.fs_ctx;
+
+			if (ops && ops->read_deferred) {
+				int ret = ops->read_deferred(node, offset, buf, count,
+				                             uname, h, ctx);
+
+				if (ret >= 0 || ret != -EINVAL) {
+					k_mutex_unlock(&global_srv_registry.lock);
+					return ret;
+				}
+			} else if (ops && ops->read) {
+				int ret = ops->read(node, offset, buf, count, uname, ctx);
+
+				if (ret >= 0 || ret != -EINVAL) {
+					k_mutex_unlock(&global_srv_registry.lock);
+					return ret;
+				}
+			}
+		}
+		entry = entry->next;
+	}
+	k_mutex_unlock(&global_srv_registry.lock);
+
+	return -ENOENT;
+}
+
+
 static const struct ninep_fs_ops srv_fs_ops = {
 	.get_root = srv_fs_get_root,
 	.walk = srv_fs_walk,
 	.open = srv_fs_open,
 	.read = srv_fs_read,
+	.read_deferred = srv_fs_read_deferred,
 	.write = srv_fs_write,
 	.stat = srv_fs_stat,
 	.create = srv_fs_create,
