@@ -80,6 +80,16 @@ struct ninep_dfu {
 	ninep_dfu_status_cb_t status_cb; /**< Status callback */
 	uint32_t last_progress_log;      /**< For progress logging */
 	struct flash_img_context flash_ctx; /**< Flash image context */
+	/**
+	 * Fingerprint of the first bytes of the image being received, used to tell a
+	 * RESUME of the same image (re-writes offset 0, must dup-skip) from a NEW,
+	 * DIFFERENT image (offset 0 with other content, must restart). Without this,
+	 * pushing image B onto a target that still holds partial image A silently
+	 * skips B's early chunks as "duplicates" and produces a spliced blob that
+	 * MCUboot rejects -- an OTA that reports success and never applies.
+	 */
+	uint8_t first_sig[16];           /**< First bytes of the in-flight image */
+	uint8_t first_sig_len;           /**< Valid bytes in first_sig (0 = unset) */
 };
 
 /**

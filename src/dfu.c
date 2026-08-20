@@ -109,6 +109,7 @@ static int dfu_start_upload(struct ninep_dfu *dfu)
 
 	dfu->bytes_written = 0;
 	dfu->last_progress_log = 0;
+	dfu->first_sig_len = 0;
 	set_state(dfu, NINEP_DFU_RECEIVING, 0);
 	LOG_INF("DFU: ready to receive firmware (progressive erase: %s)",
 	        IS_ENABLED(CONFIG_IMG_ERASE_PROGRESSIVELY) ? "on" : "off");
@@ -200,9 +201,34 @@ static int dfu_write(const uint8_t *buf, uint32_t count, uint64_t offset, void *
 		if (ret < 0) {
 			return ret;
 		}
+	} else if (offset == 0 && dfu->bytes_written > 0 && dfu->first_sig_len > 0 &&
+		   memcmp(buf, dfu->first_sig, MIN(count, dfu->first_sig_len)) != 0) {
+		/*
+		 * Offset 0 with DIFFERENT leading bytes than the image we are holding:
+		 * this is a new image, not a resume. Restart, or the dup-skip below would
+		 * silently drop this image's early chunks (they are "already written" --
+		 * but they belong to the PREVIOUS image) and splice the two together. The
+		 * result passes streaming, gets finalized, and is then rejected by MCUboot,
+		 * so the node keeps running its old firmware while the pusher reports
+		 * success. Observed in the field: a node stuck two versions behind across
+		 * several apparently-successful OTAs.
+		 */
+		LOG_WRN("DFU: offset 0 with new image content (had %u B) -- restarting",
+			dfu->bytes_written);
+		dfu->first_sig_len = 0;
+		ret = dfu_start_upload(dfu);
+		if (ret < 0) {
+			return ret;
+		}
 	} else if (dfu->state != NINEP_DFU_RECEIVING) {
 		/* Resuming (or a stray write after complete/error): keep our position. */
 		dfu->state = NINEP_DFU_RECEIVING;
+	}
+
+	/* Remember the image's leading bytes so the check above can fire next time. */
+	if (offset == 0 && count > 0 && dfu->first_sig_len == 0) {
+		dfu->first_sig_len = (uint8_t)MIN(count, sizeof(dfu->first_sig));
+		memcpy(dfu->first_sig, buf, dfu->first_sig_len);
 	}
 
 	/* IDEMPOTENT + RESUMABLE by offset. flash_img only appends, so this uses the client's
@@ -373,6 +399,7 @@ void ninep_dfu_cancel(struct ninep_dfu *dfu)
 	dfu->state = NINEP_DFU_IDLE;
 	dfu->bytes_written = 0;
 	dfu->last_progress_log = 0;
+	dfu->first_sig_len = 0;
 }
 
 int ninep_dfu_confirm(void)
