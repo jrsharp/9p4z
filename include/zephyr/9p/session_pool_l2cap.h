@@ -173,6 +173,19 @@ int ninep_session_pool_l2cap_tx_stats(struct ninep_session_pool_l2cap *pool,
                                        struct ninep_l2cap_tx_stats *stats);
 
 /**
+ * @brief Sweep all sessions for a wedged TX path and tear down any found.
+ *
+ * The internal wedge check only runs when a send is attempted, so a peer that
+ * goes silent leaves a stalled session undetected until it sends again. Call
+ * this periodically (every few seconds) so a wedge is caught within
+ * ~NINEP_L2CAP_TX_WEDGE_MS and the session dropped promptly (freeing it to
+ * reconnect) instead of hanging for minutes.
+ *
+ * @param pool L2CAP session pool
+ */
+void ninep_session_pool_l2cap_tx_sweep(struct ninep_session_pool_l2cap *pool);
+
+/**
  * @brief L2CAP session pool structure
  * @internal Exposed only for static allocation macro
  */

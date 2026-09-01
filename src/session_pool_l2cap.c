@@ -371,6 +371,16 @@ static void l2cap_session_tx_recover(struct l2cap_session_chan *ch)
 	k_work_submit_to_queue(&ninep_proc_wq, &ch->tx_recover_work);
 }
 
+/* Public entry so the application can drive wedge detection on a timer instead
+ * of only when a send is attempted. Without a periodic caller, a peer that goes
+ * silent leaves its stalled session undetected until it sends again (which can
+ * be minutes), so the node stays "connected but mute" far longer than the
+ * NINEP_L2CAP_TX_WEDGE_MS threshold. Call this every few seconds. */
+void ninep_session_pool_l2cap_tx_sweep(struct ninep_session_pool_l2cap *pool)
+{
+	l2cap_session_tx_sweep(pool);
+}
+
 int ninep_session_pool_l2cap_tx_stats(struct ninep_session_pool_l2cap *pool,
                                        int session_id,
                                        struct ninep_l2cap_tx_stats *stats)
