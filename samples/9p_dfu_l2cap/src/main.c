@@ -16,7 +16,7 @@
 #include <zephyr/dfu/mcuboot.h>
 
 #include <zephyr/9p/server.h>
-#include <zephyr/9p/transport_l2cap.h>
+#include <zephyr/9p/session_pool_l2cap.h>
 #include <zephyr/9p/sysfs.h>
 #include <zephyr/9p/dfu.h>
 
@@ -26,10 +26,18 @@
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
-/* 9P server and transport */
-static struct ninep_server server;
-static struct ninep_transport transport;
-static uint8_t rx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
+/* 9P server: an L2CAP session pool.
+ *
+ * NOTE: this sample previously used the single-session ninep_transport_l2cap
+ * API, which no longer links. 9p4z's CMakeLists compiles session_pool_l2cap.c
+ * INSTEAD OF transport_l2cap.c whenever CONFIG_NINEP_SERVER=y (the pool is the
+ * "preferred path" for servers), so ninep_transport_l2cap_init was simply never
+ * built into the library and the sample failed at link with
+ * "undefined reference to ninep_transport_l2cap_init".
+ *
+ * The pool is also what dect_relay uses in production, so this keeps the DFU
+ * comparison measuring the real path rather than a deprecated one. */
+NINEP_SESSION_POOL_L2CAP_DEFINE(l2cap_pool, 1, CONFIG_NINEP_MAX_MESSAGE_SIZE);
 
 /* Sysfs for virtual files */
 static struct ninep_sysfs sysfs;
@@ -116,21 +124,57 @@ static int write_confirm(const uint8_t *buf, uint32_t count, uint64_t offset, vo
 	return ret < 0 ? ret : count;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Device-side transfer instrumentation                                      */
+/*                                                                           */
+/* Emits the same BENCH lines as the SMP twin (samples/smp_dfu_ble) so the    */
+/* two can be timed by the board itself, with no host-side scan/connect       */
+/* overhead in the number. The clock starts when the first upload byte is     */
+/* accepted (which is also when the secondary slot erase begins, since        */
+/* IMG_ERASE_PROGRESSIVELY=n in both twins) and stops at COMPLETE.            */
+/* ------------------------------------------------------------------------ */
+
+static int64_t bench_start_ms;
+
+static void bench_begin(void)
+{
+	bench_start_ms = k_uptime_get();
+	printk("BENCH mech=9p-l2cap event=start\n");
+}
+
+static void bench_end(const char *how, uint32_t bytes)
+{
+	int64_t dt = k_uptime_get() - bench_start_ms;
+
+	if (bench_start_ms == 0) {
+		return;
+	}
+	if (dt <= 0) {
+		dt = 1;
+	}
+	printk("BENCH mech=9p-l2cap event=%s bytes=%u ms=%lld Bps=%lld\n",
+	       how, (unsigned int)bytes, dt, ((int64_t)bytes * 1000) / dt);
+	bench_start_ms = 0;
+}
+
 /* DFU status callback (optional) */
 static void dfu_status(enum ninep_dfu_state state, uint32_t bytes, int err)
 {
 	switch (state) {
 	case NINEP_DFU_ERASING:
 		LOG_INF("DFU: erasing flash...");
+		bench_begin();
 		break;
 	case NINEP_DFU_RECEIVING:
 		/* Progress logged by DFU module */
 		break;
 	case NINEP_DFU_COMPLETE:
 		LOG_INF("DFU: complete! Reboot to apply.");
+		bench_end("complete", bytes);
 		break;
 	case NINEP_DFU_ERROR:
 		LOG_ERR("DFU: error %d", err);
+		bench_end("aborted", bytes);
 		break;
 	default:
 		break;
@@ -191,35 +235,24 @@ static int init_9p_server(void)
 {
 	int ret;
 
-	/* Initialize L2CAP transport */
-	struct ninep_transport_l2cap_config l2cap_config = {
+	/* One session is enough for DFU, and matches the SMP twin's
+	 * CONFIG_BT_MAX_CONN=1 so the two are comparable. */
+	struct ninep_session_pool_l2cap_config l2cap_config = {
 		.psm = CONFIG_NINEP_L2CAP_PSM,
-		.rx_buf = rx_buf,
-		.rx_buf_size = sizeof(rx_buf),
-	};
-
-	ret = ninep_transport_l2cap_init(&transport, &l2cap_config, NULL, NULL);
-	if (ret < 0) {
-		LOG_ERR("Failed to init L2CAP transport: %d", ret);
-		return ret;
-	}
-
-	/* Initialize server with sysfs backend */
-	struct ninep_server_config server_config = {
+		.max_sessions = 1,
+		.rx_buf_size_per_session = CONFIG_NINEP_MAX_MESSAGE_SIZE,
 		.fs_ops = ninep_sysfs_get_ops(),
-		.fs_ctx = &sysfs,
-		.max_message_size = CONFIG_NINEP_MAX_MESSAGE_SIZE,
-		.version = "9P2000",
+		.fs_context = &sysfs,
 	};
 
-	ret = ninep_server_init(&server, &server_config, &transport);
+	ret = ninep_session_pool_l2cap_init(&l2cap_pool, &l2cap_config);
 	if (ret < 0) {
-		LOG_ERR("Failed to init 9P server: %d", ret);
+		LOG_ERR("Failed to init L2CAP session pool: %d", ret);
 		return ret;
 	}
 
-	/* Start the server (registers L2CAP PSM and starts listening) */
-	ret = ninep_server_start(&server);
+	/* Registers the L2CAP PSM and starts listening. */
+	ret = ninep_session_pool_l2cap_start(&l2cap_pool);
 	if (ret < 0) {
 		LOG_ERR("Failed to start 9P server: %d", ret);
 		return ret;
