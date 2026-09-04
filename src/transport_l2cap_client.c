@@ -13,6 +13,7 @@
 #include <zephyr/bluetooth/gatt.h>
 #endif
 #include <zephyr/kernel.h>
+#include <zephyr/kernel_version.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/byteorder.h>
 #include <string.h>
@@ -397,8 +398,12 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 	return 0;
 }
 
-#if NINEP_NCS_BUILD || NINEP_ESP32_BUILD
-/* NCS and ESP32: .sent callback has no status parameter */
+/* The .sent callback grew a status parameter in Zephyr 4.5. */
+#define NINEP_L2CAP_SENT_HAS_STATUS \
+	(!NINEP_NCS_BUILD && !NINEP_ESP32_BUILD && KERNEL_VERSION_NUMBER >= 0x040500)
+
+#if !NINEP_L2CAP_SENT_HAS_STATUS
+/* NCS, ESP32 and Zephyr <= 4.4: .sent callback has no status parameter */
 static void l2cap_sent(struct bt_l2cap_chan *chan)
 {
 	struct bt_l2cap_le_chan *le = BT_L2CAP_LE_CHAN(chan);
