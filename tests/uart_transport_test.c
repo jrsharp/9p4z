@@ -29,6 +29,7 @@ static uint8_t test_buffer[CONFIG_NINEP_MAX_MESSAGE_SIZE];
 
 /* Callback state */
 static bool recv_cb_called;
+static int recv_cb_count;
 static uint8_t recv_cb_buffer[CONFIG_NINEP_MAX_MESSAGE_SIZE];
 static size_t recv_cb_len;
 
@@ -37,6 +38,7 @@ static void test_recv_callback(struct ninep_transport *t,
                                 void *user_data)
 {
 	recv_cb_called = true;
+	recv_cb_count++;
 	recv_cb_len = len;
 	if (len <= sizeof(recv_cb_buffer)) {
 		memcpy(recv_cb_buffer, buf, len);
@@ -51,6 +53,7 @@ static void *uart_transport_setup(void)
 	memset(rx_buffer, 0, sizeof(rx_buffer));
 	memset(test_buffer, 0, sizeof(test_buffer));
 	recv_cb_called = false;
+	recv_cb_count = 0;
 	recv_cb_len = 0;
 
 	return &transport;
@@ -61,6 +64,7 @@ static void uart_transport_before(void *f)
 	/* Reset state before each test */
 	memset(&transport, 0, sizeof(transport));
 	recv_cb_called = false;
+	recv_cb_count = 0;
 	recv_cb_len = 0;
 	memset(recv_cb_buffer, 0, sizeof(recv_cb_buffer));
 }
@@ -254,6 +258,7 @@ ZTEST(ninep_uart_transport, test_uart_multiple_messages)
 
 	/* Reset for second message */
 	recv_cb_called = false;
+	recv_cb_count = 0;
 	recv_cb_len = 0;
 
 	/* Send second message (different type) */
@@ -269,6 +274,71 @@ ZTEST(ninep_uart_transport, test_uart_multiple_messages)
 	struct ninep_msg_header hdr;
 	ninep_parse_header(recv_cb_buffer, recv_cb_len, &hdr);
 	zassert_equal(hdr.type, NINEP_RATTACH, "Wrong second message type");
+}
+
+ZTEST(ninep_uart_transport, test_uart_resync_after_lost_byte)
+{
+	struct ninep_transport_uart_config config = {
+		.uart_dev = uart_dev,
+		.rx_buf = rx_buffer,
+		.rx_buf_size = sizeof(rx_buffer),
+	};
+
+	ninep_transport_uart_init(&transport, &config, test_recv_callback, NULL);
+	ninep_transport_start(&transport);
+
+	int msg_len = ninep_build_tversion(test_buffer, sizeof(test_buffer),
+	                                    NINEP_NOTAG, 8192, "9P2000", 6);
+
+	/* A message missing its last byte: without a gap timeout this
+	 * partial frame would swallow the start of the next one. */
+	uart_emul_put_rx_data(uart_dev, test_buffer, msg_len - 1);
+	k_sleep(K_MSEC(20));
+	zassert_false(recv_cb_called, "Truncated frame must not be delivered");
+
+	/* Silence longer than the frame gap, then a whole message. */
+	k_sleep(K_MSEC(CONFIG_NINEP_UART_FRAME_GAP_MS + 50));
+	uart_emul_put_rx_data(uart_dev, test_buffer, msg_len);
+	k_sleep(K_MSEC(100));
+
+	zassert_true(recv_cb_called, "Message after resync not received");
+	zassert_equal(recv_cb_count, 1, "Exactly one message expected, got %d",
+		      recv_cb_count);
+	zassert_equal(recv_cb_len, msg_len, "Wrong length after resync");
+	/* The bytes must be the second, whole message -- not the truncated
+	 * first one padded with the second's first byte. */
+	zassert_mem_equal(recv_cb_buffer, test_buffer, msg_len,
+			  "Delivered frame is misaligned");
+}
+
+ZTEST(ninep_uart_transport, test_uart_garbage_size_resync)
+{
+	struct ninep_transport_uart_config config = {
+		.uart_dev = uart_dev,
+		.rx_buf = rx_buffer,
+		.rx_buf_size = sizeof(rx_buffer),
+	};
+
+	ninep_transport_uart_init(&transport, &config, test_recv_callback, NULL);
+	ninep_transport_start(&transport);
+
+	/* Seven bytes of noise whose "size" cannot fit the buffer must be
+	 * dropped at once, not accumulated for ever. */
+	static const uint8_t noise[7] = { 0xff, 0xff, 0xff, 0x7f, 0x41, 0x42, 0x43 };
+	uart_emul_put_rx_data(uart_dev, noise, sizeof(noise));
+	k_sleep(K_MSEC(20));
+
+	int msg_len = ninep_build_tversion(test_buffer, sizeof(test_buffer),
+	                                    NINEP_NOTAG, 8192, "9P2000", 6);
+	uart_emul_put_rx_data(uart_dev, test_buffer, msg_len);
+	k_sleep(K_MSEC(100));
+
+	zassert_true(recv_cb_called, "Message after garbage not received");
+	zassert_equal(recv_cb_count, 1, "Exactly one message expected, got %d",
+		      recv_cb_count);
+	zassert_equal(recv_cb_len, msg_len, "Wrong length after garbage");
+	zassert_mem_equal(recv_cb_buffer, test_buffer, msg_len,
+			  "Delivered frame is misaligned");
 }
 
 ZTEST(ninep_uart_transport, test_uart_buffer_overflow_protection)
@@ -396,6 +466,7 @@ ZTEST(ninep_uart_transport, test_uart_version_negotiation_sequence)
 
 	/* Reset for response */
 	recv_cb_called = false;
+	recv_cb_count = 0;
 	recv_cb_len = 0;
 
 	/* Server responds with Rversion */
