@@ -145,6 +145,23 @@ config NINEP_UART_POLLING_MODE
 	  Polling mode is less efficient but works on platforms where
 	  UART interrupts are not properly configured.
 
+config NINEP_UART_FRAME_GAP_MS
+	int "Silence that ends a partial frame (ms)"
+	default 250
+	help
+	  A 9P stream over a bare UART is framed only by the size field,
+	  so a lost byte leaves every later message misaligned.  A partial
+	  frame that sees no byte for this long is discarded, so framing
+	  recovers at the next gap between messages.
+
+	  Must be longer than any pause a sender can make inside one
+	  message (a preempted transmit loop: tens of milliseconds on a
+	  busy host; a whole message is ~20 ms at 115200 baud) and shorter
+	  than the silence between two messages in the same direction,
+	  which is at least a request/reply round trip.  250 ms sits well
+	  inside both.  Too short is the worse failure: a good message
+	  discarded costs the client a full timeout.
+
 endif # NINEP_TRANSPORT_UART
 
 config NINEP_TRANSPORT_TCP
