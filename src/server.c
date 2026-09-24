@@ -125,6 +125,25 @@ static struct ninep_server_fid *find_fid(struct ninep_server *server, uint32_t f
 	return NULL;
 }
 
+/*
+ * Hand a node back to the filesystem, unless another fid still holds it:
+ * a clone (walk with no names) shares its original's node, and the
+ * filesystem must not free it under the other.
+ */
+static void node_release(struct ninep_server *server, struct ninep_server_fid *sfid)
+{
+	if (!server->config.fs_ops->clunk || !sfid->node) {
+		return;
+	}
+	for (int i = 0; i < CONFIG_NINEP_SERVER_MAX_FIDS; i++) {
+		if (&server->fids[i] != sfid && server->fids[i].in_use &&
+		    server->fids[i].node == sfid->node) {
+			return;
+		}
+	}
+	server->config.fs_ops->clunk(sfid->node, server->config.fs_ctx);
+}
+
 /* Helper to allocate FID */
 static struct ninep_server_fid *alloc_fid(struct ninep_server *server, uint32_t fid)
 {
@@ -396,11 +415,10 @@ static void handle_tversion(struct ninep_server *server, const uint8_t *msg, siz
 		if (server->fids[i].in_use) {
 			/* Let the filesystem release per-fid resources — the
 			 * reset is semantically a clunk of every live fid. */
-			if (server->config.fs_ops->clunk && server->fids[i].node &&
-			    !server->fids[i].is_auth_fid) {
-				server->config.fs_ops->clunk(server->fids[i].node,
-				                             server->config.fs_ctx);
+			if (!server->fids[i].is_auth_fid) {
+				node_release(server, &server->fids[i]);
 			}
+			server->fids[i].node = NULL;
 			if (server->fids[i].uname_idx != NINEP_POOL_NONE) {
 				uname_release(server, server->fids[i].uname_idx);
 			}
@@ -1239,7 +1257,11 @@ static void handle_tcreate(struct ninep_server *server, uint16_t tag,
 	 * opens the returned fid with the mode field of the request, so
 	 * subsequent Twrite/Tread on the same fid must succeed without a
 	 * separate Topen. Mirror what handle_topen does for the state the
-	 * new is_open enforcement in handle_tread/twrite looks at. */
+	 * new is_open enforcement in handle_tread/twrite looks at.  The
+	 * directory the fid stood on is no longer referenced by it. */
+	if (new_node != sfid->node) {
+		node_release(server, sfid);
+	}
 	sfid->node = new_node;
 	sfid->iounit = 0;
 	sfid->is_open = true;
@@ -1517,10 +1539,7 @@ static void handle_tclunk(struct ninep_server *server, uint16_t tag,
 			}
 		}
 
-		/* Call filesystem clunk handler if available */
-		if (server->config.fs_ops->clunk && sfid->node) {
-			server->config.fs_ops->clunk(sfid->node, server->config.fs_ctx);
-		}
+		node_release(server, sfid);
 
 		/* Free FID */
 		free_fid(server, fid);
@@ -1759,9 +1778,8 @@ void ninep_server_cleanup(struct ninep_server *server)
 			if (sfid->node) {
 				LOG_DBG("Cleanup: clunking fid %u node '%s'", sfid->fid, sfid->node->name);
 
-				/* Call filesystem clunk handler if available */
-				if (server->config.fs_ops && server->config.fs_ops->clunk) {
-					server->config.fs_ops->clunk(sfid->node, server->config.fs_ctx);
+				if (server->config.fs_ops) {
+					node_release(server, sfid);
 				}
 				sfid->node = NULL;
 			}
