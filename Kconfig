@@ -196,8 +196,13 @@ config NINEP_L2CAP_MTU
 	default 4096
 	range 23 65535
 	help
-	  Maximum L2CAP MTU (Maximum Transmission Unit) in bytes.
-	  The actual MTU will be negotiated with the peer.
+	  Maximum L2CAP SDU size in bytes: what a channel offers the peer
+	  as its receive MTU, and the size of the SDU buffers the L2CAP
+	  transports keep (a few of them, in internal RAM).  The value in
+	  use is negotiated with the peer.  A 9P message crosses the link
+	  as one SDU, so this bounds the msize a connection can use; the
+	  host segments and reassembles across ACL packets, which is what
+	  lets msize exceed the 245 bytes of one packet.
 	  Typical values are 512, 1024, 2048, or 4096.
 	  Default: 4096 bytes.
 

@@ -186,10 +186,29 @@ struct l2cap_client_data {
 };
 
 /* Define TX buffer pool for L2CAP SDUs */
+/* SDU buffers are sized by CONFIG_NINEP_L2CAP_MTU, not by
+ * CONFIG_NINEP_MAX_MESSAGE_SIZE: a client that hands ninep_client its
+ * own pools runs a larger msize on this link than the compile-time
+ * default, and its messages must fit an SDU. */
 #define TX_BUF_COUNT 4
-#define TX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_MAX_MESSAGE_SIZE)
+#define TX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_L2CAP_MTU)
 NET_BUF_POOL_DEFINE(l2cap_client_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
                     CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
+
+/* Receive pool for whole SDUs: without an alloc_buf callback the host
+ * clamps the channel's receive MTU to one PDU (245 bytes with 251-byte
+ * ACL buffers) regardless of the rx.mtu set below, so a reply larger
+ * than that could never arrive and the peer's SDU size is capped too. */
+#define RX_BUF_COUNT 2
+#define RX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_L2CAP_MTU)
+NET_BUF_POOL_FIXED_DEFINE(l2cap_client_rx_pool, RX_BUF_COUNT, RX_BUF_SIZE,
+                          CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
+
+static struct net_buf *l2cap_alloc_buf(struct bt_l2cap_chan *chan)
+{
+	ARG_UNUSED(chan);
+	return net_buf_alloc(&l2cap_client_rx_pool, K_NO_WAIT);
+}
 
 /* Low-latency connection parameters for keyboard input
  * Min interval: 6 × 1.25ms = 7.5ms (BLE minimum)
@@ -426,6 +445,7 @@ static struct bt_l2cap_chan_ops l2cap_chan_ops = {
 	.disconnected = l2cap_disconnected,
 	.recv = l2cap_recv,
 	.sent = l2cap_sent,
+	.alloc_buf = l2cap_alloc_buf,
 };
 
 #if defined(CONFIG_BT_GATT_CLIENT)
@@ -688,7 +708,7 @@ static int start_l2cap_connect(struct l2cap_client_data *data)
 	size_t saved_rx_buf_size = data->channel.rx_buf_size;
 	memset(&data->channel, 0, sizeof(data->channel));
 	data->channel.le.chan.ops = &l2cap_chan_ops;
-	data->channel.le.rx.mtu = CONFIG_NINEP_MAX_MESSAGE_SIZE;
+	data->channel.le.rx.mtu = CONFIG_NINEP_L2CAP_MTU;
 	data->channel.transport = data->transport;
 	data->channel.rx_buf = saved_rx_buf;
 	data->channel.rx_buf_size = saved_rx_buf_size;
@@ -847,7 +867,7 @@ static int connect_l2cap(struct l2cap_client_data *data)
 	/* Initialize channel structure */
 	memset(&data->channel, 0, sizeof(data->channel));
 	data->channel.le.chan.ops = &l2cap_chan_ops;
-	data->channel.le.rx.mtu = CONFIG_NINEP_MAX_MESSAGE_SIZE;
+	data->channel.le.rx.mtu = CONFIG_NINEP_L2CAP_MTU;
 	data->channel.transport = data->transport;
 
 	ret = bt_l2cap_chan_connect(data->conn, &data->channel.le.chan, data->psm);

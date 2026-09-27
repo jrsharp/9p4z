@@ -31,6 +31,25 @@ LOG_MODULE_REGISTER(ninep_session_pool_l2cap, CONFIG_NINEP_LOG_LEVEL);
 /* TX buffer pool for L2CAP SDUs — generous to survive transient TX stalls */
 #define TX_BUF_COUNT 8
 #define TX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_MAX_MESSAGE_SIZE)
+
+/* Receive pool for whole SDUs.  Without an alloc_buf callback the host
+ * clamps a channel's receive MTU to one PDU (MPS less the SDU header:
+ * 245 bytes with 251-byte ACL buffers), whatever msize the ends agree,
+ * and every 9P message crosses the link as a round trip of that size.
+ * With one, the host reassembles SDUs up to rx.mtu into these buffers:
+ * one being processed, one arriving. */
+#define RX_BUF_COUNT 2
+#define RX_SDU_MTU MIN(CONFIG_NINEP_L2CAP_MTU, CONFIG_NINEP_MAX_MESSAGE_SIZE)
+#define RX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(RX_SDU_MTU)
+NET_BUF_POOL_FIXED_DEFINE(l2cap_session_rx_pool, RX_BUF_COUNT, RX_BUF_SIZE,
+                          CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
+
+static struct net_buf *l2cap_session_alloc_buf(struct bt_l2cap_chan *chan)
+{
+	ARG_UNUSED(chan);
+	return net_buf_alloc(&l2cap_session_rx_pool, K_NO_WAIT);
+}
+
 NET_BUF_POOL_DEFINE(l2cap_session_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
                     CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
 
@@ -69,6 +88,7 @@ static struct bt_l2cap_chan_ops l2cap_session_chan_ops = {
 	.disconnected = l2cap_session_disconnected,
 	.recv = l2cap_session_recv,
 	.sent = l2cap_session_sent,
+	.alloc_buf = l2cap_session_alloc_buf,
 };
 
 /* Transport operations for session-based L2CAP */
@@ -482,6 +502,8 @@ static int l2cap_session_accept(struct bt_conn *conn, struct bt_l2cap_server *se
 	/* Initialize channel */
 	memset(l2cap_chan, 0, sizeof(*l2cap_chan));
 	l2cap_chan->le.chan.ops = &l2cap_session_chan_ops;
+	/* The SDU size offered to the peer: what the receive pool holds. */
+	l2cap_chan->le.rx.mtu = RX_SDU_MTU;
 	l2cap_chan->session = session;
 	l2cap_chan->pool = l2cap_pool;
 	l2cap_chan->rx_buf = l2cap_pool->rx_buf_pool +
