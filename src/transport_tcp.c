@@ -83,13 +83,26 @@ static void tcp_recv_thread_fn(void *arg1, void *arg2, void *arg3)
 			header_received = false;
 		}
 
-		/* Read data from client */
-		uint8_t byte;
-		int ret = zsock_recv(data->client_sock, &byte, 1, 0);
+		/* Read what the message in hand still needs: the 7-byte header
+		 * first, then the rest of it in one go.  A byte per recv() cost
+		 * a system call per byte -- ~17 KB/s on an ESP32, less than a
+		 * mono audio stream. */
+		size_t want = header_received ? expected_size : 7;
+		int ret = zsock_recv(data->client_sock, data->rx_buf + rx_offset,
+				     want - rx_offset, 0);
 
 		if (ret < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				k_sleep(K_MSEC(10));
+				/* Wait for the next segment -- poll wakes the moment it
+				 * lands.  A fixed sleep here stalled every segment of a
+				 * message, and with the node's small receive window the
+				 * sender stalled with it: ~30 KB/s over Wi-Fi.  The
+				 * timeout only bounds how long `active` goes unchecked. */
+				struct zsock_pollfd pfd = {
+					.fd = data->client_sock,
+					.events = ZSOCK_POLLIN,
+				};
+				zsock_poll(&pfd, 1, 100);
 				continue;
 			}
 			LOG_ERR("Receive error: %d", errno);
@@ -102,30 +115,24 @@ static void tcp_recv_thread_fn(void *arg1, void *arg2, void *arg3)
 			data->client_sock = -1;
 			continue;
 		}
-
-		/* Store received byte */
-		if (rx_offset < data->rx_buf_size) {
-			data->rx_buf[rx_offset++] = byte;
-		} else {
-			/* Buffer overflow - reset */
-			LOG_WRN("RX buffer overflow, resetting");
-			rx_offset = 0;
-			header_received = false;
-			continue;
-		}
+		rx_offset += (size_t)ret;
 
 		/* Parse header if we have enough bytes */
 		if (!header_received && rx_offset >= 7) {
 			struct ninep_msg_header hdr;
 
-			if (ninep_parse_header(data->rx_buf, rx_offset, &hdr) == 0) {
+			if (ninep_parse_header(data->rx_buf, rx_offset, &hdr) == 0 &&
+			    hdr.size >= 7 && hdr.size <= data->rx_buf_size) {
 				expected_size = hdr.size;
 				header_received = true;
 				LOG_DBG("Header received: size=%u type=%u tag=%u",
 				        hdr.size, hdr.type, hdr.tag);
 			} else {
-				/* Invalid header - reset */
-				LOG_WRN("Invalid header, resetting");
+				/* A stream has no way back into step: drop the client */
+				LOG_WRN("Bad message header (size %u), dropping the client",
+				        hdr.size);
+				zsock_close(data->client_sock);
+				data->client_sock = -1;
 				rx_offset = 0;
 				continue;
 			}
