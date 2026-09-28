@@ -29,7 +29,7 @@
 LOG_MODULE_REGISTER(ninep_session_pool_l2cap, CONFIG_NINEP_LOG_LEVEL);
 
 /* TX buffer pool for L2CAP SDUs — generous to survive transient TX stalls */
-#define TX_BUF_COUNT 8
+#define TX_BUF_COUNT CONFIG_NINEP_L2CAP_TX_BUF_COUNT
 #define TX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_MAX_MESSAGE_SIZE)
 
 /* Receive pool for whole SDUs.  Without an alloc_buf callback the host
