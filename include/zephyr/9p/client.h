@@ -168,6 +168,13 @@ struct ninep_client {
 	/* Synchronization */
 	struct k_mutex lock;       /* Protects TX and tag table */
 	struct k_condvar resp_cv;  /* Signaled when any response arrives */
+
+	/* Round-trip statistics (see ninep_client_stats). */
+	uint32_t rt_requests;
+	uint32_t rt_total_us;
+	uint32_t rt_last_us;
+	uint32_t rt_max_us;
+	uint32_t rt_timeouts;
 };
 
 /**
@@ -386,6 +393,13 @@ struct ninep_client_stats {
 	uint32_t fids_max;
 	uint32_t tags_used;
 	uint32_t tags_max;
+	/* Round trips: requests sent, microseconds from send to reply
+	 * (sum, last, worst), and replies that never came. */
+	uint32_t requests;
+	uint32_t total_us;
+	uint32_t last_us;
+	uint32_t max_us;
+	uint32_t timeouts;
 };
 void ninep_client_get_stats(struct ninep_client *client,
 			    struct ninep_client_stats *out);
