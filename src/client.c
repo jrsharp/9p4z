@@ -17,6 +17,14 @@
 LOG_MODULE_REGISTER(ninep_client, CONFIG_NINEP_LOG_LEVEL);
 
 /*
+ * How long the receive callback will wait for client->lock before giving
+ * up.  Generous relative to any legitimate hold (all of which are now
+ * short and non-blocking), tight relative to a link stall.
+ */
+#define NINEP_RECV_LOCK_TIMEOUT_MS 250
+
+
+/*
  * Tag management - lightweight, no per-tag buffers
  */
 
@@ -118,11 +126,13 @@ void ninep_client_get_stats(struct ninep_client *client,
 			    struct ninep_client_stats *out)
 {
 	if (!out) return;
-	out->fids_used = 0;
-	out->fids_max  = 0;
-	out->tags_used = 0;
-	out->tags_max  = 0;
+	memset(out, 0, sizeof(*out));
 	if (!client) return;
+	out->requests = client->rt_requests;
+	out->total_us = client->rt_total_us;
+	out->last_us  = client->rt_last_us;
+	out->max_us   = client->rt_max_us;
+	out->timeouts = client->rt_timeouts;
 
 	k_mutex_lock(&client->lock, K_FOREVER);
 	for (size_t i = 0; i < client->max_fids; i++) {
@@ -178,7 +188,30 @@ static void client_recv_callback(struct ninep_transport *transport,
 
 	LOG_DBG("Received response: type=%u, tag=%u, size=%u", hdr.type, hdr.tag, hdr.size);
 
-	k_mutex_lock(&client->lock, K_FOREVER);
+	/*
+	 * Bounded wait, NOT K_FOREVER.
+	 *
+	 * This callback runs in the transport's receive context — for
+	 * L2CAP that is the thread which grants flow-control credits, and
+	 * Zephyr only grants them once we return (l2cap_chan_le_recv_sdu()
+	 * calls l2cap_chan_send_credits(1) after the callback).  Blocking
+	 * here indefinitely therefore does not merely delay one response:
+	 * it stops the peer being credited, so it stops sending, and on a
+	 * shared radio it starves everything else on the link too.
+	 *
+	 * Every holder of this lock is now short and non-blocking (the
+	 * transport send and the response wait both release it), so this
+	 * should never actually time out.  The bound is here because the
+	 * cost of being wrong about that is a wedged radio rather than a
+	 * slow one — and a dropped response is recoverable, since the
+	 * sender times out and retries.
+	 */
+	if (k_mutex_lock(&client->lock, K_MSEC(NINEP_RECV_LOCK_TIMEOUT_MS)) != 0) {
+		LOG_ERR("recv: lock busy for %d ms, dropping response for tag %u"
+			" (sender will retry)",
+			NINEP_RECV_LOCK_TIMEOUT_MS, hdr.tag);
+		return;
+	}
 
 	struct ninep_tag_entry *entry = find_tag_locked(client, hdr.tag);
 	if (!entry) {
@@ -296,10 +329,19 @@ static void flush_tag_locked(struct ninep_client *client, uint16_t oldtag)
 
 	int len = ninep_build_tflush(fentry->tx, client->buf_size, ftag,
 				     oldtag);
-	if (len > 0 &&
-	    ninep_transport_send(client->transport, fentry->tx, len) == 0) {
-		/* Wait briefly for Rflush; the cancel is best-effort regardless. */
-		(void)wait_for_tag(client, fentry, 2000);
+
+	if (len > 0) {
+		/* Same reasoning as send_and_wait(): the send can block on
+		 * TX credits, and RX needs this lock to grant them. */
+		k_mutex_unlock(&client->lock);
+		int sret = ninep_transport_send(client->transport, fentry->tx,
+						len);
+		k_mutex_lock(&client->lock, K_FOREVER);
+
+		if (sret == 0) {
+			/* Wait briefly for Rflush; best-effort regardless. */
+			(void)wait_for_tag(client, fentry, 2000);
+		}
 	}
 
 	free_tag_locked(client, ftag);
@@ -327,13 +369,56 @@ static int send_and_wait(struct ninep_client *client,
 	int ret;
 
 	for (;;) {
+		/*
+		 * Release client->lock across the send.
+		 *
+		 * This is not an optimisation, it is a deadlock fix.  The
+		 * transport send can BLOCK: the L2CAP transport sleeps
+		 * waiting for TX credits, and again waiting for a net_buf.
+		 * Those credits arrive from the peer over L2CAP RX -- and
+		 * the RX path (client_recv_callback) needs this very mutex
+		 * to deliver a response.  Holding it here meant:
+		 *
+		 *   sender  holds lock, waits for credits
+		 *   BT RX   blocked on lock, cannot process the grant
+		 *
+		 * a circular wait, in BT RX context, while an ACL buffer is
+		 * still checked out.  Buffers exhaust, the controller starts
+		 * dropping frames ("No available ACL buffers!"), L2CAP
+		 * reassembly desyncs, and on a bad day the controller dies.
+		 * Its mild form is a BLE keyboard that goes silent while the
+		 * link stays up and never recovers.
+		 *
+		 * Dropping the lock is safe here: entry->tx is this tag's own
+		 * buffer, we still own the tag (only the caller frees it),
+		 * and if the reply lands while we are unlocked the recv
+		 * callback just marks entry->complete -- which wait_for_tag
+		 * tests before sleeping.
+		 */
+		uint32_t t0 = k_cycle_get_32();
+
+		k_mutex_unlock(&client->lock);
 		ret = ninep_transport_send(client->transport,
 					   entry->tx, msg_len);
+		k_mutex_lock(&client->lock, K_FOREVER);
+
 		if (ret < 0) {
 			return ret;
 		}
 
 		ret = wait_for_tag(client, entry, client->config->timeout_ms);
+		if (ret == -ETIMEDOUT) {
+			client->rt_timeouts++;
+		} else {
+			uint32_t us = (uint32_t)k_cyc_to_us_floor64(k_cycle_get_32() - t0);
+
+			client->rt_requests++;
+			client->rt_total_us += us;
+			client->rt_last_us = us;
+			if (us > client->rt_max_us) {
+				client->rt_max_us = us;
+			}
+		}
 		if (ret != -ETIMEDOUT || retries_left == 0) {
 			if (ret == -ETIMEDOUT) {
 				/* Giving up on this tag — Tflush it so the server
