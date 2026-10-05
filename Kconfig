@@ -145,6 +145,30 @@ config NINEP_UART_POLLING_MODE
 	  Polling mode is less efficient but works on platforms where
 	  UART interrupts are not properly configured.
 
+config NINEP_UART_RX_RING_SIZE
+	int "Bytes held between the receive interrupt and the framing"
+	default 2048
+	depends on !NINEP_UART_POLLING_MODE
+	help
+	  The receive interrupt only moves bytes into a ring of this size;
+	  a work queue of the transport's own frames them and delivers each
+	  message in thread context, where the client's receive path may
+	  take its lock.  At 115200 baud 2048 bytes are about 180 ms.
+
+config NINEP_UART_RX_STACK_SIZE
+	int "Stack of the UART receive work queue"
+	default 1536
+	depends on !NINEP_UART_POLLING_MODE
+	help
+	  The delivery runs here, not on the system work queue: a blocking
+	  9P call made from that queue would wait for a reply that only
+	  the queue it blocks could deliver.
+
+config NINEP_UART_RX_PRIORITY
+	int "Priority of the UART receive work queue"
+	default 2
+	depends on !NINEP_UART_POLLING_MODE
+
 config NINEP_UART_FRAME_GAP_MS
 	int "Silence that ends a partial frame (ms)"
 	default 250

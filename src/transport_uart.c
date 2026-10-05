@@ -8,6 +8,7 @@
 #include <zephyr/drivers/uart.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/ring_buffer.h>
 #include <string.h>
 #include <errno.h>
 
@@ -25,6 +26,15 @@ struct uart_transport_data {
 #ifdef CONFIG_NINEP_UART_POLLING_MODE
 	k_tid_t polling_tid;
 	bool polling_active;
+#else
+	/* The interrupt moves bytes here; rx_work frames them and delivers
+	 * messages in thread context (see uart_irq_handler). */
+	struct ninep_transport *transport;
+	struct k_work rx_work;
+	struct ring_buf rx_ring;
+	uint8_t rx_ring_mem[CONFIG_NINEP_UART_RX_RING_SIZE];
+	volatile uint32_t rx_arrival_ms;  /* when the interrupt last ran */
+	uint32_t rx_overruns;             /* bytes the ring had no room for */
 #endif
 };
 
@@ -95,11 +105,25 @@ static void rx_byte(struct ninep_transport *transport,
 	}
 }
 
+#ifndef CONFIG_NINEP_UART_POLLING_MODE
+/* Delivery has a queue of its own (see NINEP_UART_RX_STACK_SIZE) */
+static K_THREAD_STACK_DEFINE(uart_rx_stack, CONFIG_NINEP_UART_RX_STACK_SIZE);
+static struct k_work_q uart_rx_q;
+static atomic_t uart_rx_q_started;
+
+/*
+ * Receive interrupt: bytes into the ring, nothing else.  Delivering a
+ * message from here would run the client's receive path in interrupt
+ * context, and it takes the client's k_mutex -- which an ISR may not.
+ * It worked while replies came after the sender had let go of the lock;
+ * a peer that answers within the send (QEMU's PL011, at once) broke it.
+ */
 static void uart_irq_handler(const struct device *dev, void *user_data)
 {
 	struct ninep_transport *transport = user_data;
 	struct uart_transport_data *data = transport->priv_data;
 	uint8_t chunk[16];
+	bool any = false;
 
 	if (!uart_irq_update(dev)) {
 		return;
@@ -111,13 +135,39 @@ static void uart_irq_handler(const struct device *dev, void *user_data)
 		if (n <= 0) {
 			break;
 		}
-		uint32_t now = k_uptime_get_32();
+		uint32_t put = ring_buf_put(&data->rx_ring, chunk, n);
 
-		for (int i = 0; i < n; i++) {
-			rx_byte(transport, data, chunk[i], now);
-		}
+		data->rx_overruns += n - put;
+		any = true;
+	}
+	if (any) {
+		data->rx_arrival_ms = k_uptime_get_32();
+		k_work_submit_to_queue(&uart_rx_q, &data->rx_work);
 	}
 }
+
+/* The bytes the interrupt queued: framed, and each message delivered */
+static void rx_work_fn(struct k_work *work)
+{
+	struct uart_transport_data *data =
+		CONTAINER_OF(work, struct uart_transport_data, rx_work);
+	uint8_t chunk[64];
+	uint32_t n;
+
+	/* The gap rule is about arrival, not about when this ran */
+	while ((n = ring_buf_get(&data->rx_ring, chunk, sizeof(chunk))) > 0) {
+		uint32_t when = data->rx_arrival_ms;
+
+		for (uint32_t i = 0; i < n; i++) {
+			rx_byte(data->transport, data, chunk[i], when);
+		}
+	}
+	if (data->rx_overruns) {
+		LOG_WRN("UART RX: %u bytes lost, ring full", data->rx_overruns);
+		data->rx_overruns = 0;
+	}
+}
+#endif /* !CONFIG_NINEP_UART_POLLING_MODE */
 
 #ifdef CONFIG_NINEP_UART_POLLING_MODE
 #define UART_POLLING_STACK_SIZE 1024
@@ -196,6 +246,7 @@ static int uart_start(struct ninep_transport *transport)
 	while (uart_poll_in(data->uart_dev, &stale) == 0) {
 	}
 	rx_reset(data);
+	ring_buf_reset(&data->rx_ring);
 	uart_irq_callback_user_data_set(data->uart_dev, uart_irq_handler,
 	                                transport);
 	uart_irq_rx_enable(data->uart_dev);
@@ -218,8 +269,10 @@ static int uart_stop(struct ninep_transport *transport)
 	data->polling_active = false;
 	k_thread_join(data->polling_tid, K_FOREVER);
 #else
-	/* Disable UART interrupts */
+	/* Disable UART interrupts, then let a delivery in flight finish */
 	uart_irq_rx_disable(data->uart_dev);
+	k_work_cancel(&data->rx_work);
+	ring_buf_reset(&data->rx_ring);
 #endif
 
 	return 0;
@@ -259,6 +312,18 @@ int ninep_transport_uart_init(struct ninep_transport *transport,
 	transport->recv_cb = recv_cb;
 	transport->user_data = user_data;
 	transport->priv_data = data;
+
+#ifndef CONFIG_NINEP_UART_POLLING_MODE
+	if (atomic_cas(&uart_rx_q_started, 0, 1)) {
+		k_work_queue_start(&uart_rx_q, uart_rx_stack,
+				   K_THREAD_STACK_SIZEOF(uart_rx_stack),
+				   K_PRIO_PREEMPT(CONFIG_NINEP_UART_RX_PRIORITY), NULL);
+		k_thread_name_set(&uart_rx_q.thread, "ninep_uart_rx");
+	}
+	data->transport = transport;
+	k_work_init(&data->rx_work, rx_work_fn);
+	ring_buf_init(&data->rx_ring, sizeof(data->rx_ring_mem), data->rx_ring_mem);
+#endif
 
 #ifdef CONFIG_NINEP_UART_POLLING_MODE
 	/* In polling mode, ensure UART interrupts are disabled at hardware level */
