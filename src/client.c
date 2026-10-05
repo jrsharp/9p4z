@@ -483,6 +483,11 @@ int ninep_client_init(struct ninep_client *client,
 		client->max_fids = config->pools->max_fids;
 		client->tags = config->pools->tags;
 		client->max_tags = config->pools->max_tags;
+		/* The tables are the client's from here: a caller's pool comes
+		 * from a heap that does not zero, and an entry left marked in
+		 * use reads as a tag or fid that is taken (attach: -ENOMEM). */
+		memset(client->fids, 0, client->max_fids * sizeof(client->fids[0]));
+		memset(client->tags, 0, client->max_tags * sizeof(client->tags[0]));
 		client->buf_size = config->pools->buf_size;
 		pool_tx = config->pools->tx_buf;
 		pool_rx = config->pools->rx_buf;
