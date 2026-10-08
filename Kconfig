@@ -305,6 +305,18 @@ config NINEP_TRANSPORT_L2CAP_CLIENT
 
 	  Requires CONFIG_BT_CENTRAL for initiating BLE connections.
 
+config NINEP_L2CAP_CLIENT_BUFS_EXT_RAM
+	bool "L2CAP client SDU buffers in external RAM"
+	depends on NINEP_TRANSPORT_L2CAP_CLIENT && ESP_SPIRAM
+	help
+	  Place the data of the client's transmit and receive SDU pools
+	  (six buffers of CONFIG_NINEP_L2CAP_MTU, ~24 KB at a 4 KB MTU) in
+	  the ESP32's external RAM (.ext_ram.bss) rather than internal DRAM.
+	  The buffer headers stay in internal RAM; the data is only ever
+	  copied by the CPU (the host segments and reassembles SDUs, the
+	  controller interface copies packets), never touched by DMA or
+	  from an interrupt.
+
 config NINEP_TRANSPORT_AETHER
 	bool "Æther reliable-conversation Transport"
 	help

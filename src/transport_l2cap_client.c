@@ -192,8 +192,6 @@ struct l2cap_client_data {
  * default, and its messages must fit an SDU. */
 #define TX_BUF_COUNT 4
 #define TX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_L2CAP_MTU)
-NET_BUF_POOL_DEFINE(l2cap_client_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
-                    CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
 
 /* Receive pool for whole SDUs: without an alloc_buf callback the host
  * clamps the channel's receive MTU to one PDU (245 bytes with 251-byte
@@ -201,8 +199,35 @@ NET_BUF_POOL_DEFINE(l2cap_client_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
  * than that could never arrive and the peer's SDU size is capped too. */
 #define RX_BUF_COUNT 2
 #define RX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_L2CAP_MTU)
-NET_BUF_POOL_FIXED_DEFINE(l2cap_client_rx_pool, RX_BUF_COUNT, RX_BUF_SIZE,
-                          CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
+
+#if defined(CONFIG_NINEP_L2CAP_CLIENT_BUFS_EXT_RAM)
+/* NET_BUF_POOL_FIXED_DEFINE with its data array in external RAM: the
+ * headers (and the pool, with its lock and free list) stay internal. */
+#define L2CAP_CLIENT_POOL_DEFINE(_name, _count, _data_size, _ud_size)          \
+	_NET_BUF_ARRAY_DEFINE(_name, _count, _ud_size);                        \
+	static uint8_t net_buf_data_##_name[_count][_data_size] __net_buf_align \
+		__attribute__((section(".ext_ram.bss")));                      \
+	static const struct net_buf_pool_fixed net_buf_fixed_##_name = {       \
+		.data_pool = (uint8_t *)net_buf_data_##_name,                  \
+	};                                                                     \
+	static const struct net_buf_data_alloc net_buf_fixed_alloc_##_name = { \
+		.cb = &net_buf_fixed_cb,                                       \
+		.alloc_data = (void *)&net_buf_fixed_##_name,                  \
+		.max_alloc_size = _data_size,                                  \
+	};                                                                     \
+	static STRUCT_SECTION_ITERABLE(net_buf_pool, _name) =                  \
+		NET_BUF_POOL_INITIALIZER(_name, &net_buf_fixed_alloc_##_name,  \
+					 _net_buf_##_name, _count, _ud_size,   \
+					 NULL)
+#else
+#define L2CAP_CLIENT_POOL_DEFINE(_name, _count, _data_size, _ud_size)          \
+	NET_BUF_POOL_FIXED_DEFINE(_name, _count, _data_size, _ud_size, NULL)
+#endif
+
+L2CAP_CLIENT_POOL_DEFINE(l2cap_client_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
+			 CONFIG_BT_CONN_TX_USER_DATA_SIZE);
+L2CAP_CLIENT_POOL_DEFINE(l2cap_client_rx_pool, RX_BUF_COUNT, RX_BUF_SIZE,
+			 CONFIG_BT_CONN_TX_USER_DATA_SIZE);
 
 static struct net_buf *l2cap_alloc_buf(struct bt_l2cap_chan *chan)
 {
