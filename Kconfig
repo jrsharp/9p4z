@@ -199,6 +199,34 @@ config NINEP_TRANSPORT_TCP
 
 	  When CONFIG_NET_IPV6 is disabled, operates in IPv4-only mode.
 
+config NINEP_TCP_SESSION_POOL
+	bool "TCP session pool: several clients at once"
+	depends on NINEP_TRANSPORT_TCP && NINEP_SERVER
+	help
+	  ninep_session_pool_tcp_*: an accept thread and a session per
+	  connection (own 9P server, own receive thread) over a shared
+	  filesystem, like the L2CAP session pool. The plain TCP transport
+	  serves one client; a second waits unanswered in the listen
+	  backlog. A connection past the pool is refused at once.
+
+if NINEP_TCP_SESSION_POOL
+
+config NINEP_TCP_MAX_SESSIONS
+	int "Most TCP clients at once"
+	default 4
+	range 1 16
+	help
+	  Sizes the static receive-thread stacks; each session also takes
+	  its 9P server state and a receive buffer from the heap.
+
+config NINEP_TCP_SESSION_STACK_SIZE
+	int "Stack per TCP session's receive thread"
+	default 4096
+	help
+	  Filesystem callbacks run on it, as on transport_tcp's thread.
+
+endif
+
 config NINEP_TRANSPORT_L2CAP
 	bool "Bluetooth L2CAP Transport"
 	depends on BT_L2CAP_DYNAMIC_CHANNEL

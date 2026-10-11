@@ -42,6 +42,7 @@ endif()
 
 if(CONFIG_NINEP_TRANSPORT_TCP)
   zephyr_library_sources(src/transport_tcp.c)
+  zephyr_library_sources_ifdef(CONFIG_NINEP_TCP_SESSION_POOL src/session_pool_tcp.c)
 endif()
 
 if(CONFIG_NINEP_TRANSPORT_L2CAP)
