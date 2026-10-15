@@ -380,10 +380,11 @@ static void handle_tversion(struct ninep_server *server, const uint8_t *msg, siz
 
 	LOG_INF("Tversion: msize=%u, version=%.*s", msize, version_len, version);
 
-	/* Negotiate msize down to min(client, config, transport MTU). Touches
-	 * no session state, so it is safe to do before validating the version. */
-	if (msize > CONFIG_NINEP_MAX_MESSAGE_SIZE) {
-		msize = CONFIG_NINEP_MAX_MESSAGE_SIZE;
+	/* Negotiate msize down to min(client, our buffers, transport MTU).
+	 * Touches no session state, so it is safe to do before validating the
+	 * version. */
+	if (msize > server->rx_buf_size) {
+		msize = server->rx_buf_size;
 	}
 	int transport_mtu = ninep_transport_get_mtu(server->transport);
 	if (transport_mtu > 0 && (uint32_t)transport_mtu < msize) {
@@ -852,8 +853,7 @@ static void handle_topen(struct ninep_server *server, uint16_t tag,
 	 * negotiated msize (further limited by the transport MTU), not the
 	 * compile-time maximum — otherwise we advertise more than the client
 	 * agreed to accept. */
-	uint32_t eff = server->msize ? server->msize
-	                             : CONFIG_NINEP_MAX_MESSAGE_SIZE;
+	uint32_t eff = server->msize ? server->msize : server->tx_buf_size;
 	int transport_mtu = ninep_transport_get_mtu(server->transport);
 	if (transport_mtu > 0 && (uint32_t)transport_mtu < eff) {
 		eff = transport_mtu;
@@ -1709,10 +1709,14 @@ int ninep_server_init(struct ninep_server *server,
 	/* Copy config by value instead of storing pointer */
 	memcpy(&server->config, config, sizeof(server->config));
 	server->transport = transport;
-	server->msize = CONFIG_NINEP_MAX_MESSAGE_SIZE; /* Default until Tversion */
 
-	/* Dynamically allocate RX/TX buffers (may use PSRAM on ESP32) */
-	size_t buf_size = CONFIG_NINEP_MAX_MESSAGE_SIZE;
+	/* Dynamically allocate RX/TX buffers (may use PSRAM on ESP32): the
+	 * size the caller configured -- a TCP export can afford far more than
+	 * an L2CAP one -- else the build's */
+	size_t buf_size = config->max_message_size ? config->max_message_size
+	                                           : CONFIG_NINEP_MAX_MESSAGE_SIZE;
+
+	server->msize = buf_size; /* Default until Tversion */
 
 	server->rx_buf = k_malloc(buf_size);
 	if (!server->rx_buf) {

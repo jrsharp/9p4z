@@ -331,6 +331,9 @@ struct ninep_auth_config {
 struct ninep_server_config {
 	const struct ninep_fs_ops *fs_ops;
 	void *fs_ctx;
+	/** The largest message, the size of each of the server's two buffers
+	 *  and the most Tversion will agree to; 0 for
+	 *  CONFIG_NINEP_MAX_MESSAGE_SIZE */
 	uint32_t max_message_size;
 	const char *version;
 
