@@ -8,6 +8,8 @@
 
 #include <zephyr/9p/session_pool.h>
 #include <zephyr/bluetooth/l2cap.h>
+#include <zephyr/kernel.h>
+#include <zephyr/net_buf.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -133,6 +135,14 @@ struct l2cap_session_chan {
 	enum { RX_WAIT_SIZE, RX_WAIT_DATA, RX_PROCESSING } rx_state;
 	struct k_work process_work;  /* Async 9P processing off BT RX thread */
 	uint32_t process_len;        /* Length of message to process */
+	/* A request that arrived while the previous one was still being
+	 * processed (the peer pipelines, or its next request beat our state
+	 * reset after the reply went out). Held (referenced) until the work
+	 * handler finishes, then fed through the RX state machine. One slot:
+	 * a second early arrival is dropped (its client times out that one
+	 * request; the session survives). rx_lock guards the handoff. */
+	struct net_buf *pending_rx;
+	struct k_spinlock rx_lock;
 
 	/* TX health. A wedged TX path accepts sends forever and completes
 	 * none of them, so the only honest signal is completions: in_flight

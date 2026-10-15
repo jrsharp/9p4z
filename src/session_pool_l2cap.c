@@ -61,6 +61,7 @@ static int l2cap_session_accept(struct bt_conn *conn, struct bt_l2cap_server *se
 static void l2cap_session_connected(struct bt_l2cap_chan *chan);
 static void l2cap_session_disconnected(struct bt_l2cap_chan *chan);
 static int l2cap_session_recv(struct bt_l2cap_chan *chan, struct net_buf *buf);
+static int l2cap_session_feed(struct l2cap_session_chan *ch, struct net_buf *buf);
 
 static void l2cap_session_sent(struct bt_l2cap_chan *chan);
 
@@ -124,8 +125,15 @@ static void l2cap_session_disconnected(struct bt_l2cap_chan *chan)
 
 	LOG_INF("L2CAP session channel disconnected for session %d", ch->session->session_id);
 
-	/* Mark RX as not accepting new data */
+	/* Mark RX as not accepting new data; let go of any parked SDU */
+	k_spinlock_key_t key = k_spin_lock(&ch->rx_lock);
 	ch->rx_state = RX_PROCESSING;
+	struct net_buf *parked = ch->pending_rx;
+	ch->pending_rx = NULL;
+	k_spin_unlock(&ch->rx_lock, key);
+	if (parked) {
+		net_buf_unref(parked);
+	}
 
 	/* Try to cancel pending work. If the work handler is currently
 	 * running (e.g., blocked on a TCP recv), we can't wait for it
@@ -172,11 +180,27 @@ static void session_process_work_handler(struct k_work *work)
 	}
 
 	/* Reset RX state machine — ready for next message from BT RX thread.
-	 * Check state again in case disconnect happened during processing. */
+	 * Check state again in case disconnect happened during processing.
+	 * A request that arrived meanwhile was parked in pending_rx: take it
+	 * under the lock together with the state reset, so the BT thread can
+	 * never park a buffer that nobody will feed. */
+	struct net_buf *pending = NULL;
+	k_spinlock_key_t key = k_spin_lock(&ch->rx_lock);
 	if (ch->rx_state == RX_PROCESSING) {
 		ch->rx_len = 0;
 		ch->rx_expected = 0;
 		ch->rx_state = RX_WAIT_SIZE;
+		pending = ch->pending_rx;
+		ch->pending_rx = NULL;
+	}
+	k_spin_unlock(&ch->rx_lock, key);
+
+	if (pending) {
+		if (session->state == NINEP_SESSION_CONNECTED) {
+			LOG_DBG("Session %d: feeding %u parked bytes", session->session_id, pending->len);
+			(void)l2cap_session_feed(ch, pending);
+		}
+		net_buf_unref(pending);
 	}
 }
 
@@ -190,16 +214,35 @@ static int l2cap_session_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 #endif
 
 	LOG_DBG("L2CAP session recv: %u bytes for session %d", buf->len, ch->session->session_id);
+	return l2cap_session_feed(ch, buf);
+}
 
+/* Run the RX state machine over buf. Called from the BT RX thread (an SDU
+ * arriving) and from the processing work handler (a parked SDU). */
+static int l2cap_session_feed(struct l2cap_session_chan *ch, struct net_buf *buf)
+{
 	/* Process all data in the buffer */
 	while (buf->len > 0) {
+		k_spinlock_key_t key = k_spin_lock(&ch->rx_lock);
 		if (ch->rx_state == RX_PROCESSING) {
-			/* Previous message still being processed on work queue.
-			 * L2CAP flow control should prevent this, but guard anyway. */
-			LOG_WRN("Session %d: data arrived while processing, dropping %u bytes",
+			/* Previous message still on the work queue. This is normal
+			 * for a fast peer: its next request can land between our
+			 * reply going out and the handler resetting rx_state. Park
+			 * the SDU (one slot) rather than fail the channel — a
+			 * non-zero return here makes the stack drop the link. */
+			if (!ch->pending_rx) {
+				ch->pending_rx = net_buf_ref(buf);
+				k_spin_unlock(&ch->rx_lock, key);
+				LOG_DBG("Session %d: %u bytes arrived while processing, parked",
+				        ch->session->session_id, buf->len);
+				return 0;
+			}
+			k_spin_unlock(&ch->rx_lock, key);
+			LOG_WRN("Session %d: data arrived while processing (slot taken), dropping %u bytes",
 			        ch->session->session_id, buf->len);
-			return -EBUSY;
+			return 0;
 		}
+		k_spin_unlock(&ch->rx_lock, key);
 
 		if (ch->rx_state == RX_WAIT_SIZE) {
 			/* Reading 4-byte size field */
@@ -243,7 +286,9 @@ static int l2cap_session_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 				/* Complete message — hand off to processing thread */
 				LOG_DBG("Complete message received: %u bytes", ch->rx_len);
 				ch->process_len = ch->rx_len;
+				key = k_spin_lock(&ch->rx_lock);
 				ch->rx_state = RX_PROCESSING;
+				k_spin_unlock(&ch->rx_lock, key);
 				k_work_submit_to_queue(&ninep_proc_wq, &ch->process_work);
 
 				/* Don't process more data from this SDU — the rx_buf
