@@ -107,7 +107,11 @@ static void rx_byte(struct ninep_transport *transport,
 
 #ifndef CONFIG_NINEP_UART_POLLING_MODE
 /* Delivery has a queue of its own (see NINEP_UART_RX_STACK_SIZE) */
+#ifdef CONFIG_NINEP_UART_RX_STACK_DYNAMIC
+static k_thread_stack_t *uart_rx_stack;
+#else
 static K_THREAD_STACK_DEFINE(uart_rx_stack, CONFIG_NINEP_UART_RX_STACK_SIZE);
+#endif
 static struct k_work_q uart_rx_q;
 static atomic_t uart_rx_q_started;
 
@@ -315,9 +319,22 @@ int ninep_transport_uart_init(struct ninep_transport *transport,
 
 #ifndef CONFIG_NINEP_UART_POLLING_MODE
 	if (atomic_cas(&uart_rx_q_started, 0, 1)) {
+#ifdef CONFIG_NINEP_UART_RX_STACK_DYNAMIC
+		uart_rx_stack = k_aligned_alloc(Z_KERNEL_STACK_OBJ_ALIGN,
+				K_KERNEL_STACK_LEN(CONFIG_NINEP_UART_RX_STACK_SIZE));
+		if (!uart_rx_stack) {
+			atomic_set(&uart_rx_q_started, 0);
+			k_free(data);
+			return -ENOMEM;
+		}
+		k_work_queue_start(&uart_rx_q, uart_rx_stack,
+				   CONFIG_NINEP_UART_RX_STACK_SIZE,
+				   K_PRIO_PREEMPT(CONFIG_NINEP_UART_RX_PRIORITY), NULL);
+#else
 		k_work_queue_start(&uart_rx_q, uart_rx_stack,
 				   K_THREAD_STACK_SIZEOF(uart_rx_stack),
 				   K_PRIO_PREEMPT(CONFIG_NINEP_UART_RX_PRIORITY), NULL);
+#endif
 		k_thread_name_set(&uart_rx_q.thread, "ninep_uart_rx");
 	}
 	data->transport = transport;

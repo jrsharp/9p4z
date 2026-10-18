@@ -164,6 +164,16 @@ config NINEP_UART_RX_STACK_SIZE
 	  9P call made from that queue would wait for a reply that only
 	  the queue it blocks could deliver.
 
+config NINEP_UART_RX_STACK_DYNAMIC
+	bool "Allocate the UART receive work queue's stack"
+	depends on !NINEP_UART_POLLING_MODE
+	help
+	  Take the queue's stack from the system heap when the first UART
+	  transport is set up, rather than reserving it statically: an
+	  image that carries a UART transport it may never use (a deck
+	  that looks for a wired keyboard but has a wireless one) then
+	  pays for it only when the transport is wanted.
+
 config NINEP_UART_RX_PRIORITY
 	int "Priority of the UART receive work queue"
 	default 2
