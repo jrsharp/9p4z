@@ -13,6 +13,7 @@
 #include <zephyr/bluetooth/gatt.h>
 #endif
 #include <zephyr/kernel.h>
+#include <zephyr/kernel_version.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/byteorder.h>
 #include <string.h>
@@ -185,10 +186,54 @@ struct l2cap_client_data {
 };
 
 /* Define TX buffer pool for L2CAP SDUs */
+/* SDU buffers are sized by CONFIG_NINEP_L2CAP_MTU, not by
+ * CONFIG_NINEP_MAX_MESSAGE_SIZE: a client that hands ninep_client its
+ * own pools runs a larger msize on this link than the compile-time
+ * default, and its messages must fit an SDU. */
 #define TX_BUF_COUNT 4
-#define TX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_MAX_MESSAGE_SIZE)
-NET_BUF_POOL_DEFINE(l2cap_client_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
-                    CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
+#define TX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_L2CAP_MTU)
+
+/* Receive pool for whole SDUs: without an alloc_buf callback the host
+ * clamps the channel's receive MTU to one PDU (245 bytes with 251-byte
+ * ACL buffers) regardless of the rx.mtu set below, so a reply larger
+ * than that could never arrive and the peer's SDU size is capped too. */
+#define RX_BUF_COUNT 2
+#define RX_BUF_SIZE BT_L2CAP_SDU_BUF_SIZE(CONFIG_NINEP_L2CAP_MTU)
+
+#if defined(CONFIG_NINEP_L2CAP_CLIENT_BUFS_EXT_RAM)
+/* NET_BUF_POOL_FIXED_DEFINE with its data array in external RAM: the
+ * headers (and the pool, with its lock and free list) stay internal. */
+#define L2CAP_CLIENT_POOL_DEFINE(_name, _count, _data_size, _ud_size)          \
+	_NET_BUF_ARRAY_DEFINE(_name, _count, _ud_size);                        \
+	static uint8_t net_buf_data_##_name[_count][_data_size] __net_buf_align \
+		__attribute__((section(".ext_ram.bss")));                      \
+	static const struct net_buf_pool_fixed net_buf_fixed_##_name = {       \
+		.data_pool = (uint8_t *)net_buf_data_##_name,                  \
+	};                                                                     \
+	static const struct net_buf_data_alloc net_buf_fixed_alloc_##_name = { \
+		.cb = &net_buf_fixed_cb,                                       \
+		.alloc_data = (void *)&net_buf_fixed_##_name,                  \
+		.max_alloc_size = _data_size,                                  \
+	};                                                                     \
+	static STRUCT_SECTION_ITERABLE(net_buf_pool, _name) =                  \
+		NET_BUF_POOL_INITIALIZER(_name, &net_buf_fixed_alloc_##_name,  \
+					 _net_buf_##_name, _count, _ud_size,   \
+					 NULL)
+#else
+#define L2CAP_CLIENT_POOL_DEFINE(_name, _count, _data_size, _ud_size)          \
+	NET_BUF_POOL_FIXED_DEFINE(_name, _count, _data_size, _ud_size, NULL)
+#endif
+
+L2CAP_CLIENT_POOL_DEFINE(l2cap_client_tx_pool, TX_BUF_COUNT, TX_BUF_SIZE,
+			 CONFIG_BT_CONN_TX_USER_DATA_SIZE);
+L2CAP_CLIENT_POOL_DEFINE(l2cap_client_rx_pool, RX_BUF_COUNT, RX_BUF_SIZE,
+			 CONFIG_BT_CONN_TX_USER_DATA_SIZE);
+
+static struct net_buf *l2cap_alloc_buf(struct bt_l2cap_chan *chan)
+{
+	ARG_UNUSED(chan);
+	return net_buf_alloc(&l2cap_client_rx_pool, K_NO_WAIT);
+}
 
 /* Low-latency connection parameters for keyboard input
  * Min interval: 6 × 1.25ms = 7.5ms (BLE minimum)
@@ -397,8 +442,12 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 	return 0;
 }
 
-#if NINEP_NCS_BUILD || NINEP_ESP32_BUILD
-/* NCS and ESP32: .sent callback has no status parameter */
+/* The .sent callback grew a status parameter in Zephyr 4.5. */
+#define NINEP_L2CAP_SENT_HAS_STATUS \
+	(!NINEP_NCS_BUILD && !NINEP_ESP32_BUILD && KERNEL_VERSION_NUMBER >= 0x040500)
+
+#if !NINEP_L2CAP_SENT_HAS_STATUS
+/* NCS, ESP32 and Zephyr <= 4.4: .sent callback has no status parameter */
 static void l2cap_sent(struct bt_l2cap_chan *chan)
 {
 	struct bt_l2cap_le_chan *le = BT_L2CAP_LE_CHAN(chan);
@@ -421,6 +470,7 @@ static struct bt_l2cap_chan_ops l2cap_chan_ops = {
 	.disconnected = l2cap_disconnected,
 	.recv = l2cap_recv,
 	.sent = l2cap_sent,
+	.alloc_buf = l2cap_alloc_buf,
 };
 
 #if defined(CONFIG_BT_GATT_CLIENT)
@@ -683,7 +733,7 @@ static int start_l2cap_connect(struct l2cap_client_data *data)
 	size_t saved_rx_buf_size = data->channel.rx_buf_size;
 	memset(&data->channel, 0, sizeof(data->channel));
 	data->channel.le.chan.ops = &l2cap_chan_ops;
-	data->channel.le.rx.mtu = CONFIG_NINEP_MAX_MESSAGE_SIZE;
+	data->channel.le.rx.mtu = CONFIG_NINEP_L2CAP_MTU;
 	data->channel.transport = data->transport;
 	data->channel.rx_buf = saved_rx_buf;
 	data->channel.rx_buf_size = saved_rx_buf_size;
@@ -842,7 +892,7 @@ static int connect_l2cap(struct l2cap_client_data *data)
 	/* Initialize channel structure */
 	memset(&data->channel, 0, sizeof(data->channel));
 	data->channel.le.chan.ops = &l2cap_chan_ops;
-	data->channel.le.rx.mtu = CONFIG_NINEP_MAX_MESSAGE_SIZE;
+	data->channel.le.rx.mtu = CONFIG_NINEP_L2CAP_MTU;
 	data->channel.transport = data->transport;
 
 	ret = bt_l2cap_chan_connect(data->conn, &data->channel.le.chan, data->psm);
