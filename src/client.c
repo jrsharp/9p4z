@@ -494,12 +494,17 @@ int ninep_client_init(struct ninep_client *client,
 		LOG_INF("Using caller-provided pools (%zu fids, %zu tags, %zu buf)",
 		        client->max_fids, client->max_tags, client->buf_size);
 	} else {
+#ifdef CONFIG_NINEP_CLIENT_EMBEDDED_POOLS
 		/* Embedded per-tag arrays. */
 		client->fids = client->_embedded_fids;
 		client->max_fids = CONFIG_NINEP_MAX_FIDS;
 		client->tags = client->_embedded_tags;
 		client->max_tags = CONFIG_NINEP_MAX_TAGS;
 		client->buf_size = CONFIG_NINEP_MAX_MESSAGE_SIZE;
+#else
+		LOG_ERR("No pools given, and NINEP_CLIENT_EMBEDDED_POOLS is off");
+		return -EINVAL;
+#endif
 	}
 
 	/* Initialize synchronization primitives */
@@ -514,10 +519,13 @@ int ninep_client_init(struct ninep_client *client,
 		if (pool_tx != NULL) {
 			client->tags[i].tx = pool_tx + i * client->buf_size;
 			client->tags[i].rx = pool_rx + i * client->buf_size;
-		} else {
+		}
+#ifdef CONFIG_NINEP_CLIENT_EMBEDDED_POOLS
+		else {
 			client->tags[i].tx = client->_embedded_tx_buf[i];
 			client->tags[i].rx = client->_embedded_rx_buf[i];
 		}
+#endif
 		client->tags[i].rx_len = 0;
 	}
 

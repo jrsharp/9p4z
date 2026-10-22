@@ -25,6 +25,19 @@ config NINEP_MAX_FIDS
 	  Maximum number of concurrent file IDs that can be tracked.
 	  Each fid represents an open file or directory handle.
 
+config NINEP_CLIENT_EMBEDDED_POOLS
+	bool "Each client carries its own fid, tag and buffer pools"
+	default y
+	help
+	  A client initialized without caller pools (config->pools NULL)
+	  uses arrays embedded in struct ninep_client: NINEP_MAX_FIDS fids
+	  and NINEP_MAX_TAGS tags with a TX and an RX buffer of
+	  NINEP_MAX_MESSAGE_SIZE each.  Turn this off when every client
+	  passes its own pools: struct ninep_client shrinks to its few
+	  hundred bytes of state and locks, small enough to keep in internal
+	  RAM while the pools live elsewhere (external RAM, say).  A client
+	  without pools then fails to initialize with -EINVAL.
+
 config NINEP_MAX_TAGS
 	int "Maximum number of pending requests (tags)"
 	default 32
