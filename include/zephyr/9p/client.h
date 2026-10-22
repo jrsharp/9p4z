@@ -145,12 +145,14 @@ struct ninep_client {
 	size_t max_tags;
 	size_t buf_size;   /* Per-tag TX/RX buffer size (one message) */
 
+#ifdef CONFIG_NINEP_CLIENT_EMBEDDED_POOLS
 	/* Embedded arrays - used when config->pools is NULL.  Per-tag TX/RX
 	 * buffers so embedded clients get correct multiplexing for free. */
 	struct ninep_client_fid _embedded_fids[CONFIG_NINEP_MAX_FIDS];
 	struct ninep_tag_entry _embedded_tags[CONFIG_NINEP_MAX_TAGS];
 	uint8_t _embedded_tx_buf[CONFIG_NINEP_MAX_TAGS][CONFIG_NINEP_MAX_MESSAGE_SIZE];
 	uint8_t _embedded_rx_buf[CONFIG_NINEP_MAX_TAGS][CONFIG_NINEP_MAX_MESSAGE_SIZE];
+#endif
 
 	/* Runtime state */
 	uint32_t msize;  /* Negotiated max message size */
